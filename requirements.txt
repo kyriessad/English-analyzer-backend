@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+cachetools
+pyspellchecker
+tencentcloud-sdk-python
+requests
+httpx
+PyJWT
+sqlalchemy>=2.0
+alembic>=1.13
+psycopg2-binary>=2.9
+tzdata>=2024.1
