@@ -24,14 +24,19 @@ class ReviewSession(Base):
     __table_args__ = (
         CheckConstraint("status IN ('active', 'completed', 'abandoned')", name="ck_review_sessions_status"),
         Index("ix_review_sessions_user_date_status", "user_id", "review_date", "status"),
+        Index("ix_review_sessions_user_status", "user_id", "status"),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
     user_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("users.id"), nullable=False)
     review_date: Mapped[date] = mapped_column(Date, nullable=False)
     timezone: Mapped[str] = mapped_column(String(64), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    batch_size: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
     total_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reviewed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     completed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     current_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
@@ -41,18 +46,21 @@ class ReviewSession(Base):
         default=utc_now,
         onupdate=utc_now,
     )
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     user: Mapped["User"] = relationship(back_populates="review_sessions")
     items: Mapped[list["ReviewSessionItem"]] = relationship(back_populates="session")
     review_records: Mapped[list["ReviewRecord"]] = relationship(back_populates="session")
+    review_logs: Mapped[list["ReviewLog"]] = relationship(back_populates="session")
 
 
 class ReviewSessionItem(Base):
     __tablename__ = "review_session_items"
     __table_args__ = (
         UniqueConstraint("session_id", "position", name="uq_review_session_items_session_position"),
-        CheckConstraint("status IN ('pending', 'done', 'skipped')", name="ck_review_session_items_status"),
+        CheckConstraint(
+            "status IN ('pending', 'reviewed', 'done', 'skipped')",
+            name="ck_review_session_items_status",
+        ),
         Index("ix_review_session_items_session_status", "session_id", "status"),
     )
 
@@ -65,11 +73,14 @@ class ReviewSessionItem(Base):
     card_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("cards.id"), nullable=False)
     position: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    result: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    reappear_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     is_repeat: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     repeat_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     first_result: Mapped[str | None] = mapped_column(String(32), nullable=True)
     final_result: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -80,6 +91,7 @@ class ReviewSessionItem(Base):
     session: Mapped["ReviewSession"] = relationship(back_populates="items")
     card: Mapped["Card"] = relationship(back_populates="review_session_items")
     review_records: Mapped[list["ReviewRecord"]] = relationship(back_populates="session_item")
+    review_logs: Mapped[list["ReviewLog"]] = relationship(back_populates="session_item")
 
 
 class ReviewRecord(Base):
@@ -121,3 +133,38 @@ class ReviewRecord(Base):
     card: Mapped["Card"] = relationship(back_populates="review_records")
     session: Mapped["ReviewSession | None"] = relationship(back_populates="review_records")
     session_item: Mapped["ReviewSessionItem | None"] = relationship(back_populates="review_records")
+
+
+class ReviewLog(Base):
+    __tablename__ = "review_logs"
+    __table_args__ = (
+        CheckConstraint("result IN ('forgot', 'shaky', 'got_it', 'fluent')", name="ck_review_logs_result"),
+        Index("ix_review_logs_user_reviewed_at", "user_id", "reviewed_at"),
+        Index("ix_review_logs_card_reviewed_at", "card_id", "reviewed_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    card_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("cards.id"), nullable=False)
+    session_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("review_sessions.id"), nullable=False)
+    session_item_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("review_session_items.id"),
+        nullable=False,
+    )
+    result: Mapped[str] = mapped_column(String(32), nullable=False)
+    reviewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    review_state_before: Mapped[str] = mapped_column(String(32), nullable=False)
+    review_state_after: Mapped[str] = mapped_column(String(32), nullable=False)
+    mastery_score_before: Mapped[int] = mapped_column(Integer, nullable=False)
+    mastery_score_after: Mapped[int] = mapped_column(Integer, nullable=False)
+    recovery_stage_before: Mapped[int] = mapped_column(Integer, nullable=False)
+    recovery_stage_after: Mapped[int] = mapped_column(Integer, nullable=False)
+    next_review_at_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_review_at_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+
+    user: Mapped["User"] = relationship(back_populates="review_logs")
+    card: Mapped["Card"] = relationship(back_populates="review_logs")
+    session: Mapped["ReviewSession"] = relationship(back_populates="review_logs")
+    session_item: Mapped["ReviewSessionItem"] = relationship(back_populates="review_logs")

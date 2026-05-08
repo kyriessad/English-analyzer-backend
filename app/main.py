@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from app.routers.auth import router as auth_router
 from app.routers.cards import router as cards_router
 from app.routers.review import router as review_router
+from app.routers.reviews import router as reviews_router
 from app.schemas import AnalyzeRequest, AnalyzeResponse
 from app.services.analyzer import analyze_text
 
@@ -17,6 +18,7 @@ app = FastAPI(
 app.include_router(auth_router)
 app.include_router(cards_router)
 app.include_router(review_router)
+app.include_router(reviews_router)
 
 
 @app.get("/health")

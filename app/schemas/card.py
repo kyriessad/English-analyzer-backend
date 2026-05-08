@@ -9,6 +9,7 @@ CardType = Literal["word", "phrase", "sentence"]
 AnalysisStatus = Literal["pending", "done", "failed"]
 AnalysisLevel = Literal["pass", "warning", "error"]
 CardStatus = Literal["active", "archived", "deleted"]
+ReviewState = Literal["new", "strengthening", "reviewing", "mastered"]
 UnderstandingSource = Literal["local", "machine", "ai", "user"]
 
 
@@ -62,11 +63,19 @@ class CardResponse(BaseModel):
     analysis_level: AnalysisLevel
     analysis_messages: list[str] = Field(default_factory=list)
     understanding_source: UnderstandingSource
+    review_state: ReviewState
+    mastery_score: int
+    recovery_stage: int
     review_count: int
+    first_reviewed_at: datetime | None = None
     again_count: int
     hard_count: int
     good_count: int
     easy_count: int
+    forgot_count: int
+    shaky_count: int
+    got_it_count: int
+    fluent_count: int
     last_review_result: str | None = None
     last_reviewed_at: datetime | None = None
     next_review_at: datetime | None = None

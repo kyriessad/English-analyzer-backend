@@ -35,8 +35,13 @@ class Card(Base):
             "understanding_source IN ('local', 'machine', 'ai', 'user')",
             name="ck_cards_understanding_source",
         ),
+        CheckConstraint(
+            "review_state IN ('new', 'strengthening', 'reviewing', 'mastered')",
+            name="ck_cards_review_state",
+        ),
         CheckConstraint("status IN ('active', 'archived', 'deleted')", name="ck_cards_status"),
         Index("ix_cards_user_status", "user_id", "status"),
+        Index("ix_cards_user_review_state", "user_id", "review_state"),
         Index("ix_cards_user_next_review_at", "user_id", "next_review_at"),
     )
 
@@ -56,11 +61,19 @@ class Card(Base):
     analysis_level: Mapped[str] = mapped_column(String(32), nullable=False)
     analysis_messages: Mapped[list[str]] = mapped_column(json_messages_type, nullable=False, default=list)
     understanding_source: Mapped[str] = mapped_column(String(32), nullable=False, default="user")
+    review_state: Mapped[str] = mapped_column(String(32), nullable=False, default="new")
+    mastery_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    recovery_stage: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     review_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    first_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     again_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     hard_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     good_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     easy_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    forgot_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    shaky_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    got_it_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    fluent_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_review_result: Mapped[str | None] = mapped_column(String(32), nullable=True)
     last_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     next_review_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -77,3 +90,4 @@ class Card(Base):
     user: Mapped["User"] = relationship(back_populates="cards")
     review_session_items: Mapped[list["ReviewSessionItem"]] = relationship(back_populates="card")
     review_records: Mapped[list["ReviewRecord"]] = relationship(back_populates="card")
+    review_logs: Mapped[list["ReviewLog"]] = relationship(back_populates="card")
