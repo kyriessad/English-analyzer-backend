@@ -33,3 +33,4 @@ class User(Base):
     review_sessions: Mapped[list["ReviewSession"]] = relationship(back_populates="user")
     review_records: Mapped[list["ReviewRecord"]] = relationship(back_populates="user")
     review_logs: Mapped[list["ReviewLog"]] = relationship(back_populates="user")
+    client_actions: Mapped[list["ClientAction"]] = relationship(back_populates="user")

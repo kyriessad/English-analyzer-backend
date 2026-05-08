@@ -17,9 +17,17 @@ from app.schemas.reviews import (
     ReviewOverviewResponse,
     ReviewProgressResponse,
     ReviewSummaryResponse,
+    SessionSummaryResponse,
     TodayReviewsResponse,
 )
 from app.services.auth_service import get_current_user
+from app.services.idempotency import (
+    create_processing_action,
+    get_existing_client_action,
+    mark_action_failed,
+    mark_action_ignored,
+    mark_action_succeeded,
+)
 from app.services.review_rules import (
     apply_review_feedback_to_card,
     calculate_reappear_insert_position,
@@ -355,7 +363,52 @@ def submit_review_feedback(
 ) -> ReviewFeedbackResponse:
     now = utc_now()
 
+    # Step 1: Check client_action_id idempotency
+    existing_action = get_existing_client_action(db, current_user.id, payload.client_action_id)
+    if existing_action is not None:
+        if existing_action.status == "succeeded":
+            # Return the saved response_payload from the first successful processing
+            saved = existing_action.response_payload or {}
+            return ReviewFeedbackResponse(
+                done=saved.get("done", False),
+                next_item=None,
+                summary=None,
+                progress=ReviewProgressResponse(
+                    reviewed=saved.get("progress", {}).get("reviewed", 0),
+                    total=saved.get("progress", {}).get("total", 0),
+                ),
+                status="success",
+            )
+        if existing_action.status == "ignored":
+            saved = existing_action.response_payload or {}
+            return ReviewFeedbackResponse(
+                done=False,
+                next_item=None,
+                summary=None,
+                progress=ReviewProgressResponse(
+                    reviewed=saved.get("progress", {}).get("reviewed", 0),
+                    total=saved.get("progress", {}).get("total", 0),
+                ),
+                status="ignored",
+                ignored_reason=existing_action.error_message or "action_ignored",
+            )
+        if existing_action.status == "processing":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Action is being processed, please retry later.",
+            )
+
+    # Step 2: Create processing record (within transaction)
     try:
+        action = create_processing_action(
+            db,
+            current_user.id,
+            payload.client_action_id,
+            "review_feedback",
+            request_payload=payload.model_dump(mode="json"),
+        )
+
+        # Step 3: Lock and validate session
         session = db.scalar(
             select(ReviewSession)
             .where(
@@ -365,10 +418,27 @@ def submit_review_feedback(
             .with_for_update()
         )
         if session is None:
+            mark_action_failed(db, action, "Review session not found")
+            db.commit()
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Review session not found")
-        if session.status != "active":
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Review session is not active")
 
+        if session.status != "active":
+            mark_action_ignored(
+                db, action,
+                response_payload={"progress": _progress_response(session).model_dump()},
+                reason="session_not_active",
+            )
+            db.commit()
+            return ReviewFeedbackResponse(
+                done=False,
+                next_item=None,
+                summary=None,
+                progress=_progress_response(session),
+                status="ignored",
+                ignored_reason="session_not_active",
+            )
+
+        # Step 4: Lock and validate session_item
         item = db.scalar(
             select(ReviewSessionItem)
             .where(
@@ -378,13 +448,27 @@ def submit_review_feedback(
             .with_for_update()
         )
         if item is None:
+            mark_action_failed(db, action, "Review session item not found")
+            db.commit()
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Review session item not found")
+
         if item.status != "pending":
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="This session item has already been reviewed.",
+            mark_action_ignored(
+                db, action,
+                response_payload={"progress": _progress_response(session).model_dump()},
+                reason="session_item_not_pending",
+            )
+            db.commit()
+            return ReviewFeedbackResponse(
+                done=False,
+                next_item=None,
+                summary=None,
+                progress=_progress_response(session),
+                status="ignored",
+                ignored_reason="session_item_not_pending",
             )
 
+        # Step 5: Validate card
         card = db.scalar(
             select(Card)
             .where(
@@ -396,22 +480,28 @@ def submit_review_feedback(
             .with_for_update()
         )
         if card is None:
+            mark_action_failed(db, action, "Card not found")
+            db.commit()
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Card not found")
         if item.card_id != card.id:
+            mark_action_failed(db, action, "Session item does not match card")
+            db.commit()
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Session item does not match card",
             )
 
+        # Step 6: Apply Phase 2 feedback rules
         transitions = apply_review_feedback_to_card(card, payload.result, now)
 
+        # Step 7: Write review_log
         log = ReviewLog(
             user_id=current_user.id,
             card_id=card.id,
             session_id=session.id,
             session_item_id=item.id,
             result=payload.result,
-            reviewed_at=now,
+            reviewed_at=payload.reviewed_at or now,
             review_state_before=transitions["review_state_before"],
             review_state_after=transitions["review_state_after"],
             mastery_score_before=transitions["mastery_score_before"],
@@ -423,12 +513,14 @@ def submit_review_feedback(
         )
         db.add(log)
 
+        # Step 8: Mark session_item reviewed
         item.status = "reviewed"
         item.result = payload.result
-        item.reviewed_at = now
+        item.reviewed_at = payload.reviewed_at or now
         item.final_result = payload.result
         item.first_result = item.first_result or payload.result
 
+        # Step 9: Handle reappear items
         if should_append_reappear_item(payload.result, item.reappear_count):
             current_max_position = db.scalar(
                 select(func.max(ReviewSessionItem.position)).where(
@@ -452,6 +544,7 @@ def submit_review_feedback(
                 )
             )
 
+        # Step 10: Refresh session progress and find next item
         db.flush()
         _refresh_session_progress(db, session, now)
         next_item = _next_pending_item(db, session.id)
@@ -459,17 +552,49 @@ def submit_review_feedback(
         progress = _progress_response(session)
         next_item_response = _item_response(next_item, now) if next_item is not None else None
 
-        db.commit()
-
-        return ReviewFeedbackResponse(
+        response = ReviewFeedbackResponse(
             done=next_item is None,
             next_item=next_item_response,
             summary=summary,
             progress=progress,
+            status="success",
         )
+
+        # Step 11: Mark succeeded
+        mark_action_succeeded(db, action, response_payload=response.model_dump(mode="json"))
+        db.commit()
+
+        return response
+
     except HTTPException:
         db.rollback()
         raise
     except Exception:
         db.rollback()
         raise
+
+
+@router.get("/sessions/{session_id}/summary", response_model=SessionSummaryResponse)
+def get_session_summary(
+    session_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> SessionSummaryResponse:
+    session = db.scalar(
+        select(ReviewSession).where(
+            ReviewSession.id == session_id,
+            ReviewSession.user_id == current_user.id,
+        )
+    )
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+
+    progress = _progress_response(session)
+    summary = _build_summary(db, session.id)
+
+    return SessionSummaryResponse(
+        session_id=session.id,
+        status=session.status,
+        progress=progress,
+        summary=summary,
+    )

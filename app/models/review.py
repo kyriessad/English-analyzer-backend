@@ -9,6 +9,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
     String,
     UniqueConstraint,
     Uuid,
@@ -168,3 +169,35 @@ class ReviewLog(Base):
     card: Mapped["Card"] = relationship(back_populates="review_logs")
     session: Mapped["ReviewSession"] = relationship(back_populates="review_logs")
     session_item: Mapped["ReviewSessionItem"] = relationship(back_populates="review_logs")
+
+
+class ClientAction(Base):
+    __tablename__ = "client_actions"
+    __table_args__ = (
+        UniqueConstraint("user_id", "client_action_id", name="ux_client_actions_user_action"),
+        Index("ix_client_actions_created_at", "created_at"),
+        Index("ix_client_actions_status_created_at", "status", "created_at"),
+        CheckConstraint(
+            "status IN ('processing', 'succeeded', 'failed', 'ignored')",
+            name="ck_client_actions_status",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    client_action_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    action_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    response_payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="processing")
+    error_message: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+        onupdate=utc_now,
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    user: Mapped["User"] = relationship(back_populates="client_actions")

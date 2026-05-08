@@ -43,10 +43,12 @@ class TodayReviewsResponse(BaseModel):
 
 
 class ReviewFeedbackRequest(BaseModel):
+    client_action_id: str
     session_id: UUID
     session_item_id: UUID
     card_id: UUID
     result: ReviewResult
+    reviewed_at: datetime | None = None
 
 
 class ReviewSummaryResponse(BaseModel):
@@ -65,6 +67,15 @@ class ReviewFeedbackResponse(BaseModel):
     next_item: ReviewItemResponse | None = None
     summary: ReviewSummaryResponse | None = None
     progress: ReviewProgressResponse
+    status: str = "success"
+    ignored_reason: str | None = None
+
+
+class SessionSummaryResponse(BaseModel):
+    session_id: UUID
+    status: str
+    progress: ReviewProgressResponse
+    summary: ReviewSummaryResponse
 
 
 class ReviewLogResponse(BaseModel):

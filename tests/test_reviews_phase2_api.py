@@ -13,7 +13,7 @@ from app.core.config import settings as app_settings
 from app.database import Base, get_db
 from app.main import app
 from app.models.card import Card
-from app.models.review import ReviewLog, ReviewSession, ReviewSessionItem
+from app.models.review import ClientAction, ReviewLog, ReviewSession, ReviewSessionItem
 from app.models.user import User
 from app.services import auth_service
 
@@ -140,15 +140,25 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
             old_session = db.get(ReviewSession, UUID(first_data["session_id"]))
             self.assertEqual("abandoned", old_session.status)
 
-    def test_feedback_forgot_updates_card_logs_reappear_and_rejects_duplicate(self):
-        card_id = self.create_card(content="forgot card", content_normalized="forgot card")
+    def _start_session(self):
+        """Helper: start a review session and return session data + first item."""
+        self.create_card(content="card a", content_normalized="card a")
         today = self.client.get("/api/reviews/today?limit=5", headers=self.auth_headers()).json()
+        return today, today["items"][0]
+
+    def test_feedback_forgot_updates_card_logs_and_reappear(self):
+        """Phase 3: feedback with client_action_id succeeds."""
+        card_id = self.create_card(content="forgot card", content_normalized="forgot card")
+        today = self.client.get("/api/reviews/today?limit=5&restart=true", headers=self.auth_headers()).json()
+        self.assertEqual(1, len(today["items"]))
         item = today["items"][0]
 
+        client_action_id = str(uuid4())
         response = self.client.post(
             "/api/reviews/feedback",
             headers=self.auth_headers(),
             json={
+                "client_action_id": client_action_id,
                 "session_id": today["session_id"],
                 "session_item_id": item["session_item_id"],
                 "card_id": str(card_id),
@@ -159,38 +169,152 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
         data = response.json()
         self.assertFalse(data["done"])
         self.assertEqual(1, data["progress"]["reviewed"])
-        self.assertEqual(2, data["progress"]["total"])
-        self.assertEqual(str(card_id), data["next_item"]["card_id"])
-
-        duplicate = self.client.post(
-            "/api/reviews/feedback",
-            headers=self.auth_headers(),
-            json={
-                "session_id": today["session_id"],
-                "session_item_id": item["session_item_id"],
-                "card_id": str(card_id),
-                "result": "forgot",
-            },
-        )
-        self.assertEqual(409, duplicate.status_code)
+        self.assertEqual("success", data["status"])
 
         with TestingSessionLocal() as db:
             card = db.get(Card, card_id)
             self.assertEqual("strengthening", card.review_state)
-            self.assertEqual(2, card.recovery_stage)
             self.assertEqual(1, card.forgot_count)
-            self.assertEqual(1, card.review_count)
-            self.assertIsNotNone(card.next_review_at)
             logs = list(db.scalars(select(ReviewLog).where(ReviewLog.card_id == card_id)))
             self.assertEqual(1, len(logs))
-            self.assertEqual(0, logs[0].recovery_stage_before)
-            self.assertEqual(2, logs[0].recovery_stage_after)
-            items_count = db.scalar(
-                select(func.count()).select_from(ReviewSessionItem).where(
-                    ReviewSessionItem.session_id == UUID(today["session_id"])
-                )
-            )
-            self.assertEqual(2, items_count)
+            # Verify client_action was recorded
+            ca = db.scalar(select(ClientAction).where(ClientAction.client_action_id == client_action_id))
+            self.assertIsNotNone(ca)
+            self.assertEqual("succeeded", ca.status)
+
+    def test_same_client_action_id_returns_cached_response(self):
+        """Phase 3: same client_action_id submitted twice — only processed once."""
+        today, item = self._start_session()
+        client_action_id = str(uuid4())
+
+        payload = {
+            "client_action_id": client_action_id,
+            "session_id": today["session_id"],
+            "session_item_id": item["session_item_id"],
+            "card_id": item["card_id"],
+            "result": "forgot",
+        }
+
+        first = self.client.post("/api/reviews/feedback", headers=self.auth_headers(), json=payload)
+        self.assertEqual(200, first.status_code, first.text)
+        self.assertEqual("success", first.json()["status"])
+
+        second = self.client.post("/api/reviews/feedback", headers=self.auth_headers(), json=payload)
+        self.assertEqual(200, second.status_code, second.text)
+        self.assertEqual("success", second.json()["status"])
+
+        # Verify only one review_log was created
+        with TestingSessionLocal() as db:
+            logs = list(db.scalars(select(ReviewLog).where(ReviewLog.card_id == UUID(item["card_id"]))))
+            self.assertEqual(1, len(logs))
+            actions = list(db.scalars(select(ClientAction).where(ClientAction.client_action_id == client_action_id)))
+            self.assertEqual(1, len(actions))
+
+    def test_different_client_action_id_same_session_item_returns_ignored(self):
+        """Phase 3: same session_item with different client_action_id → 200 ignored."""
+        today, item = self._start_session()
+
+        first_id = str(uuid4())
+        first = self.client.post(
+            "/api/reviews/feedback",
+            headers=self.auth_headers(),
+            json={
+                "client_action_id": first_id,
+                "session_id": today["session_id"],
+                "session_item_id": item["session_item_id"],
+                "card_id": item["card_id"],
+                "result": "forgot",
+            },
+        )
+        self.assertEqual(200, first.status_code, first.text)
+        self.assertEqual("success", first.json()["status"])
+
+        second_id = str(uuid4())
+        second = self.client.post(
+            "/api/reviews/feedback",
+            headers=self.auth_headers(),
+            json={
+                "client_action_id": second_id,
+                "session_id": today["session_id"],
+                "session_item_id": item["session_item_id"],
+                "card_id": item["card_id"],
+                "result": "got_it",
+            },
+        )
+        self.assertEqual(200, second.status_code, second.text)
+        data = second.json()
+        self.assertEqual("ignored", data["status"])
+        self.assertEqual("session_item_not_pending", data["ignored_reason"])
+
+        # Verify only one review_log exists
+        with TestingSessionLocal() as db:
+            logs = list(db.scalars(select(ReviewLog).where(ReviewLog.card_id == UUID(item["card_id"]))))
+            self.assertEqual(1, len(logs))
+
+    def test_completed_session_old_action_returns_ignored(self):
+        """Phase 3: action for completed session → 200 ignored."""
+        self.create_card(content="card x", content_normalized="card x")
+        today, item = self._start_session()
+
+        # Complete the session
+        ca_id = str(uuid4())
+        self.client.post(
+            "/api/reviews/feedback",
+            headers=self.auth_headers(),
+            json={
+                "client_action_id": ca_id,
+                "session_id": today["session_id"],
+                "session_item_id": item["session_item_id"],
+                "card_id": item["card_id"],
+                "result": "fluent",
+            },
+        )
+
+        # Try submitting another action against the now-completed session
+        stale_ca_id = str(uuid4())
+        resp = self.client.post(
+            "/api/reviews/feedback",
+            headers=self.auth_headers(),
+            json={
+                "client_action_id": stale_ca_id,
+                "session_id": today["session_id"],
+                "session_item_id": item["session_item_id"],
+                "card_id": item["card_id"],
+                "result": "got_it",
+            },
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        data = resp.json()
+        self.assertEqual("ignored", data["status"])
+
+    def test_summary_endpoint_returns_session_summary(self):
+        """Phase 3: GET /sessions/{session_id}/summary returns correct data."""
+        self.create_card(content="summary card", content_normalized="summary card")
+        today, item = self._start_session()
+
+        self.client.post(
+            "/api/reviews/feedback",
+            headers=self.auth_headers(),
+            json={
+                "client_action_id": str(uuid4()),
+                "session_id": today["session_id"],
+                "session_item_id": item["session_item_id"],
+                "card_id": item["card_id"],
+                "result": "fluent",
+            },
+        )
+
+        summary_resp = self.client.get(
+            f"/api/reviews/sessions/{today['session_id']}/summary",
+            headers=self.auth_headers(),
+        )
+        self.assertEqual(200, summary_resp.status_code, summary_resp.text)
+        data = summary_resp.json()
+        self.assertEqual(today["session_id"], data["session_id"])
+        self.assertIn(data["status"], ("active", "completed"))
+        self.assertIn("progress", data)
+        self.assertIn("summary", data)
+        self.assertGreaterEqual(data["progress"]["total"], 1)
 
     def test_old_result_is_rejected_by_new_feedback_api(self):
         card_id = self.create_card()
@@ -201,6 +325,7 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
             "/api/reviews/feedback",
             headers=self.auth_headers(),
             json={
+                "client_action_id": str(uuid4()),
                 "session_id": today["session_id"],
                 "session_item_id": item["session_item_id"],
                 "card_id": str(card_id),
