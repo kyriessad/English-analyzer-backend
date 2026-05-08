@@ -71,7 +71,10 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
             "content": f"card {uuid4()}",
             "content_normalized": f"card {uuid4()}",
             "card_type": "word",
+            "understanding": "meaning",
             "analysis_status": "done",
+            "is_review_ready": True,
+            "needs_manual_fix": False,
             "analysis_level": "pass",
             "analysis_messages": [],
             "understanding_source": "user",
@@ -111,11 +114,15 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
         response = self.client.get("/api/reviews/overview", headers=self.auth_headers())
         self.assertEqual(200, response.status_code, response.text)
         data = response.json()
-        self.assertEqual(2, data["today_required_count"])
-        self.assertEqual(1, data["strengthening_count"])
-        self.assertEqual(1, data["due_count"])
-        self.assertEqual(20, data["new_available_count"])
-        self.assertEqual(5, data["suggested_batch_size"])
+        self.assertEqual(2, data["suggested"]["review_count"])
+        self.assertEqual(1, data["suggested"]["new_count"])
+        self.assertEqual(1, data["suggested"]["strengthening_count"])
+        self.assertEqual(1, data["suggested"]["due_count"])
+        self.assertEqual(3, data["suggested"]["total_count"])
+        self.assertEqual(0, data["completed_suggested"]["total_count"])
+        self.assertEqual(0, data["extra_today"]["total_count"])
+        self.assertFalse(data["is_all_done"])
+        self.assertIsNone(data["active_session"])
 
     def test_today_creates_reuses_and_restarts_session(self):
         self.create_card(content="older new", content_normalized="older new")
@@ -139,6 +146,190 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
         with TestingSessionLocal() as db:
             old_session = db.get(ReviewSession, UUID(first_data["session_id"]))
             self.assertEqual("abandoned", old_session.status)
+
+    def test_post_review_sessions_switch_requires_restart_and_abandons_old_active(self):
+        self.create_card(content="daily card", content_normalized="daily card")
+        self.create_card(content="new only card", content_normalized="new only card")
+
+        first = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5},
+        )
+        self.assertEqual(200, first.status_code, first.text)
+        first_data = first.json()
+        self.assertEqual("daily_suggested", first_data["session_type"])
+
+        conflict = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "new_only", "limit": 5},
+        )
+        self.assertEqual(409, conflict.status_code, conflict.text)
+
+        restarted = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "new_only", "limit": 5, "restart": True},
+        )
+        self.assertEqual(200, restarted.status_code, restarted.text)
+        restarted_data = restarted.json()
+        self.assertEqual("new_only", restarted_data["session_type"])
+        self.assertNotEqual(first_data["session_id"], restarted_data["session_id"])
+
+        with TestingSessionLocal() as db:
+            old_session = db.get(ReviewSession, UUID(first_data["session_id"]))
+            self.assertEqual("abandoned", old_session.status)
+
+    def test_review_session_selection_filters_pending_and_manual_fix_cards(self):
+        self.create_card(content="ready done", content_normalized="ready done")
+        self.create_card(
+            content="pending card",
+            content_normalized="pending card",
+            analysis_status="pending",
+            is_review_ready=True,
+            needs_manual_fix=False,
+        )
+        self.create_card(
+            content="failed not ready",
+            content_normalized="failed not ready",
+            understanding=None,
+            analysis_status="failed",
+            is_review_ready=False,
+            needs_manual_fix=True,
+        )
+        self.create_card(
+            content="failed ready",
+            content_normalized="failed ready",
+            analysis_status="failed",
+            is_review_ready=True,
+            needs_manual_fix=False,
+        )
+
+        response = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "new_only", "limit": 5, "restart": True},
+        )
+
+        self.assertEqual(200, response.status_code, response.text)
+        contents = {item["content"] for item in response.json()["items"]}
+        self.assertEqual({"ready done", "failed ready"}, contents)
+
+    def test_overview_separates_daily_suggested_from_extra_new_only(self):
+        daily_card_id = self.create_card(content="daily new", content_normalized="daily new")
+        daily = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "restart": True},
+        ).json()
+
+        self.client.post(
+            "/api/reviews/feedback",
+            headers=self.auth_headers(),
+            json={
+                "client_action_id": str(uuid4()),
+                "session_id": daily["session_id"],
+                "session_item_id": daily["items"][0]["session_item_id"],
+                "card_id": str(daily_card_id),
+                "result": "got_it",
+            },
+        )
+
+        extra_card_id = self.create_card(content="extra new", content_normalized="extra new")
+        extra = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "new_only", "limit": 5, "restart": True},
+        ).json()
+        self.client.post(
+            "/api/reviews/feedback",
+            headers=self.auth_headers(),
+            json={
+                "client_action_id": str(uuid4()),
+                "session_id": extra["session_id"],
+                "session_item_id": extra["items"][0]["session_item_id"],
+                "card_id": str(extra_card_id),
+                "result": "got_it",
+            },
+        )
+
+        overview = self.client.get("/api/reviews/overview", headers=self.auth_headers())
+
+        self.assertEqual(200, overview.status_code, overview.text)
+        data = overview.json()
+        self.assertEqual(1, data["completed_suggested"]["new_count"])
+        self.assertEqual(1, data["completed_suggested"]["total_count"])
+        self.assertEqual(1, data["extra_today"]["new_only_count"])
+        self.assertEqual(1, data["extra_today"]["total_count"])
+
+    def test_overview_hides_active_session_with_zero_total_count(self):
+        with TestingSessionLocal() as db:
+            session = ReviewSession(
+                user_id=self.user_uuid,
+                review_date=NOW.date(),
+                timezone="Asia/Shanghai",
+                session_type="daily_suggested",
+                status="active",
+                batch_size=5,
+                total_count=0,
+                reviewed_count=0,
+                completed_count=0,
+                current_index=0,
+            )
+            db.add(session)
+            db.commit()
+            session_id = session.id
+
+        response = self.client.get("/api/reviews/overview", headers=self.auth_headers())
+
+        self.assertEqual(200, response.status_code, response.text)
+        self.assertIsNone(response.json()["active_session"])
+        with TestingSessionLocal() as db:
+            session = db.get(ReviewSession, session_id)
+            self.assertEqual("abandoned", session.status)
+
+    def test_overview_hides_active_session_with_zero_remaining_count(self):
+        card_id = self.create_card(content="already reviewed", content_normalized="already reviewed")
+        with TestingSessionLocal() as db:
+            session = ReviewSession(
+                user_id=self.user_uuid,
+                review_date=NOW.date(),
+                timezone="Asia/Shanghai",
+                session_type="daily_suggested",
+                status="active",
+                batch_size=5,
+                total_count=1,
+                reviewed_count=1,
+                completed_count=1,
+                current_index=1,
+            )
+            db.add(session)
+            db.flush()
+            db.add(
+                ReviewSessionItem(
+                    session_id=session.id,
+                    card_id=card_id,
+                    position=0,
+                    status="reviewed",
+                    result="got_it",
+                    reappear_count=0,
+                    is_repeat=False,
+                    repeat_count=0,
+                    first_result="got_it",
+                    final_result="got_it",
+                )
+            )
+            db.commit()
+            session_id = session.id
+
+        response = self.client.get("/api/reviews/overview", headers=self.auth_headers())
+
+        self.assertEqual(200, response.status_code, response.text)
+        self.assertIsNone(response.json()["active_session"])
+        with TestingSessionLocal() as db:
+            session = db.get(ReviewSession, session_id)
+            self.assertEqual("completed", session.status)
 
     def _start_session(self):
         """Helper: start a review session and return session data + first item."""
@@ -177,6 +368,8 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
             self.assertEqual(1, card.forgot_count)
             logs = list(db.scalars(select(ReviewLog).where(ReviewLog.card_id == card_id)))
             self.assertEqual(1, len(logs))
+            self.assertEqual("daily_suggested", logs[0].session_type)
+            self.assertEqual("new", logs[0].card_state_before_review)
             # Verify client_action was recorded
             ca = db.scalar(select(ClientAction).where(ClientAction.client_action_id == client_action_id))
             self.assertIsNotNone(ca)

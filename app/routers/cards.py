@@ -5,9 +5,16 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.user import User
-from app.schemas.card import CardCreate, CardListResponse, CardResponse, CardUpdate
+from app.schemas.card import CardCreate, CardListResponse, CardResponse, CardStatsResponse, CardUpdate
 from app.services.auth_service import get_current_user
-from app.services.card_service import create_card, delete_card, get_card_or_404, list_cards, update_card
+from app.services.card_service import (
+    create_card,
+    delete_card,
+    get_card_or_404,
+    get_cards_stats,
+    list_cards,
+    update_card,
+)
 
 
 router = APIRouter(prefix="/api/cards", tags=["cards"])
@@ -49,6 +56,14 @@ def list_cards_endpoint(
         offset=offset,
     )
     return CardListResponse(items=cards, total=total, limit=limit, offset=offset)
+
+
+@router.get("/stats", response_model=CardStatsResponse)
+def get_card_stats_endpoint(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> CardStatsResponse:
+    return CardStatsResponse(**get_cards_stats(db, current_user.id))
 
 
 @router.get("/{card_id}", response_model=CardResponse)

@@ -3,7 +3,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session, selectinload
 
 from app.database import get_db
@@ -16,6 +16,8 @@ from app.schemas.reviews import (
     ReviewItemResponse,
     ReviewOverviewResponse,
     ReviewProgressResponse,
+    ReviewSessionCreateRequest,
+    ReviewSessionCreateResponse,
     ReviewSummaryResponse,
     SessionSummaryResponse,
     TodayReviewsResponse,
@@ -30,6 +32,7 @@ from app.services.idempotency import (
 )
 from app.services.review_rules import (
     apply_review_feedback_to_card,
+    calculate_effective_new_quota,
     calculate_reappear_insert_position,
     get_due_reason,
     normalize_review_limit,
@@ -39,6 +42,10 @@ from app.services.review_rules import (
 
 
 router = APIRouter(prefix="/api/reviews", tags=["reviews"])
+review_sessions_router = APIRouter(prefix="/api/review-sessions", tags=["review-sessions"])
+
+
+MAIN_REVIEW_STATES = ("new", "reviewing", "strengthening", "mastered")
 
 
 def _active_card_filters(user_id: UUID) -> list:
@@ -46,6 +53,16 @@ def _active_card_filters(user_id: UUID) -> list:
         Card.user_id == user_id,
         Card.deleted_at.is_(None),
         Card.status == "active",
+    ]
+
+
+def _review_ready_card_filters(user_id: UUID) -> list:
+    return [
+        *_active_card_filters(user_id),
+        Card.review_state.in_(MAIN_REVIEW_STATES),
+        Card.is_review_ready.is_(True),
+        Card.analysis_status != "pending",
+        Card.needs_manual_fix.is_(False),
     ]
 
 
@@ -125,7 +142,9 @@ def _refresh_session_progress(db: Session, session: ReviewSession, now: datetime
     session.completed_count = reviewed_count
     session.current_index = next_pending.position if next_pending is not None else total_count
 
-    if total_count > 0 and next_pending is None:
+    if total_count <= 0:
+        session.status = "abandoned"
+    elif next_pending is None:
         session.status = "completed"
         session.completed_at = session.completed_at or now
 
@@ -147,13 +166,34 @@ def _today_response(session: ReviewSession | None, limit: int, now: datetime, it
     )
 
 
-def _get_active_session(db: Session, user_id: UUID) -> ReviewSession | None:
+def _active_sessions(db: Session, user_id: UUID) -> list[ReviewSession]:
+    return list(
+        db.scalars(
+            select(ReviewSession)
+            .where(
+                ReviewSession.user_id == user_id,
+                ReviewSession.status == "active",
+            )
+            .order_by(ReviewSession.started_at.desc(), ReviewSession.created_at.desc())
+        )
+    )
+
+
+def _get_active_session(
+    db: Session,
+    user_id: UUID,
+    session_type: str | None = None,
+) -> ReviewSession | None:
+    filters = [
+        ReviewSession.user_id == user_id,
+        ReviewSession.status == "active",
+    ]
+    if session_type is not None:
+        filters.append(ReviewSession.session_type == session_type)
+
     return db.scalar(
         select(ReviewSession)
-        .where(
-            ReviewSession.user_id == user_id,
-            ReviewSession.status == "active",
-        )
+        .where(*filters)
         .order_by(ReviewSession.started_at.desc(), ReviewSession.created_at.desc())
         .limit(1)
     )
@@ -166,17 +206,23 @@ def _create_session(
     cards: list[Card],
     limit: int,
     now: datetime,
+    session_type: str = "daily_suggested",
 ) -> ReviewSession:
+    planned_new_count = sum(1 for card in cards if card.review_state == "new")
+    planned_review_count = len(cards) - planned_new_count
     session = ReviewSession(
         user_id=user.id,
         review_date=_local_review_date(now, user.timezone),
         timezone=user.timezone,
+        session_type=session_type,
         started_at=now,
         status="active",
         batch_size=limit,
         total_count=len(cards),
         reviewed_count=0,
         completed_count=0,
+        planned_new_count=planned_new_count,
+        planned_review_count=planned_review_count,
         current_index=0,
     )
     db.add(session)
@@ -265,13 +311,148 @@ def _shift_items_for_insert(db: Session, session_id: UUID, target_position: int,
     )
 
 
+def _select_new_only_cards(user_id: UUID, limit: int, db: Session) -> list[Card]:
+    return list(
+        db.scalars(
+            select(Card)
+            .where(
+                *_review_ready_card_filters(user_id),
+                Card.review_state == "new",
+            )
+            .order_by(Card.created_at, Card.id)
+            .limit(limit)
+        )
+    )
+
+
+def _select_free_review_cards(user_id: UUID, limit: int, now: datetime, db: Session) -> list[Card]:
+    return list(
+        db.scalars(
+            select(Card)
+            .where(
+                *_review_ready_card_filters(user_id),
+                Card.review_state != "new",
+                or_(
+                    Card.review_state == "strengthening",
+                    Card.next_review_at <= now,
+                ),
+            )
+            .order_by(Card.next_review_at.is_(None), Card.next_review_at, Card.created_at, Card.id)
+            .limit(limit)
+        )
+    )
+
+
+def _select_session_cards(
+    *,
+    user_id: UUID,
+    session_type: str,
+    limit: int,
+    now: datetime,
+    db: Session,
+) -> list[Card]:
+    if session_type == "new_only":
+        return _select_new_only_cards(user_id, limit, db)
+
+    if session_type == "free_review":
+        return _select_free_review_cards(user_id, limit, now, db)
+
+    return select_review_cards(user_id, limit, now, db)
+
+
+def _create_or_return_session(
+    db: Session,
+    *,
+    user: User,
+    session_type: str,
+    limit: int,
+    restart: bool,
+    now: datetime,
+) -> tuple[ReviewSession | None, list[ReviewSessionItem]]:
+    normalized_limit = normalize_review_limit(limit)
+
+    active_sessions = _active_sessions(db, user.id)
+    for session in active_sessions:
+        _refresh_session_progress(db, session, now)
+    db.flush()
+    active_sessions = [session for session in active_sessions if session.status == "active"]
+
+    active_same = next((session for session in active_sessions if session.session_type == session_type), None)
+    if active_same is not None and not restart:
+        return active_same, _pending_items(db, active_same.id)
+
+    active_other = next((session for session in active_sessions if session.session_type != session_type), None)
+    if active_other is not None and not restart:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Different active review session exists. Pass restart=true to abandon it.",
+        )
+
+    if restart:
+        for session in active_sessions:
+            session.status = "abandoned"
+        db.flush()
+
+    selected_cards = _select_session_cards(
+        user_id=user.id,
+        session_type=session_type,
+        limit=normalized_limit,
+        now=now,
+        db=db,
+    )
+    if not selected_cards:
+        return None, []
+
+    session = _create_session(
+        db,
+        user=user,
+        cards=selected_cards,
+        limit=normalized_limit,
+        now=now,
+        session_type=session_type,
+    )
+    db.flush()
+    return session, _pending_items(db, session.id)
+
+
+def _session_create_response(
+    session: ReviewSession | None,
+    *,
+    session_type: str,
+    limit: int,
+    now: datetime,
+    items: list[ReviewSessionItem],
+) -> ReviewSessionCreateResponse:
+    if session is None:
+        return ReviewSessionCreateResponse(
+            session_id=None,
+            session_type=session_type,
+            status=None,
+            limit=limit,
+            progress=ReviewProgressResponse(reviewed=0, total=0),
+            items=[],
+        )
+
+    return ReviewSessionCreateResponse(
+        session_id=session.id,
+        session_type=session.session_type,
+        status=session.status,
+        limit=limit,
+        planned_new_count=session.planned_new_count,
+        planned_review_count=session.planned_review_count,
+        progress=_progress_response(session),
+        items=[_item_response(item, now) for item in items],
+    )
+
+
 @router.get("/overview", response_model=ReviewOverviewResponse)
 def get_review_overview(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> ReviewOverviewResponse:
     now = utc_now()
-    base_filters = _active_card_filters(current_user.id)
+    base_filters = _review_ready_card_filters(current_user.id)
+    today = _local_review_date(now, current_user.timezone)
 
     strengthening_count = db.scalar(
         select(func.count())
@@ -292,13 +473,130 @@ def get_review_overview(
         .select_from(Card)
         .where(*base_filters, Card.review_state == "new")
     ) or 0
+    suggested_new_count = min(
+        calculate_effective_new_quota(5, strengthening_count, due_count),
+        new_available_count,
+    )
+    suggested_review_count = strengthening_count + due_count
+
+    daily_session = db.scalar(
+        select(ReviewSession)
+        .where(
+            ReviewSession.user_id == current_user.id,
+            ReviewSession.review_date == today,
+            ReviewSession.session_type == "daily_suggested",
+            ReviewSession.status.in_(("active", "completed")),
+        )
+        .order_by(ReviewSession.started_at.desc(), ReviewSession.created_at.desc())
+        .limit(1)
+    )
+    if daily_session is not None and daily_session.total_count > 0:
+        suggested_new_count = daily_session.planned_new_count
+        suggested_review_count = daily_session.planned_review_count
+
+    completed_new_count = db.scalar(
+        select(func.count())
+        .select_from(ReviewLog)
+        .join(ReviewSession, ReviewSession.id == ReviewLog.session_id)
+        .where(
+            ReviewLog.user_id == current_user.id,
+            ReviewLog.session_type == "daily_suggested",
+            ReviewSession.review_date == today,
+            ReviewLog.card_state_before_review == "new",
+        )
+    ) or 0
+    completed_review_count = db.scalar(
+        select(func.count())
+        .select_from(ReviewLog)
+        .join(ReviewSession, ReviewSession.id == ReviewLog.session_id)
+        .where(
+            ReviewLog.user_id == current_user.id,
+            ReviewLog.session_type == "daily_suggested",
+            ReviewSession.review_date == today,
+            ReviewLog.card_state_before_review != "new",
+        )
+    ) or 0
+    new_only_count = db.scalar(
+        select(func.count())
+        .select_from(ReviewLog)
+        .join(ReviewSession, ReviewSession.id == ReviewLog.session_id)
+        .where(
+            ReviewLog.user_id == current_user.id,
+            ReviewLog.session_type == "new_only",
+            ReviewSession.review_date == today,
+        )
+    ) or 0
+    free_review_count = db.scalar(
+        select(func.count())
+        .select_from(ReviewLog)
+        .join(ReviewSession, ReviewSession.id == ReviewLog.session_id)
+        .where(
+            ReviewLog.user_id == current_user.id,
+            ReviewLog.session_type == "free_review",
+            ReviewSession.review_date == today,
+        )
+    ) or 0
+
+    active_session = _get_active_session(db, current_user.id)
+    active_session_response = None
+    if active_session is not None:
+        _refresh_session_progress(db, active_session, now)
+        remaining_count = db.scalar(
+            select(func.count())
+            .select_from(ReviewSessionItem)
+            .where(
+                ReviewSessionItem.session_id == active_session.id,
+                ReviewSessionItem.status == "pending",
+            )
+        ) or 0
+        if (
+            active_session.status == "active"
+            and remaining_count > 0
+            and active_session.total_count > 0
+        ):
+            active_session_response = {
+                "id": active_session.id,
+                "session_type": active_session.session_type,
+                "remaining_count": remaining_count,
+                "total_count": active_session.total_count,
+                "reviewed_count": active_session.reviewed_count,
+                "status": active_session.status,
+            }
+
+    suggested_total_count = suggested_review_count + suggested_new_count
+    completed_suggested_total = completed_review_count + completed_new_count
+    is_all_done = (
+        suggested_total_count == 0
+        or (daily_session is not None and daily_session.status == "completed")
+        or (
+            active_session_response is None
+            and suggested_total_count > 0
+            and completed_suggested_total >= suggested_total_count
+        )
+    )
+
+    db.commit()
 
     return ReviewOverviewResponse(
-        today_required_count=strengthening_count + due_count,
-        suggested_batch_size=5,
-        strengthening_count=strengthening_count,
-        due_count=due_count,
-        new_available_count=new_available_count,
+        suggested={
+            "review_count": suggested_review_count,
+            "new_count": suggested_new_count,
+            "strengthening_count": strengthening_count,
+            "due_count": due_count,
+            "total_count": suggested_total_count,
+        },
+        completed_suggested={
+            "review_count": completed_review_count,
+            "new_count": completed_new_count,
+            "total_count": completed_suggested_total,
+        },
+        extra_today={
+            "new_only_count": new_only_count,
+            "free_review_count": free_review_count,
+            "total_count": new_only_count + free_review_count,
+        },
+        is_all_done=is_all_done,
+        active_session=active_session_response,
     )
 
 
@@ -312,47 +610,47 @@ def get_today_reviews(
     normalized_limit = normalize_review_limit(limit)
     now = utc_now()
 
-    if restart:
-        active_sessions = list(
-            db.scalars(
-                select(ReviewSession).where(
-                    ReviewSession.user_id == current_user.id,
-                    ReviewSession.status == "active",
-                )
-            )
-        )
-        for session in active_sessions:
-            session.status = "abandoned"
-        db.flush()
-    else:
-        active_session = _get_active_session(db, current_user.id)
-        if active_session is not None:
-            pending_items = _pending_items(db, active_session.id)
-            if pending_items:
-                _refresh_session_progress(db, active_session, now)
-                db.commit()
-                db.refresh(active_session)
-                return _today_response(active_session, normalized_limit, now, pending_items)
-
-            _refresh_session_progress(db, active_session, now)
-            db.commit()
-
-    selected_cards = select_review_cards(current_user.id, normalized_limit, now, db)
-    if not selected_cards:
-        db.commit()
-        return _today_response(None, normalized_limit, now, [])
-
-    session = _create_session(
+    session, pending_items = _create_or_return_session(
         db,
         user=current_user,
-        cards=selected_cards,
+        session_type="daily_suggested",
+        now=now,
         limit=normalized_limit,
+        restart=restart,
+    )
+    db.commit()
+    if session is None:
+        return _today_response(None, normalized_limit, now, [])
+    db.refresh(session)
+    return _today_response(session, normalized_limit, now, pending_items)
+
+
+@review_sessions_router.post("", response_model=ReviewSessionCreateResponse)
+def create_review_session_endpoint(
+    payload: ReviewSessionCreateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ReviewSessionCreateResponse:
+    normalized_limit = normalize_review_limit(payload.limit)
+    now = utc_now()
+    session, pending_items = _create_or_return_session(
+        db,
+        user=current_user,
+        session_type=payload.session_type,
+        limit=normalized_limit,
+        restart=payload.restart,
         now=now,
     )
     db.commit()
-    db.refresh(session)
-    pending_items = _pending_items(db, session.id)
-    return _today_response(session, normalized_limit, now, pending_items)
+    if session is not None:
+        db.refresh(session)
+    return _session_create_response(
+        session,
+        session_type=payload.session_type,
+        limit=normalized_limit,
+        now=now,
+        items=pending_items,
+    )
 
 
 @router.post("/feedback", response_model=ReviewFeedbackResponse)
@@ -500,8 +798,10 @@ def submit_review_feedback(
             card_id=card.id,
             session_id=session.id,
             session_item_id=item.id,
+            session_type=session.session_type,
             result=payload.result,
             reviewed_at=payload.reviewed_at or now,
+            card_state_before_review=transitions["review_state_before"],
             review_state_before=transitions["review_state_before"],
             review_state_after=transitions["review_state_after"],
             mastery_score_before=transitions["mastery_score_before"],

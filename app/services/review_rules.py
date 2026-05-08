@@ -216,6 +216,8 @@ def apply_review_feedback_to_card(card: Card, result: str, now: datetime) -> dic
         mastery_score_after,
         recovery_stage_after,
     )
+    if review_state_before == "new" and result == "fluent":
+        review_state_after = "reviewing"
     next_review_at_after = calculate_next_review_at(
         result,
         mastery_score_after,
@@ -343,6 +345,10 @@ def select_review_cards(user_id: UUID, limit: int, now: datetime, db: Session) -
                 Card.user_id == user_id,
                 Card.deleted_at.is_(None),
                 Card.status == "active",
+                Card.review_state.in_(tuple(REVIEW_STATES)),
+                Card.is_review_ready.is_(True),
+                Card.analysis_status != "pending",
+                Card.needs_manual_fix.is_(False),
                 or_(
                     Card.review_state == "new",
                     Card.review_state == "strengthening",

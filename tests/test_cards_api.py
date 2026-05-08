@@ -11,6 +11,7 @@ from app.core.config import settings as app_settings
 import app.models
 from app.database import Base, get_db
 from app.main import app
+from app.models.card import Card
 from app.models.user import User
 from app.services import auth_service
 
@@ -91,6 +92,8 @@ class CardsApiTest(unittest.TestCase):
         self.assertEqual(0, card["easy_count"])
         self.assertEqual("local-card-1", card["local_temp_id"])
         self.assertEqual("cloud-card-1", card["legacy_cloud_id"])
+        self.assertTrue(card["is_review_ready"])
+        self.assertFalse(card["needs_manual_fix"])
         self.assertIsNotNone(card["next_review_at"])
 
     def test_create_card_with_same_local_temp_id_returns_existing_card(self):
@@ -151,6 +154,96 @@ class CardsApiTest(unittest.TestCase):
         self.assertEqual("pending", data["analysis_status"])
         self.assertEqual("考研", data["exam_scene"])
         self.assertEqual("阅读", data["exam_module"])
+
+    def test_patch_failed_not_ready_card_recomputes_readiness(self):
+        created = self.create_card(
+            local_temp_id="local-needs-fix",
+            legacy_cloud_id="cloud-needs-fix",
+            understanding=None,
+            translation=None,
+            analysis_status="failed",
+        )
+        self.assertFalse(created["is_review_ready"])
+        self.assertTrue(created["needs_manual_fix"])
+
+        response = self.client.patch(
+            f"/api/cards/{created['id']}",
+            headers=self.auth_headers(),
+            json={"user_understanding": "need to fix this meaning"},
+        )
+
+        self.assertEqual(200, response.status_code, response.text)
+        data = response.json()
+        self.assertTrue(data["is_review_ready"])
+        self.assertFalse(data["needs_manual_fix"])
+        self.assertEqual("failed", data["analysis_status"])
+
+    def test_cards_stats_counts_main_states_and_readiness_flags(self):
+        with TestingSessionLocal() as db:
+            for review_state in ("new", "reviewing", "strengthening", "mastered"):
+                db.add(
+                    Card(
+                        user_id=self.user_uuid,
+                        content=f"{review_state} card",
+                        content_normalized=f"{review_state} card",
+                        card_type="word",
+                        understanding="meaning",
+                        analysis_status="done",
+                        is_review_ready=True,
+                        needs_manual_fix=False,
+                        analysis_level="pass",
+                        analysis_messages=[],
+                        understanding_source="user",
+                        review_state=review_state,
+                        status="active",
+                    )
+                )
+            db.add(
+                Card(
+                    user_id=self.user_uuid,
+                    content="pending card",
+                    content_normalized="pending card",
+                    card_type="word",
+                    understanding="meaning",
+                    analysis_status="pending",
+                    is_review_ready=True,
+                    needs_manual_fix=False,
+                    analysis_level="pass",
+                    analysis_messages=[],
+                    understanding_source="user",
+                    review_state="new",
+                    status="active",
+                )
+            )
+            db.add(
+                Card(
+                    user_id=self.user_uuid,
+                    content="manual fix card",
+                    content_normalized="manual fix card",
+                    card_type="word",
+                    analysis_status="failed",
+                    is_review_ready=False,
+                    needs_manual_fix=True,
+                    analysis_level="error",
+                    analysis_messages=[],
+                    understanding_source="user",
+                    review_state="new",
+                    status="active",
+                )
+            )
+            db.commit()
+
+        response = self.client.get("/api/cards/stats", headers=self.auth_headers())
+
+        self.assertEqual(200, response.status_code, response.text)
+        data = response.json()
+        self.assertEqual(6, data["total"])
+        self.assertEqual(3, data["new"])
+        self.assertEqual(1, data["reviewing"])
+        self.assertEqual(1, data["strengthening"])
+        self.assertEqual(1, data["mastered"])
+        self.assertEqual(1, data["needs_manual_fix"])
+        self.assertEqual(1, data["pending"])
 
     def test_delete_card_soft_deletes(self):
         created = self.create_card()

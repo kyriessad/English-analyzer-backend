@@ -23,9 +23,15 @@ class CardCreate(BaseModel):
     local_temp_id: str | None = None
     exam_scene: str | None = None
     exam_module: str | None = None
-    understanding: str | None = None
-    note: str | None = None
-    translation: str | None = None
+    understanding: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("understanding", "user_understanding", "ai_understanding"),
+    )
+    note: str | None = Field(default=None, validation_alias=AliasChoices("note", "notes"))
+    translation: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("translation", "meaning_cn", "context_translation"),
+    )
     analysis_status: AnalysisStatus = "pending"
     analysis_level: AnalysisLevel = "pass"
     analysis_messages: list[str] = Field(default_factory=list)
@@ -37,8 +43,16 @@ class CardUpdate(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     content: str | None = Field(default=None, validation_alias=AliasChoices("content", "english_text"))
-    understanding: str | None = None
-    note: str | None = None
+    understanding: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("understanding", "user_understanding", "ai_understanding"),
+    )
+    note: str | None = Field(default=None, validation_alias=AliasChoices("note", "notes"))
+    translation: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("translation", "meaning_cn", "context_translation"),
+    )
+    analysis_status: AnalysisStatus | None = None
     card_type: CardType | None = None
     exam_scene: str | None = None
     exam_module: str | None = None
@@ -60,6 +74,8 @@ class CardResponse(BaseModel):
     note: str | None = None
     translation: str | None = None
     analysis_status: AnalysisStatus
+    is_review_ready: bool
+    needs_manual_fix: bool
     analysis_level: AnalysisLevel
     analysis_messages: list[str] = Field(default_factory=list)
     understanding_source: UnderstandingSource
@@ -100,3 +116,13 @@ class CardListResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class CardStatsResponse(BaseModel):
+    total: int
+    new: int
+    reviewing: int
+    strengthening: int
+    mastered: int
+    needs_manual_fix: int
+    pending: int

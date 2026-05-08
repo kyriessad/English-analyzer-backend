@@ -10,8 +10,24 @@ from app.models.user import User, utc_now
 from app.schemas.card import CardCreate, CardUpdate
 
 
+MAIN_REVIEW_STATES = ("new", "reviewing", "strengthening", "mastered")
+
+
 def normalize_card_content(content: str) -> str:
     return " ".join(content.strip().lower().split())
+
+
+def _has_text(value: str | None) -> bool:
+    return bool(value and value.strip())
+
+
+def recompute_card_readiness(card: Card) -> Card:
+    is_review_ready = _has_text(card.content) and (
+        _has_text(card.understanding) or _has_text(card.translation)
+    )
+    card.is_review_ready = is_review_ready
+    card.needs_manual_fix = (card.analysis_status == "failed") and not is_review_ready
+    return card
 
 
 def get_card_or_404(db: Session, card_id: UUID, user_id: UUID | None = None) -> Card:
@@ -65,6 +81,7 @@ def create_card(db: Session, payload: CardCreate) -> Card:
         next_review_at=payload.next_review_at or now,
         status="active",
     )
+    recompute_card_readiness(card)
     db.add(card)
 
     try:
@@ -132,9 +149,19 @@ def update_card(db: Session, card_id: UUID, user_id: UUID, payload: CardUpdate) 
         card.content_normalized = normalize_card_content(update_data["content"])
         card.analysis_status = "pending"
 
-    for field in ("understanding", "note", "card_type", "exam_scene", "exam_module"):
+    for field in (
+        "understanding",
+        "translation",
+        "note",
+        "analysis_status",
+        "card_type",
+        "exam_scene",
+        "exam_module",
+    ):
         if field in update_data:
             setattr(card, field, update_data[field])
+
+    recompute_card_readiness(card)
 
     try:
         db.commit()
@@ -147,6 +174,41 @@ def update_card(db: Session, card_id: UUID, user_id: UUID, payload: CardUpdate) 
 
     db.refresh(card)
     return card
+
+
+def get_cards_stats(db: Session, user_id: UUID) -> dict[str, int]:
+    base_filters = [
+        Card.user_id == user_id,
+        Card.deleted_at.is_(None),
+        Card.status != "deleted",
+    ]
+
+    state_counts = {
+        review_state: db.scalar(
+            select(func.count())
+            .select_from(Card)
+            .where(*base_filters, Card.review_state == review_state)
+        ) or 0
+        for review_state in MAIN_REVIEW_STATES
+    }
+
+    return {
+        "total": sum(state_counts.values()),
+        "new": state_counts["new"],
+        "reviewing": state_counts["reviewing"],
+        "strengthening": state_counts["strengthening"],
+        "mastered": state_counts["mastered"],
+        "needs_manual_fix": db.scalar(
+            select(func.count())
+            .select_from(Card)
+            .where(*base_filters, Card.needs_manual_fix.is_(True))
+        ) or 0,
+        "pending": db.scalar(
+            select(func.count())
+            .select_from(Card)
+            .where(*base_filters, Card.analysis_status == "pending")
+        ) or 0,
+    }
 
 
 def delete_card(db: Session, card_id: UUID, user_id: UUID) -> Card:

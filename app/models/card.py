@@ -2,6 +2,7 @@ from datetime import datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -58,6 +59,8 @@ class Card(Base):
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
     translation: Mapped[str | None] = mapped_column(Text, nullable=True)
     analysis_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    is_review_ready: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    needs_manual_fix: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     analysis_level: Mapped[str] = mapped_column(String(32), nullable=False)
     analysis_messages: Mapped[list[str]] = mapped_column(json_messages_type, nullable=False, default=list)
     understanding_source: Mapped[str] = mapped_column(String(32), nullable=False, default="user")

@@ -7,14 +7,45 @@ from pydantic import BaseModel, ConfigDict
 
 ReviewResult = Literal["forgot", "shaky", "got_it", "fluent"]
 ReviewState = Literal["new", "strengthening", "reviewing", "mastered"]
+ReviewSessionType = Literal["daily_suggested", "new_only", "free_review"]
+ReviewSessionStatus = Literal["active", "completed", "abandoned", "expired"]
+
+
+class ReviewSuggestedOverview(BaseModel):
+    review_count: int
+    new_count: int
+    strengthening_count: int
+    due_count: int
+    total_count: int
+
+
+class ReviewCompletedSuggestedOverview(BaseModel):
+    review_count: int
+    new_count: int
+    total_count: int
+
+
+class ReviewExtraTodayOverview(BaseModel):
+    new_only_count: int
+    free_review_count: int
+    total_count: int
+
+
+class ActiveReviewSessionResponse(BaseModel):
+    id: UUID
+    session_type: ReviewSessionType
+    remaining_count: int
+    total_count: int
+    reviewed_count: int
+    status: ReviewSessionStatus
 
 
 class ReviewOverviewResponse(BaseModel):
-    today_required_count: int
-    suggested_batch_size: int
-    strengthening_count: int
-    due_count: int
-    new_available_count: int
+    suggested: ReviewSuggestedOverview
+    completed_suggested: ReviewCompletedSuggestedOverview
+    extra_today: ReviewExtraTodayOverview
+    is_all_done: bool
+    active_session: ActiveReviewSessionResponse | None = None
 
 
 class ReviewProgressResponse(BaseModel):
@@ -38,6 +69,23 @@ class ReviewItemResponse(BaseModel):
 class TodayReviewsResponse(BaseModel):
     session_id: UUID | None = None
     limit: int
+    progress: ReviewProgressResponse
+    items: list[ReviewItemResponse]
+
+
+class ReviewSessionCreateRequest(BaseModel):
+    session_type: ReviewSessionType = "daily_suggested"
+    limit: int = 5
+    restart: bool = False
+
+
+class ReviewSessionCreateResponse(BaseModel):
+    session_id: UUID | None = None
+    session_type: ReviewSessionType
+    status: ReviewSessionStatus | None = None
+    limit: int
+    planned_new_count: int = 0
+    planned_review_count: int = 0
     progress: ReviewProgressResponse
     items: list[ReviewItemResponse]
 
@@ -86,8 +134,10 @@ class ReviewLogResponse(BaseModel):
     card_id: UUID
     session_id: UUID
     session_item_id: UUID
+    session_type: ReviewSessionType
     result: ReviewResult
     reviewed_at: datetime
+    card_state_before_review: ReviewState
     review_state_before: str
     review_state_after: str
     mastery_score_before: int

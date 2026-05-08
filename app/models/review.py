@@ -23,7 +23,14 @@ from app.models.user import utc_now
 class ReviewSession(Base):
     __tablename__ = "review_sessions"
     __table_args__ = (
-        CheckConstraint("status IN ('active', 'completed', 'abandoned')", name="ck_review_sessions_status"),
+        CheckConstraint(
+            "session_type IN ('daily_suggested', 'new_only', 'free_review')",
+            name="ck_review_sessions_session_type",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'completed', 'abandoned', 'expired')",
+            name="ck_review_sessions_status",
+        ),
         Index("ix_review_sessions_user_date_status", "user_id", "review_date", "status"),
         Index("ix_review_sessions_user_status", "user_id", "status"),
     )
@@ -32,6 +39,7 @@ class ReviewSession(Base):
     user_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("users.id"), nullable=False)
     review_date: Mapped[date] = mapped_column(Date, nullable=False)
     timezone: Mapped[str] = mapped_column(String(64), nullable=False)
+    session_type: Mapped[str] = mapped_column(String(32), nullable=False, default="daily_suggested")
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
@@ -39,6 +47,8 @@ class ReviewSession(Base):
     total_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     reviewed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     completed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    planned_new_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    planned_review_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     current_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
@@ -154,7 +164,9 @@ class ReviewLog(Base):
         nullable=False,
     )
     result: Mapped[str] = mapped_column(String(32), nullable=False)
+    session_type: Mapped[str] = mapped_column(String(32), nullable=False, default="daily_suggested")
     reviewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    card_state_before_review: Mapped[str] = mapped_column(String(32), nullable=False)
     review_state_before: Mapped[str] = mapped_column(String(32), nullable=False)
     review_state_after: Mapped[str] = mapped_column(String(32), nullable=False)
     mastery_score_before: Mapped[int] = mapped_column(Integer, nullable=False)
