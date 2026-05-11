@@ -516,24 +516,16 @@ def get_review_overview(
             ReviewLog.card_state_before_review != "new",
         )
     ) or 0
-    new_only_count = db.scalar(
+    free_review_available_count = db.scalar(
         select(func.count())
-        .select_from(ReviewLog)
-        .join(ReviewSession, ReviewSession.id == ReviewLog.session_id)
+        .select_from(Card)
         .where(
-            ReviewLog.user_id == current_user.id,
-            ReviewLog.session_type == "new_only",
-            ReviewSession.review_date == today,
-        )
-    ) or 0
-    free_review_count = db.scalar(
-        select(func.count())
-        .select_from(ReviewLog)
-        .join(ReviewSession, ReviewSession.id == ReviewLog.session_id)
-        .where(
-            ReviewLog.user_id == current_user.id,
-            ReviewLog.session_type == "free_review",
-            ReviewSession.review_date == today,
+            *base_filters,
+            Card.review_state != "new",
+            or_(
+                Card.review_state == "strengthening",
+                Card.next_review_at <= now,
+            ),
         )
     ) or 0
 
@@ -591,9 +583,9 @@ def get_review_overview(
             "total_count": completed_suggested_total,
         },
         extra_today={
-            "new_only_count": new_only_count,
-            "free_review_count": free_review_count,
-            "total_count": new_only_count + free_review_count,
+            "new_only_count": new_available_count,
+            "free_review_count": free_review_available_count,
+            "total_count": new_available_count + free_review_available_count,
         },
         is_all_done=is_all_done,
         active_session=active_session_response,

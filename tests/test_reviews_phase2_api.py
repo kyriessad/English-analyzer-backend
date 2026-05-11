@@ -120,7 +120,9 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
         self.assertEqual(1, data["suggested"]["due_count"])
         self.assertEqual(3, data["suggested"]["total_count"])
         self.assertEqual(0, data["completed_suggested"]["total_count"])
-        self.assertEqual(0, data["extra_today"]["total_count"])
+        self.assertEqual(20, data["extra_today"]["new_only_count"])
+        self.assertEqual(2, data["extra_today"]["free_review_count"])
+        self.assertEqual(22, data["extra_today"]["total_count"])
         self.assertFalse(data["is_all_done"])
         self.assertIsNone(data["active_session"])
 
@@ -260,8 +262,8 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
         data = overview.json()
         self.assertEqual(1, data["completed_suggested"]["new_count"])
         self.assertEqual(1, data["completed_suggested"]["total_count"])
-        self.assertEqual(1, data["extra_today"]["new_only_count"])
-        self.assertEqual(1, data["extra_today"]["total_count"])
+        self.assertEqual(0, data["extra_today"]["new_only_count"])
+        self.assertEqual(0, data["extra_today"]["total_count"])
 
     def test_overview_hides_active_session_with_zero_total_count(self):
         with TestingSessionLocal() as db:
