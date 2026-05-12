@@ -13,6 +13,8 @@ from app.models.user import User, utc_now
 from app.schemas.reviews import (
     ReviewFeedbackRequest,
     ReviewFeedbackResponse,
+    ReviewHistoryDetailCardResponse,
+    ReviewHistoryDetailResponse,
     ReviewHistoryItemResponse,
     ReviewHistoryResponse,
     ReviewHistoryResultCounts,
@@ -56,6 +58,12 @@ REVIEW_RESULT_LABELS = {
     "shaky": "不太稳",
     "got_it": "基本掌握",
     "fluent": "很熟了",
+}
+
+SESSION_TYPE_LABELS = {
+    "daily_suggested": "系统今日推荐",
+    "new_only": "主动新学",
+    "free_review": "自由复习",
 }
 
 
@@ -201,6 +209,7 @@ def _today_response(session: ReviewSession | None, limit: int, now: datetime, it
 
 def _review_history_item_response(row) -> ReviewHistoryItemResponse:
     return ReviewHistoryItemResponse(
+        review_log_id=row.review_log_id,
         card_id=row.card_id,
         content=row.content or "",
         understanding=row.understanding,
@@ -667,6 +676,7 @@ def get_review_history(
 
     filtered_logs = (
         select(
+            ReviewLog.id.label("review_log_id"),
             ReviewLog.card_id.label("card_id"),
             ReviewLog.result.label("result"),
             ReviewLog.reviewed_at.label("reviewed_at"),
@@ -683,6 +693,7 @@ def get_review_history(
     )
     latest_logs = (
         select(
+            filtered_logs.c.review_log_id,
             filtered_logs.c.card_id,
             filtered_logs.c.result.label("last_result"),
             filtered_logs.c.reviewed_at.label("last_reviewed_at"),
@@ -726,6 +737,7 @@ def get_review_history(
 
     history_query = (
         select(
+            latest_logs.c.review_log_id,
             latest_logs.c.card_id,
             Card.content,
             Card.understanding,
@@ -839,6 +851,63 @@ def get_review_history_summary(
         latest_result_card_counts=ReviewHistoryResultCounts(**counts),
         date_from=date_from,
         date_to=date_to,
+    )
+
+
+@router.get("/history/{log_id}", response_model=ReviewHistoryDetailResponse)
+def get_review_history_detail(
+    log_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ReviewHistoryDetailResponse:
+    log = db.scalar(
+        select(ReviewLog).where(
+            ReviewLog.id == log_id,
+            ReviewLog.user_id == current_user.id,
+        )
+    )
+
+    if log is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Review log not found",
+        )
+
+    card_response = None
+    card_obj = db.scalar(
+        select(Card).where(
+            Card.id == log.card_id,
+            Card.user_id == current_user.id,
+            Card.deleted_at.is_(None),
+            Card.status == "active",
+        )
+    )
+
+    if card_obj is not None:
+        card_response = ReviewHistoryDetailCardResponse(
+            id=card_obj.id,
+            card_id=card_obj.id,
+            content=card_obj.content,
+            understanding=card_obj.understanding,
+            note=card_obj.note,
+            card_type=card_obj.card_type,
+            exam_scene=card_obj.exam_scene,
+            exam_module=card_obj.exam_module,
+            review_state=card_obj.review_state,
+            next_review_at=card_obj.next_review_at,
+        )
+
+    session_type_label = SESSION_TYPE_LABELS.get(log.session_type, "其他来源")
+
+    return ReviewHistoryDetailResponse(
+        id=log.id,
+        review_log_id=log.id,
+        reviewed_at=log.reviewed_at,
+        result=log.result,
+        result_label=REVIEW_RESULT_LABELS.get(log.result, log.result),
+        session_type=log.session_type,
+        session_type_label=session_type_label,
+        card=card_response,
     )
 
 

@@ -1046,6 +1046,285 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
 
         self.assertEqual(422, response.status_code)
 
+    # ===== Phase 5-5B: review_log_id in history list =====
+
+    def test_history_list_includes_review_log_id(self):
+        """Phase 5-5B: each history list item must carry the real ReviewLog.id."""
+        card_id = self.create_card(
+            content="log id card",
+            content_normalized="log id card",
+        )
+        log_id_1 = self.create_review_log(card_id, "forgot", NOW - timedelta(hours=2))
+        log_id_2 = self.create_review_log(card_id, "got_it", NOW - timedelta(hours=1))
+
+        response = self.client.get("/api/reviews/history", headers=self.auth_headers())
+
+        self.assertEqual(200, response.status_code, response.text)
+        data = response.json()
+        self.assertEqual(1, data["total"])
+        item = data["items"][0]
+        self.assertIn("review_log_id", item)
+        self.assertEqual(str(log_id_2), item["review_log_id"])
+        self.assertIn("card_id", item)
+        self.assertEqual(str(card_id), item["card_id"])
+
+    def test_history_list_multiple_cards_each_has_review_log_id(self):
+        """Phase 5-5B: multiple cards each carry their latest review_log_id."""
+        card_a = self.create_card(content="multi log a", content_normalized="multi log a")
+        card_b = self.create_card(content="multi log b", content_normalized="multi log b")
+        log_a = self.create_review_log(card_a, "shaky", NOW - timedelta(hours=3))
+        log_b = self.create_review_log(card_b, "fluent", NOW - timedelta(hours=1))
+        # card_a has a newer log
+        log_a2 = self.create_review_log(card_a, "got_it", NOW - timedelta(hours=2))
+
+        response = self.client.get("/api/reviews/history", headers=self.auth_headers())
+
+        self.assertEqual(200, response.status_code, response.text)
+        data = response.json()
+        self.assertEqual(2, data["total"])
+        items_by_card = {item["card_id"]: item for item in data["items"]}
+        self.assertEqual(str(log_a2), items_by_card[str(card_a)]["review_log_id"])
+        self.assertEqual(str(log_b), items_by_card[str(card_b)]["review_log_id"])
+
+    # ===== Phase 5-5B: review history detail endpoint =====
+
+    def test_history_detail_returns_full_log_data(self):
+        """Phase 5-5B: GET /api/reviews/history/{log_id} returns 200 with log + card."""
+        card_id = self.create_card(
+            content="detail card",
+            content_normalized="detail card",
+            understanding="我的理解",
+            note="备注",
+            card_type="sentence",
+            exam_scene="IELTS",
+            exam_module="speaking",
+            review_state="reviewing",
+        )
+        log_id = self.create_review_log(
+            card_id, "got_it", NOW,
+            session_type="daily_suggested",
+        )
+
+        response = self.client.get(
+            f"/api/reviews/history/{log_id}",
+            headers=self.auth_headers(),
+        )
+
+        self.assertEqual(200, response.status_code, response.text)
+        data = response.json()
+
+        self.assertEqual(str(log_id), data["id"])
+        self.assertEqual(str(log_id), data["review_log_id"])
+        self.assertEqual("got_it", data["result"])
+        self.assertEqual("基本掌握", data["result_label"])
+        self.assertEqual("daily_suggested", data["session_type"])
+        self.assertEqual("系统今日推荐", data["session_type_label"])
+        self.assertIsNotNone(data["reviewed_at"])
+
+        self.assertIsNotNone(data["card"])
+        card = data["card"]
+        self.assertEqual(str(card_id), card["id"])
+        self.assertEqual(str(card_id), card["card_id"])
+        self.assertEqual("detail card", card["content"])
+        self.assertEqual("我的理解", card["understanding"])
+        self.assertEqual("备注", card["note"])
+        self.assertEqual("sentence", card["card_type"])
+        self.assertEqual("IELTS", card["exam_scene"])
+        self.assertEqual("speaking", card["exam_module"])
+        self.assertEqual("reviewing", card["review_state"])
+
+    def test_history_detail_session_type_labels(self):
+        """Phase 5-5B: session_type_label maps for all known types."""
+        card_id = self.create_card(content="type card", content_normalized="type card")
+
+        cases = [
+            ("daily_suggested", "系统今日推荐"),
+            ("new_only", "主动新学"),
+            ("free_review", "自由复习"),
+        ]
+        for session_type, expected_label in cases:
+            with self.subTest(session_type=session_type):
+                log_id = self.create_review_log(
+                    card_id, "fluent", NOW - timedelta(hours=1),
+                    session_type=session_type,
+                )
+                response = self.client.get(
+                    f"/api/reviews/history/{log_id}",
+                    headers=self.auth_headers(),
+                )
+                self.assertEqual(200, response.status_code, response.text)
+                data = response.json()
+                self.assertEqual(session_type, data["session_type"])
+                self.assertEqual(expected_label, data["session_type_label"])
+
+    def test_history_detail_unknown_session_type_fallback_label(self):
+        """Phase 5-5B: unknown session_type falls back to 其他来源."""
+        card_id = self.create_card(content="unknown type", content_normalized="unknown type")
+        with TestingSessionLocal() as db:
+            session = ReviewSession(
+                user_id=self.user_uuid,
+                review_date=NOW.date(),
+                timezone="Asia/Shanghai",
+                session_type="daily_suggested",
+                started_at=NOW,
+                status="completed",
+                batch_size=5,
+                total_count=1,
+                reviewed_count=1,
+                completed_count=1,
+            )
+            db.add(session)
+            db.flush()
+            item = ReviewSessionItem(
+                session_id=session.id,
+                card_id=card_id,
+                position=0,
+                status="reviewed",
+                result="fluent",
+                reappear_count=0,
+                is_repeat=False,
+                repeat_count=0,
+                first_result="fluent",
+                final_result="fluent",
+                reviewed_at=NOW,
+            )
+            db.add(item)
+            db.flush()
+            log = ReviewLog(
+                user_id=self.user_uuid,
+                card_id=card_id,
+                session_id=session.id,
+                session_item_id=item.id,
+                session_type="ancient_ritual",
+                result="fluent",
+                reviewed_at=NOW,
+                card_state_before_review="reviewing",
+                review_state_before="reviewing",
+                review_state_after="reviewing",
+                mastery_score_before=1,
+                mastery_score_after=2,
+                recovery_stage_before=0,
+                recovery_stage_after=0,
+            )
+            db.add(log)
+            db.commit()
+            log_id = log.id
+
+        response = self.client.get(
+            f"/api/reviews/history/{log_id}",
+            headers=self.auth_headers(),
+        )
+        self.assertEqual(200, response.status_code, response.text)
+        self.assertEqual("其他来源", response.json()["session_type_label"])
+
+    def test_history_detail_log_not_found_returns_404(self):
+        """Phase 5-5B: non-existent log_id returns 404."""
+        non_existent_id = uuid4()
+
+        response = self.client.get(
+            f"/api/reviews/history/{non_existent_id}",
+            headers=self.auth_headers(),
+        )
+
+        self.assertEqual(404, response.status_code, response.text)
+
+    def test_history_detail_card_soft_deleted_returns_card_null(self):
+        """Phase 5-5B: log exists but card is soft-deleted → 200 + card:null."""
+        card_id = self.create_card(
+            content="deleted card",
+            content_normalized="deleted card",
+        )
+        log_id = self.create_review_log(card_id, "shaky", NOW)
+
+        # Soft-delete the card
+        with TestingSessionLocal() as db:
+            card = db.get(Card, card_id)
+            card.deleted_at = NOW
+            card.status = "deleted"
+            db.commit()
+
+        response = self.client.get(
+            f"/api/reviews/history/{log_id}",
+            headers=self.auth_headers(),
+        )
+
+        self.assertEqual(200, response.status_code, response.text)
+        data = response.json()
+        self.assertEqual(str(log_id), data["id"])
+        self.assertEqual("shaky", data["result"])
+        self.assertIsNone(data["card"])
+
+    def test_history_detail_card_archived_returns_card_null(self):
+        """Phase 5-5B: log exists but card is archived → 200 + card:null."""
+        card_id = self.create_card(
+            content="archived card",
+            content_normalized="archived card",
+        )
+        log_id = self.create_review_log(card_id, "fluent", NOW)
+
+        with TestingSessionLocal() as db:
+            card = db.get(Card, card_id)
+            card.status = "archived"
+            db.commit()
+
+        response = self.client.get(
+            f"/api/reviews/history/{log_id}",
+            headers=self.auth_headers(),
+        )
+
+        self.assertEqual(200, response.status_code, response.text)
+        data = response.json()
+        self.assertEqual(str(log_id), data["id"])
+        self.assertIsNone(data["card"])
+
+    def test_history_detail_user_isolation(self):
+        """Phase 5-5B: user A's log returns 404 when requested by user B."""
+        card_id = self.create_card(
+            content="isolation card",
+            content_normalized="isolation card",
+        )
+        log_id = self.create_review_log(card_id, "got_it", NOW)
+
+        # User B tries to access User A's log
+        other_response = self.client.get(
+            f"/api/reviews/history/{log_id}",
+            headers=self.auth_headers(self.other_token),
+        )
+
+        self.assertEqual(404, other_response.status_code, other_response.text)
+
+        # User A can still access their own log
+        own_response = self.client.get(
+            f"/api/reviews/history/{log_id}",
+            headers=self.auth_headers(),
+        )
+        self.assertEqual(200, own_response.status_code, own_response.text)
+
+    def test_history_detail_result_label_for_all_results(self):
+        """Phase 5-5B: result_label uses REVIEW_RESULT_LABELS for all values."""
+        card_id = self.create_card(
+            content="result label card",
+            content_normalized="result label card",
+        )
+
+        expected_labels = {
+            "forgot": "想不起来",
+            "shaky": "不太稳",
+            "got_it": "基本掌握",
+            "fluent": "很熟了",
+        }
+        for result, expected_label in expected_labels.items():
+            with self.subTest(result=result):
+                log_id = self.create_review_log(
+                    card_id, result, NOW - timedelta(hours=1),
+                )
+                response = self.client.get(
+                    f"/api/reviews/history/{log_id}",
+                    headers=self.auth_headers(),
+                )
+                self.assertEqual(200, response.status_code, response.text)
+                self.assertEqual(expected_label, response.json()["result_label"])
+
 
 if __name__ == "__main__":
     unittest.main()

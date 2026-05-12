@@ -127,6 +127,7 @@ class SessionSummaryResponse(BaseModel):
 
 
 class ReviewHistoryItemResponse(BaseModel):
+    review_log_id: UUID
     card_id: UUID
     content: str = ""
     understanding: str | None = None
@@ -182,3 +183,27 @@ class ReviewLogResponse(BaseModel):
     recovery_stage_after: int
     next_review_at_before: datetime | None = None
     next_review_at_after: datetime | None = None
+
+
+class ReviewHistoryDetailCardResponse(BaseModel):
+    id: UUID
+    card_id: UUID
+    content: str
+    understanding: str | None = None
+    note: str | None = None
+    card_type: str | None = None
+    exam_scene: str | None = None
+    exam_module: str | None = None
+    review_state: str | None = None
+    next_review_at: datetime | None = None
+
+
+class ReviewHistoryDetailResponse(BaseModel):
+    id: UUID
+    review_log_id: UUID
+    reviewed_at: datetime
+    result: str
+    result_label: str
+    session_type: str
+    session_type_label: str
+    card: ReviewHistoryDetailCardResponse | None = None
