@@ -1,9 +1,9 @@
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta, timezone
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.orm import Session, selectinload
 
 from app.database import get_db
@@ -13,9 +13,12 @@ from app.models.user import User, utc_now
 from app.schemas.reviews import (
     ReviewFeedbackRequest,
     ReviewFeedbackResponse,
+    ReviewHistoryItemResponse,
+    ReviewHistoryResponse,
     ReviewItemResponse,
     ReviewOverviewResponse,
     ReviewProgressResponse,
+    ReviewResult,
     ReviewSessionCreateRequest,
     ReviewSessionCreateResponse,
     ReviewSummaryResponse,
@@ -46,6 +49,12 @@ review_sessions_router = APIRouter(prefix="/api/review-sessions", tags=["review-
 
 
 MAIN_REVIEW_STATES = ("new", "reviewing", "strengthening", "mastered")
+REVIEW_RESULT_LABELS = {
+    "forgot": "想不起来",
+    "shaky": "不太稳",
+    "got_it": "基本掌握",
+    "fluent": "很熟了",
+}
 
 
 def _active_card_filters(user_id: UUID) -> list:
@@ -71,6 +80,28 @@ def _local_review_date(now: datetime, timezone_name: str) -> date:
         return now.astimezone(ZoneInfo(timezone_name or "UTC")).date()
     except Exception:
         return now.date()
+
+
+def _history_date_bounds(
+    date_from: date | None,
+    date_to: date | None,
+    timezone_name: str,
+) -> tuple[datetime | None, datetime | None]:
+    try:
+        user_timezone = ZoneInfo(timezone_name or "UTC")
+    except Exception:
+        user_timezone = timezone.utc
+
+    start_at = None
+    end_before = None
+    if date_from is not None:
+        start_at = datetime.combine(date_from, time.min, tzinfo=user_timezone).astimezone(timezone.utc)
+    if date_to is not None:
+        end_before = (
+            datetime.combine(date_to, time.min, tzinfo=user_timezone) + timedelta(days=1)
+        ).astimezone(timezone.utc)
+
+    return start_at, end_before
 
 
 def _item_response(item: ReviewSessionItem, now: datetime) -> ReviewItemResponse:
@@ -163,6 +194,22 @@ def _today_response(session: ReviewSession | None, limit: int, now: datetime, it
         limit=limit,
         progress=_progress_response(session),
         items=[_item_response(item, now) for item in items],
+    )
+
+
+def _review_history_item_response(row) -> ReviewHistoryItemResponse:
+    return ReviewHistoryItemResponse(
+        card_id=row.card_id,
+        content=row.content or "",
+        understanding=row.understanding,
+        note=row.note,
+        card_type=row.card_type,
+        exam_scene=row.exam_scene,
+        exam_module=row.exam_module,
+        review_count_in_range=row.review_count_in_range,
+        last_result=row.last_result,
+        last_result_label=REVIEW_RESULT_LABELS[row.last_result],
+        last_reviewed_at=row.last_reviewed_at,
     )
 
 
@@ -589,6 +636,122 @@ def get_review_overview(
         },
         is_all_done=is_all_done,
         active_session=active_session_response,
+    )
+
+
+@router.get("/history", response_model=ReviewHistoryResponse)
+def get_review_history(
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    date_from: date | None = None,
+    date_to: date | None = None,
+    result: ReviewResult | None = None,
+    search: str | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ReviewHistoryResponse:
+    if date_from is not None and date_to is not None and date_from > date_to:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="date_from must be earlier than or equal to date_to",
+        )
+
+    start_at, end_before = _history_date_bounds(date_from, date_to, current_user.timezone)
+    log_filters = [ReviewLog.user_id == current_user.id]
+    if start_at is not None:
+        log_filters.append(ReviewLog.reviewed_at >= start_at)
+    if end_before is not None:
+        log_filters.append(ReviewLog.reviewed_at < end_before)
+
+    filtered_logs = (
+        select(
+            ReviewLog.card_id.label("card_id"),
+            ReviewLog.result.label("result"),
+            ReviewLog.reviewed_at.label("reviewed_at"),
+            func.count(ReviewLog.id).over(partition_by=ReviewLog.card_id).label("review_count_in_range"),
+            func.row_number()
+            .over(
+                partition_by=ReviewLog.card_id,
+                order_by=(ReviewLog.reviewed_at.desc(), ReviewLog.id.desc()),
+            )
+            .label("row_number"),
+        )
+        .where(*log_filters)
+        .cte("filtered_review_logs")
+    )
+    latest_logs = (
+        select(
+            filtered_logs.c.card_id,
+            filtered_logs.c.result.label("last_result"),
+            filtered_logs.c.reviewed_at.label("last_reviewed_at"),
+            filtered_logs.c.review_count_in_range,
+        )
+        .where(filtered_logs.c.row_number == 1)
+        .cte("latest_review_logs")
+    )
+
+    card_join = latest_logs.outerjoin(
+        Card,
+        and_(
+            Card.id == latest_logs.c.card_id,
+            Card.user_id == current_user.id,
+        ),
+    )
+    history_filters = [
+        or_(
+            Card.id.is_(None),
+            and_(
+                Card.deleted_at.is_(None),
+                Card.status == "active",
+            ),
+        )
+    ]
+    if result is not None:
+        history_filters.append(latest_logs.c.last_result == result)
+
+    normalized_search = search.strip() if search else None
+    if normalized_search:
+        pattern = f"%{normalized_search}%"
+        history_filters.append(
+            or_(
+                Card.content.ilike(pattern),
+                Card.understanding.ilike(pattern),
+                Card.note.ilike(pattern),
+                Card.exam_scene.ilike(pattern),
+                Card.exam_module.ilike(pattern),
+            )
+        )
+
+    history_query = (
+        select(
+            latest_logs.c.card_id,
+            Card.content,
+            Card.understanding,
+            Card.note,
+            Card.card_type,
+            Card.exam_scene,
+            Card.exam_module,
+            latest_logs.c.review_count_in_range,
+            latest_logs.c.last_result,
+            latest_logs.c.last_reviewed_at,
+        )
+        .select_from(card_join)
+        .where(*history_filters)
+    )
+
+    total = db.scalar(select(func.count()).select_from(history_query.subquery())) or 0
+    rows = db.execute(
+        history_query
+        .order_by(latest_logs.c.last_reviewed_at.desc(), latest_logs.c.card_id)
+        .offset(offset)
+        .limit(limit)
+    ).all()
+
+    return ReviewHistoryResponse(
+        items=[_review_history_item_response(row) for row in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
     )
 
 

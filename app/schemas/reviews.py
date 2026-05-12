@@ -126,6 +126,27 @@ class SessionSummaryResponse(BaseModel):
     summary: ReviewSummaryResponse
 
 
+class ReviewHistoryItemResponse(BaseModel):
+    card_id: UUID
+    content: str = ""
+    understanding: str | None = None
+    note: str | None = None
+    card_type: str | None = None
+    exam_scene: str | None = None
+    exam_module: str | None = None
+    review_count_in_range: int
+    last_result: ReviewResult
+    last_result_label: str
+    last_reviewed_at: datetime
+
+
+class ReviewHistoryResponse(BaseModel):
+    items: list[ReviewHistoryItemResponse]
+    total: int
+    limit: int
+    offset: int
+
+
 class ReviewLogResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

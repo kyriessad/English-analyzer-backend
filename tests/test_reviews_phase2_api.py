@@ -101,6 +101,61 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
             db.refresh(card)
             return card.id
 
+    def create_review_log(self, card_id, result, reviewed_at, **overrides):
+        user_id = overrides.pop("user_id", self.user_uuid)
+        with TestingSessionLocal() as db:
+            session = ReviewSession(
+                user_id=user_id,
+                review_date=reviewed_at.date(),
+                timezone="Asia/Shanghai",
+                session_type=overrides.pop("session_type", "daily_suggested"),
+                started_at=reviewed_at,
+                status="completed",
+                batch_size=5,
+                total_count=1,
+                reviewed_count=1,
+                completed_count=1,
+                planned_new_count=0,
+                planned_review_count=1,
+                current_index=1,
+            )
+            db.add(session)
+            db.flush()
+            item = ReviewSessionItem(
+                session_id=session.id,
+                card_id=card_id,
+                position=0,
+                status="reviewed",
+                result=result,
+                reappear_count=0,
+                is_repeat=False,
+                repeat_count=0,
+                first_result=result,
+                final_result=result,
+                reviewed_at=reviewed_at,
+            )
+            db.add(item)
+            db.flush()
+            log = ReviewLog(
+                user_id=user_id,
+                card_id=card_id,
+                session_id=session.id,
+                session_item_id=item.id,
+                session_type=session.session_type,
+                result=result,
+                reviewed_at=reviewed_at,
+                card_state_before_review="reviewing",
+                review_state_before="reviewing",
+                review_state_after="reviewing",
+                mastery_score_before=1,
+                mastery_score_after=2,
+                recovery_stage_before=0,
+                recovery_stage_after=0,
+            )
+            db.add(log)
+            db.commit()
+            return log.id
+
     def test_overview_requires_token_and_does_not_count_all_new_cards_as_required(self):
         for index in range(20):
             self.create_card(content=f"new {index}", content_normalized=f"new {index}")
@@ -332,6 +387,223 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
         with TestingSessionLocal() as db:
             session = db.get(ReviewSession, session_id)
             self.assertEqual("completed", session.status)
+
+    def test_history_returns_grouped_card_summaries(self):
+        card_a = self.create_card(
+            content="aggregate alpha",
+            content_normalized="aggregate alpha",
+            understanding="first meaning",
+            note="first note",
+            card_type="phrase",
+            exam_scene="IELTS",
+            exam_module="reading",
+        )
+        card_b = self.create_card(content="aggregate beta", content_normalized="aggregate beta")
+        self.create_review_log(card_a, "forgot", NOW - timedelta(hours=3))
+        self.create_review_log(card_b, "shaky", NOW - timedelta(hours=2))
+        self.create_review_log(card_a, "got_it", NOW - timedelta(hours=1))
+
+        response = self.client.get("/api/reviews/history", headers=self.auth_headers())
+
+        self.assertEqual(200, response.status_code, response.text)
+        data = response.json()
+        self.assertEqual(2, data["total"])
+        self.assertEqual(20, data["limit"])
+        self.assertEqual(0, data["offset"])
+        self.assertEqual([str(card_a), str(card_b)], [item["card_id"] for item in data["items"]])
+        first = data["items"][0]
+        self.assertEqual("aggregate alpha", first["content"])
+        self.assertEqual("first meaning", first["understanding"])
+        self.assertEqual("first note", first["note"])
+        self.assertEqual("phrase", first["card_type"])
+        self.assertEqual("IELTS", first["exam_scene"])
+        self.assertEqual("reading", first["exam_module"])
+        self.assertEqual(2, first["review_count_in_range"])
+        self.assertEqual("got_it", first["last_result"])
+        self.assertEqual("基本掌握", first["last_result_label"])
+        self.assertTrue(first["last_reviewed_at"].startswith("2026-05-08T08:30:00"))
+
+    def test_history_aggregation_uses_latest_log_within_card(self):
+        card_id = self.create_card(content="latest card", content_normalized="latest card")
+        self.create_review_log(card_id, "forgot", NOW - timedelta(hours=4))
+        self.create_review_log(card_id, "shaky", NOW - timedelta(hours=2))
+        self.create_review_log(card_id, "fluent", NOW)
+
+        response = self.client.get("/api/reviews/history", headers=self.auth_headers())
+
+        self.assertEqual(200, response.status_code, response.text)
+        item = response.json()["items"][0]
+        self.assertEqual(1, response.json()["total"])
+        self.assertEqual(3, item["review_count_in_range"])
+        self.assertEqual("fluent", item["last_result"])
+        self.assertEqual("很熟了", item["last_result_label"])
+        self.assertTrue(item["last_reviewed_at"].startswith("2026-05-08T09:30:00"))
+
+    def test_history_sorts_by_last_reviewed_at_desc(self):
+        oldest = self.create_card(content="oldest", content_normalized="oldest")
+        newest = self.create_card(content="newest", content_normalized="newest")
+        middle = self.create_card(content="middle", content_normalized="middle")
+        self.create_review_log(oldest, "forgot", NOW - timedelta(days=3))
+        self.create_review_log(newest, "got_it", NOW)
+        self.create_review_log(middle, "shaky", NOW - timedelta(days=1))
+
+        response = self.client.get("/api/reviews/history", headers=self.auth_headers())
+
+        self.assertEqual(200, response.status_code, response.text)
+        self.assertEqual(
+            [str(newest), str(middle), str(oldest)],
+            [item["card_id"] for item in response.json()["items"]],
+        )
+
+    def test_history_result_filter_uses_latest_result_per_card(self):
+        changed = self.create_card(content="changed result", content_normalized="changed result")
+        still_forgot = self.create_card(content="still forgot", content_normalized="still forgot")
+        self.create_review_log(changed, "forgot", NOW - timedelta(hours=2))
+        self.create_review_log(changed, "got_it", NOW - timedelta(hours=1))
+        self.create_review_log(still_forgot, "forgot", NOW)
+
+        forgot_response = self.client.get(
+            "/api/reviews/history",
+            headers=self.auth_headers(),
+            params={"result": "forgot"},
+        )
+        got_it_response = self.client.get(
+            "/api/reviews/history",
+            headers=self.auth_headers(),
+            params={"result": "got_it"},
+        )
+
+        self.assertEqual(200, forgot_response.status_code, forgot_response.text)
+        self.assertEqual([str(still_forgot)], [item["card_id"] for item in forgot_response.json()["items"]])
+        self.assertEqual(1, forgot_response.json()["total"])
+        self.assertEqual(200, got_it_response.status_code, got_it_response.text)
+        self.assertEqual([str(changed)], [item["card_id"] for item in got_it_response.json()["items"]])
+        self.assertEqual(1, got_it_response.json()["total"])
+
+    def test_history_date_range_counts_only_logs_in_range(self):
+        card_id = self.create_card(content="date range", content_normalized="date range")
+        self.create_review_log(card_id, "forgot", datetime(2026, 5, 6, 12, 0, tzinfo=timezone.utc))
+        self.create_review_log(card_id, "shaky", datetime(2026, 5, 8, 6, 0, tzinfo=timezone.utc))
+        self.create_review_log(card_id, "fluent", datetime(2026, 5, 9, 18, 0, tzinfo=timezone.utc))
+
+        response = self.client.get(
+            "/api/reviews/history",
+            headers=self.auth_headers(),
+            params={"date_from": "2026-05-08", "date_to": "2026-05-08"},
+        )
+
+        self.assertEqual(200, response.status_code, response.text)
+        data = response.json()
+        self.assertEqual(1, data["total"])
+        self.assertEqual(1, data["items"][0]["review_count_in_range"])
+        self.assertEqual("shaky", data["items"][0]["last_result"])
+        self.assertTrue(data["items"][0]["last_reviewed_at"].startswith("2026-05-08T06:00:00"))
+
+    def test_history_limit_offset_apply_to_grouped_cards(self):
+        first = self.create_card(content="first page", content_normalized="first page")
+        second = self.create_card(content="second page", content_normalized="second page")
+        third = self.create_card(content="third page", content_normalized="third page")
+        self.create_review_log(first, "forgot", NOW - timedelta(days=2))
+        self.create_review_log(first, "got_it", NOW)
+        self.create_review_log(second, "shaky", NOW - timedelta(days=1))
+        self.create_review_log(third, "fluent", NOW - timedelta(days=3))
+
+        response = self.client.get(
+            "/api/reviews/history",
+            headers=self.auth_headers(),
+            params={"limit": 1, "offset": 1},
+        )
+
+        self.assertEqual(200, response.status_code, response.text)
+        data = response.json()
+        self.assertEqual(3, data["total"])
+        self.assertEqual(1, data["limit"])
+        self.assertEqual(1, data["offset"])
+        self.assertEqual([str(second)], [item["card_id"] for item in data["items"]])
+
+    def test_history_search_matches_card_fields_and_empty_search_result(self):
+        content_card = self.create_card(content="alpha phrase", content_normalized="alpha phrase")
+        understanding_card = self.create_card(
+            content="understanding card",
+            content_normalized="understanding card",
+            understanding="target meaning",
+        )
+        note_card = self.create_card(
+            content="note card",
+            content_normalized="note card",
+            note="sticky note",
+        )
+        scene_card = self.create_card(
+            content="scene card",
+            content_normalized="scene card",
+            exam_scene="IELTS",
+        )
+        module_card = self.create_card(
+            content="module card",
+            content_normalized="module card",
+            exam_module="reading module",
+        )
+        for card_id in (content_card, understanding_card, note_card, scene_card, module_card):
+            self.create_review_log(card_id, "got_it", NOW)
+
+        cases = [
+            ("alpha", content_card),
+            ("target meaning", understanding_card),
+            ("sticky", note_card),
+            ("IELTS", scene_card),
+            ("reading module", module_card),
+        ]
+        for keyword, expected_card in cases:
+            with self.subTest(keyword=keyword):
+                response = self.client.get(
+                    "/api/reviews/history",
+                    headers=self.auth_headers(),
+                    params={"search": keyword},
+                )
+                self.assertEqual(200, response.status_code, response.text)
+                data = response.json()
+                self.assertEqual(1, data["total"])
+                self.assertEqual([str(expected_card)], [item["card_id"] for item in data["items"]])
+
+        empty = self.client.get(
+            "/api/reviews/history",
+            headers=self.auth_headers(),
+            params={"search": "not-found"},
+        )
+        self.assertEqual(200, empty.status_code, empty.text)
+        self.assertEqual(0, empty.json()["total"])
+        self.assertEqual([], empty.json()["items"])
+
+    def test_history_empty_state_returns_empty_items(self):
+        self.create_card(content="no logs", content_normalized="no logs")
+
+        response = self.client.get("/api/reviews/history", headers=self.auth_headers())
+
+        self.assertEqual(200, response.status_code, response.text)
+        self.assertEqual({"items": [], "total": 0, "limit": 20, "offset": 0}, response.json())
+
+    def test_history_is_limited_to_current_user(self):
+        own_card = self.create_card(content="own card", content_normalized="own card")
+        other_card = self.create_card(
+            user_id=self.other_user_uuid,
+            content="other card",
+            content_normalized="other card",
+        )
+        self.create_review_log(own_card, "got_it", NOW)
+        self.create_review_log(other_card, "forgot", NOW, user_id=self.other_user_uuid)
+
+        own_response = self.client.get("/api/reviews/history", headers=self.auth_headers())
+        other_response = self.client.get(
+            "/api/reviews/history",
+            headers=self.auth_headers(self.other_token),
+        )
+
+        self.assertEqual(200, own_response.status_code, own_response.text)
+        self.assertEqual([str(own_card)], [item["card_id"] for item in own_response.json()["items"]])
+        self.assertEqual(1, own_response.json()["total"])
+        self.assertEqual(200, other_response.status_code, other_response.text)
+        self.assertEqual([str(other_card)], [item["card_id"] for item in other_response.json()["items"]])
+        self.assertEqual(1, other_response.json()["total"])
 
     def _start_session(self):
         """Helper: start a review session and return session data + first item."""
