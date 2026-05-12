@@ -647,7 +647,7 @@ def get_review_history(
     offset: int = Query(default=0, ge=0),
     date_from: date | None = None,
     date_to: date | None = None,
-    result: ReviewResult | None = None,
+    result: list[ReviewResult] | None = Query(default=None),
     search: str | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -708,8 +708,8 @@ def get_review_history(
             ),
         )
     ]
-    if result is not None:
-        history_filters.append(latest_logs.c.last_result == result)
+    if result:
+        history_filters.append(latest_logs.c.last_result.in_(result))
 
     normalized_search = search.strip() if search else None
     if normalized_search:
@@ -761,6 +761,7 @@ def get_review_history(
 def get_review_history_summary(
     date_from: date | None = None,
     date_to: date | None = None,
+    search: str | None = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> ReviewHistorySummaryResponse:
@@ -776,6 +777,21 @@ def get_review_history_summary(
         log_filters.append(ReviewLog.reviewed_at >= start_at)
     if end_before is not None:
         log_filters.append(ReviewLog.reviewed_at < end_before)
+
+    normalized_search = search.strip() if search else None
+    if normalized_search:
+        pattern = f"%{normalized_search}%"
+        matching_card_ids = select(Card.id).where(
+            Card.user_id == current_user.id,
+            or_(
+                Card.content.ilike(pattern),
+                Card.understanding.ilike(pattern),
+                Card.note.ilike(pattern),
+                Card.exam_scene.ilike(pattern),
+                Card.exam_module.ilike(pattern),
+            )
+        )
+        log_filters.append(ReviewLog.card_id.in_(matching_card_ids))
 
     total_reviews = db.scalar(
         select(func.count()).select_from(ReviewLog).where(*log_filters)

@@ -736,6 +736,119 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
             other_response.json()["latest_result_card_counts"],
         )
 
+    def test_history_result_single_value_still_compatible(self):
+        card_a = self.create_card(content="compat a", content_normalized="compat a")
+        card_b = self.create_card(content="compat b", content_normalized="compat b")
+        self.create_review_log(card_a, "forgot", NOW - timedelta(hours=2))
+        self.create_review_log(card_b, "got_it", NOW - timedelta(hours=1))
+
+        response = self.client.get(
+            "/api/reviews/history",
+            headers=self.auth_headers(),
+            params={"result": "forgot"},
+        )
+        self.assertEqual(200, response.status_code, response.text)
+        data = response.json()
+        self.assertEqual(1, data["total"])
+        self.assertEqual(str(card_a), data["items"][0]["card_id"])
+
+    def test_history_result_multi_value_got_it_fluent(self):
+        card_a = self.create_card(content="multi a", content_normalized="multi a")
+        card_b = self.create_card(content="multi b", content_normalized="multi b")
+        card_c = self.create_card(content="multi c", content_normalized="multi c")
+        self.create_review_log(card_a, "forgot", NOW - timedelta(hours=3))
+        self.create_review_log(card_b, "got_it", NOW - timedelta(hours=2))
+        self.create_review_log(card_c, "fluent", NOW - timedelta(hours=1))
+
+        response = self.client.get(
+            "/api/reviews/history",
+            headers=self.auth_headers(),
+            params={"result": ["got_it", "fluent"]},
+        )
+        self.assertEqual(200, response.status_code, response.text)
+        data = response.json()
+        self.assertEqual(2, data["total"])
+        returned_ids = [item["card_id"] for item in data["items"]]
+        self.assertIn(str(card_b), returned_ids)
+        self.assertIn(str(card_c), returned_ids)
+
+    def test_history_result_multi_value_with_search(self):
+        card_a = self.create_card(content="apple pie", content_normalized="apple pie")
+        card_b = self.create_card(content="apple juice", content_normalized="apple juice")
+        card_c = self.create_card(content="banana bread", content_normalized="banana bread")
+        self.create_review_log(card_a, "got_it", NOW - timedelta(hours=3))
+        self.create_review_log(card_b, "fluent", NOW - timedelta(hours=2))
+        self.create_review_log(card_c, "got_it", NOW - timedelta(hours=1))
+
+        response = self.client.get(
+            "/api/reviews/history",
+            headers=self.auth_headers(),
+            params={"result": ["got_it", "fluent"], "search": "apple"},
+        )
+        self.assertEqual(200, response.status_code, response.text)
+        data = response.json()
+        self.assertEqual(2, data["total"])
+        returned_ids = [item["card_id"] for item in data["items"]]
+        self.assertIn(str(card_a), returned_ids)
+        self.assertIn(str(card_b), returned_ids)
+
+    def test_history_result_multi_value_with_limit_offset(self):
+        cards = []
+        for i in range(6):
+            card_id = self.create_card(
+                content=f"multi page {i}", content_normalized=f"multi page {i}"
+            )
+            cards.append(card_id)
+            self.create_review_log(card_id, "forgot", NOW - timedelta(hours=i))
+        cards.reverse()
+
+        response = self.client.get(
+            "/api/reviews/history",
+            headers=self.auth_headers(),
+            params={"result": "forgot", "limit": 2, "offset": 1},
+        )
+        self.assertEqual(200, response.status_code, response.text)
+        data = response.json()
+        self.assertEqual(6, data["total"])
+        self.assertEqual(2, len(data["items"]))
+        returned_ids = [item["card_id"] for item in data["items"]]
+        self.assertNotIn(str(cards[0]), returned_ids)
+
+    def test_history_summary_search_narrows_counts(self):
+        card_a = self.create_card(content="alpha", content_normalized="alpha", understanding="first")
+        card_b = self.create_card(content="beta", content_normalized="beta")
+        self.create_review_log(card_a, "got_it", NOW - timedelta(hours=2))
+        self.create_review_log(card_b, "fluent", NOW - timedelta(hours=1))
+
+        response = self.client.get(
+            "/api/reviews/history/summary",
+            headers=self.auth_headers(),
+            params={"search": "alpha"},
+        )
+        self.assertEqual(200, response.status_code, response.text)
+        data = response.json()
+        self.assertEqual(1, data["total_reviews"])
+        self.assertEqual(1, data["unique_cards"])
+        self.assertEqual(1, data["latest_result_card_counts"]["got_it"])
+
+    def test_history_summary_search_empty_result(self):
+        card = self.create_card(content="present", content_normalized="present")
+        self.create_review_log(card, "fluent", NOW)
+
+        response = self.client.get(
+            "/api/reviews/history/summary",
+            headers=self.auth_headers(),
+            params={"search": "not-found"},
+        )
+        self.assertEqual(200, response.status_code, response.text)
+        data = response.json()
+        self.assertEqual(0, data["total_reviews"])
+        self.assertEqual(0, data["unique_cards"])
+        self.assertEqual(
+            {"forgot": 0, "shaky": 0, "got_it": 0, "fluent": 0},
+            data["latest_result_card_counts"],
+        )
+
     def _start_session(self):
         """Helper: start a review session and return session data + first item."""
         self.create_card(content="card a", content_normalized="card a")
