@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 from uuid import UUID
 
@@ -145,6 +145,21 @@ class ReviewHistoryResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class ReviewHistoryResultCounts(BaseModel):
+    forgot: int = 0
+    shaky: int = 0
+    got_it: int = 0
+    fluent: int = 0
+
+
+class ReviewHistorySummaryResponse(BaseModel):
+    total_reviews: int
+    unique_cards: int
+    latest_result_card_counts: ReviewHistoryResultCounts
+    date_from: date | None = None
+    date_to: date | None = None
 
 
 class ReviewLogResponse(BaseModel):

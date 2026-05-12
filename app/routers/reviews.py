@@ -15,6 +15,8 @@ from app.schemas.reviews import (
     ReviewFeedbackResponse,
     ReviewHistoryItemResponse,
     ReviewHistoryResponse,
+    ReviewHistoryResultCounts,
+    ReviewHistorySummaryResponse,
     ReviewItemResponse,
     ReviewOverviewResponse,
     ReviewProgressResponse,
@@ -752,6 +754,75 @@ def get_review_history(
         total=total,
         limit=limit,
         offset=offset,
+    )
+
+
+@router.get("/history/summary", response_model=ReviewHistorySummaryResponse)
+def get_review_history_summary(
+    date_from: date | None = None,
+    date_to: date | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ReviewHistorySummaryResponse:
+    if date_from is not None and date_to is not None and date_from > date_to:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="date_from must be earlier than or equal to date_to",
+        )
+
+    start_at, end_before = _history_date_bounds(date_from, date_to, current_user.timezone)
+    log_filters = [ReviewLog.user_id == current_user.id]
+    if start_at is not None:
+        log_filters.append(ReviewLog.reviewed_at >= start_at)
+    if end_before is not None:
+        log_filters.append(ReviewLog.reviewed_at < end_before)
+
+    total_reviews = db.scalar(
+        select(func.count()).select_from(ReviewLog).where(*log_filters)
+    ) or 0
+    unique_cards = db.scalar(
+        select(func.count(func.distinct(ReviewLog.card_id))).select_from(ReviewLog).where(*log_filters)
+    ) or 0
+
+    filtered_logs = (
+        select(
+            ReviewLog.card_id.label("card_id"),
+            ReviewLog.result.label("result"),
+            func.row_number()
+            .over(
+                partition_by=ReviewLog.card_id,
+                order_by=(ReviewLog.reviewed_at.desc(), ReviewLog.id.desc()),
+            )
+            .label("row_number"),
+        )
+        .where(*log_filters)
+        .cte("filtered_summary_review_logs")
+    )
+    latest_logs = (
+        select(
+            filtered_logs.c.card_id,
+            filtered_logs.c.result,
+        )
+        .where(filtered_logs.c.row_number == 1)
+        .cte("latest_summary_review_logs")
+    )
+
+    counts = {"forgot": 0, "shaky": 0, "got_it": 0, "fluent": 0}
+    count_rows = db.execute(
+        select(latest_logs.c.result, func.count())
+        .select_from(latest_logs)
+        .group_by(latest_logs.c.result)
+    ).all()
+    for result_value, count in count_rows:
+        if result_value in counts:
+            counts[result_value] = count
+
+    return ReviewHistorySummaryResponse(
+        total_reviews=total_reviews,
+        unique_cards=unique_cards,
+        latest_result_card_counts=ReviewHistoryResultCounts(**counts),
+        date_from=date_from,
+        date_to=date_to,
     )
 
 
