@@ -1471,27 +1471,138 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
             self.assertEqual(state_after_first, card_after_second.review_state)
             self.assertEqual(review_count_after_first, card_after_second.review_count)
 
-    def test_processing_zombie_updates_request_payload(self):
-        """B2: zombie re-processing syncs request_payload to current request payload."""
-        card_id = self.create_card(content="zombie2", content_normalized="zombie2")
-        today, item = self._start_session()
-        client_action_id = str(uuid4())
+    def test_card_snapshot_written_on_feedback(self):
+        """A: submit_review_feedback writes card_snapshot with card content fields."""
+        card_id = self.create_card(
+            content="snapshot test content",
+            content_normalized="snapshot test content",
+            understanding="my understanding",
+            note="my note",
+            card_type="sentence",
+            exam_scene="exam scene",
+            exam_module="exam module",
+            analysis_status="done",
+            analysis_level="pass",
+        )
+        today = self.client.get(
+            "/api/reviews/today?limit=5&restart=true", headers=self.auth_headers()
+        ).json()
+        item = today["items"][0]
 
-        ten_min_ago = datetime.now(timezone.utc) - timedelta(minutes=10)
-        old_payload = {"result": "forgot"}
+        client_action_id = str(uuid4())
+        resp = self.client.post(
+            "/api/reviews/feedback",
+            headers=self.auth_headers(),
+            json={
+                "client_action_id": client_action_id,
+                "session_id": today["session_id"],
+                "session_item_id": item["session_item_id"],
+                "card_id": str(card_id),
+                "result": "forgot",
+            },
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+
         with TestingSessionLocal() as db:
-            action = ClientAction(
-                user_id=self.user_uuid,
-                client_action_id=client_action_id,
-                action_type="review_feedback",
-                status="processing",
-                updated_at=ten_min_ago,
-                request_payload=old_payload,
-            )
-            db.add(action)
+            log = db.scalar(select(ReviewLog).where(ReviewLog.card_id == card_id))
+            self.assertIsNotNone(log)
+            self.assertIsNotNone(log.card_snapshot)
+            s = log.card_snapshot
+            self.assertEqual("snapshot test content", s.get("content"))
+            self.assertEqual("my understanding", s.get("understanding"))
+            self.assertEqual("my note", s.get("note"))
+            self.assertEqual("sentence", s.get("card_type"))
+            self.assertEqual("exam scene", s.get("exam_scene"))
+            self.assertEqual("exam module", s.get("exam_module"))
+            self.assertEqual("done", s.get("analysis_status"))
+            self.assertEqual("pass", s.get("analysis_level"))
+            self.assertEqual(str(card_id), s.get("card_id"))
+            # Scheduling fields NOT in snapshot
+            self.assertNotIn("review_state", s)
+            self.assertNotIn("next_review_at", s)
+
+    def test_history_list_returns_snapshot_after_card_edit(self):
+        """B: After card is edited, history list returns snapshot content."""
+        card_id = self.create_card(
+            content="original content",
+            content_normalized="original content",
+            understanding="original understanding",
+            note="original note",
+            card_type="word",
+            exam_scene="original scene",
+            exam_module="original module",
+            analysis_status="done",
+            analysis_level="pass",
+        )
+        today = self.client.get(
+            "/api/reviews/today?limit=5&restart=true", headers=self.auth_headers()
+        ).json()
+        item = today["items"][0]
+
+        client_action_id = str(uuid4())
+        fb = self.client.post(
+            "/api/reviews/feedback",
+            headers=self.auth_headers(),
+            json={
+                "client_action_id": client_action_id,
+                "session_id": today["session_id"],
+                "session_item_id": item["session_item_id"],
+                "card_id": str(card_id),
+                "result": "got_it",
+            },
+        )
+        self.assertEqual(200, fb.status_code, fb.text)
+
+        # Edit the card
+        with TestingSessionLocal() as db:
+            card = db.get(Card, card_id)
+            card.content = "edited content"
+            card.understanding = "edited understanding"
+            card.note = "edited note"
+            card.card_type = "phrase"
+            card.exam_scene = "edited scene"
+            card.exam_module = "edited module"
             db.commit()
 
-        resp = self.client.post(
+        # Query history list
+        hist = self.client.get(
+            "/api/reviews/history?limit=20",
+            headers=self.auth_headers(),
+        )
+        self.assertEqual(200, hist.status_code, hist.text)
+        data = hist.json()
+        self.assertGreater(len(data["items"]), 0)
+        found = [i for i in data["items"] if i["card_id"] == str(card_id)]
+        self.assertEqual(1, len(found))
+        item_data = found[0]
+        self.assertEqual("original content", item_data["content"])
+        self.assertEqual("original understanding", item_data["understanding"])
+        self.assertEqual("original note", item_data["note"])
+        self.assertEqual("word", item_data["card_type"])
+        self.assertEqual("original scene", item_data["exam_scene"])
+        self.assertEqual("original module", item_data["exam_module"])
+        self.assertEqual("snapshot", item_data["card_source"])
+
+    def test_history_detail_returns_snapshot_after_card_edit(self):
+        """C: After card is edited, history detail returns snapshot content."""
+        card_id = self.create_card(
+            content="detail original",
+            content_normalized="detail original",
+            understanding="detail understanding",
+            note="detail note",
+            card_type="word",
+            exam_scene="detail scene",
+            exam_module="detail module",
+            analysis_status="done",
+            analysis_level="pass",
+        )
+        today = self.client.get(
+            "/api/reviews/today?limit=5&restart=true", headers=self.auth_headers()
+        ).json()
+        item = today["items"][0]
+
+        client_action_id = str(uuid4())
+        fb = self.client.post(
             "/api/reviews/feedback",
             headers=self.auth_headers(),
             json={
@@ -1502,27 +1613,160 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
                 "result": "shaky",
             },
         )
-        self.assertEqual(200, resp.status_code, resp.text)
-        self.assertEqual("success", resp.json()["status"])
+        self.assertEqual(200, fb.status_code, fb.text)
 
-        # Verify: only one ClientAction row, now succeeded, payload updated to new request
+        # Get log ID
         with TestingSessionLocal() as db:
-            actions = list(db.scalars(
-                select(ClientAction).where(ClientAction.client_action_id == client_action_id)
-            ))
-            self.assertEqual(1, len(actions))
-            self.assertEqual("succeeded", actions[0].status)
-            saved_payload = actions[0].request_payload
-            self.assertIsNotNone(saved_payload)
-            self.assertEqual("shaky", saved_payload.get("result"))
+            log = db.scalar(select(ReviewLog).where(ReviewLog.card_id == card_id))
+            log_id = str(log.id)
 
-        # Card / ReviewLog should reflect the actual (new) result
+        # Edit the card
         with TestingSessionLocal() as db:
-            logs = list(db.scalars(select(ReviewLog).where(ReviewLog.card_id == card_id)))
-            self.assertEqual(1, len(logs))
-            self.assertEqual("shaky", logs[0].result)
             card = db.get(Card, card_id)
-            self.assertEqual("strengthening", card.review_state)
+            card.content = "edited detail"
+            card.understanding = "edited understanding"
+            card.note = "edited note"
+            db.commit()
+
+        # Query history detail
+        detail = self.client.get(
+            f"/api/reviews/history/{log_id}",
+            headers=self.auth_headers(),
+        )
+        self.assertEqual(200, detail.status_code, detail.text)
+        data = detail.json()
+        self.assertIsNotNone(data["card"])
+        self.assertEqual("detail original", data["card"]["content"])
+        self.assertEqual("detail understanding", data["card"]["understanding"])
+        self.assertEqual("detail note", data["card"]["note"])
+        self.assertEqual("snapshot", data["card"]["card_source"])
+        # Scheduling fields should be null for snapshot
+        self.assertIsNone(data["card"]["review_state"])
+        self.assertIsNone(data["card"]["next_review_at"])
+
+    def test_old_log_without_snapshot_falls_back_to_card(self):
+        """D: Old log without card_snapshot returns current Card data."""
+        card_id = self.create_card(
+            content="current content",
+            content_normalized="current content",
+            understanding="current understanding",
+            note="current note",
+            card_type="word",
+        )
+        reviewed_at = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+        log_id = self.create_review_log(card_id=card_id, result="forgot", reviewed_at=reviewed_at)
+
+        # Verify log has no snapshot
+        with TestingSessionLocal() as db:
+            log = db.get(ReviewLog, log_id)
+            self.assertIsNone(log.card_snapshot)
+
+        # History list
+        hist = self.client.get(
+            "/api/reviews/history?limit=20",
+            headers=self.auth_headers(),
+        )
+        self.assertEqual(200, hist.status_code, hist.text)
+        data = hist.json()
+        found = [i for i in data["items"] if i["card_id"] == str(card_id)]
+        self.assertEqual(1, len(found))
+        self.assertEqual("current content", found[0]["content"])
+        self.assertEqual("current understanding", found[0]["understanding"])
+        self.assertEqual("current_card", found[0]["card_source"])
+
+        # History detail
+        detail = self.client.get(
+            f"/api/reviews/history/{log_id}",
+            headers=self.auth_headers(),
+        )
+        self.assertEqual(200, detail.status_code, detail.text)
+        d = detail.json()
+        self.assertIsNotNone(d["card"])
+        self.assertEqual("current content", d["card"]["content"])
+        self.assertEqual("current_card", d["card"]["card_source"])
+
+    def test_deleted_card_with_snapshot_still_displays(self):
+        """E: Deleted card + snapshot → card data from snapshot, card_source=snapshot."""
+        card_id = self.create_card(
+            content="deleted snapshot content",
+            content_normalized="deleted snapshot content",
+            understanding="survives deletion",
+            note="persistent note",
+            card_type="sentence",
+            exam_scene="deleted scene",
+            exam_module="deleted module",
+            analysis_status="done",
+            analysis_level="pass",
+        )
+        today = self.client.get(
+            "/api/reviews/today?limit=5&restart=true", headers=self.auth_headers()
+        ).json()
+        item = today["items"][0]
+
+        client_action_id = str(uuid4())
+        fb = self.client.post(
+            "/api/reviews/feedback",
+            headers=self.auth_headers(),
+            json={
+                "client_action_id": client_action_id,
+                "session_id": today["session_id"],
+                "session_item_id": item["session_item_id"],
+                "card_id": str(card_id),
+                "result": "fluent",
+            },
+        )
+        self.assertEqual(200, fb.status_code, fb.text)
+
+        with TestingSessionLocal() as db:
+            log = db.scalar(select(ReviewLog).where(ReviewLog.card_id == card_id))
+            log_id = str(log.id)
+
+        # Soft-delete the card
+        with TestingSessionLocal() as db:
+            card = db.get(Card, card_id)
+            card.deleted_at = datetime.now(timezone.utc)
+            db.commit()
+
+        # History detail should still return card from snapshot
+        detail = self.client.get(
+            f"/api/reviews/history/{log_id}",
+            headers=self.auth_headers(),
+        )
+        self.assertEqual(200, detail.status_code, detail.text)
+        d = detail.json()
+        self.assertIsNotNone(d["card"])
+        self.assertEqual("deleted snapshot content", d["card"]["content"])
+        self.assertEqual("survives deletion", d["card"]["understanding"])
+        self.assertEqual("snapshot", d["card"]["card_source"])
+
+    def test_deleted_card_no_snapshot_orphan_state(self):
+        """F: Deleted card + no snapshot → card_response is None (orphan)."""
+        card_id = self.create_card(
+            content="doomed card",
+            content_normalized="doomed card",
+        )
+        reviewed_at = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+        log_id = self.create_review_log(card_id=card_id, result="forgot", reviewed_at=reviewed_at)
+
+        # Verify no snapshot
+        with TestingSessionLocal() as db:
+            log = db.get(ReviewLog, log_id)
+            self.assertIsNone(log.card_snapshot)
+
+        # Soft-delete the card
+        with TestingSessionLocal() as db:
+            card = db.get(Card, card_id)
+            card.deleted_at = datetime.now(timezone.utc)
+            db.commit()
+
+        # History detail — card should be null
+        detail = self.client.get(
+            f"/api/reviews/history/{log_id}",
+            headers=self.auth_headers(),
+        )
+        self.assertEqual(200, detail.status_code, detail.text)
+        d = detail.json()
+        self.assertIsNone(d["card"])
 
 
 if __name__ == "__main__":

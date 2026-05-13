@@ -14,6 +14,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Uuid,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -146,6 +147,9 @@ class ReviewRecord(Base):
     session_item: Mapped["ReviewSessionItem | None"] = relationship(back_populates="review_records")
 
 
+json_messages_type = JSON().with_variant(JSONB, "postgresql")
+
+
 class ReviewLog(Base):
     __tablename__ = "review_logs"
     __table_args__ = (
@@ -166,6 +170,7 @@ class ReviewLog(Base):
     result: Mapped[str] = mapped_column(String(32), nullable=False)
     session_type: Mapped[str] = mapped_column(String(32), nullable=False, default="daily_suggested")
     reviewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    card_snapshot: Mapped[dict | None] = mapped_column(json_messages_type, nullable=True)
     card_state_before_review: Mapped[str] = mapped_column(String(32), nullable=False)
     review_state_before: Mapped[str] = mapped_column(String(32), nullable=False)
     review_state_after: Mapped[str] = mapped_column(String(32), nullable=False)

@@ -208,20 +208,46 @@ def _today_response(session: ReviewSession | None, limit: int, now: datetime, it
     )
 
 
+def _build_card_snapshot(card: Card) -> dict:
+    """Capture stable card content at review time, before feedback mutates Card state."""
+    return {
+        "card_id": str(card.id),
+        "content": card.content,
+        "understanding": card.understanding,
+        "note": card.note,
+        "card_type": card.card_type,
+        "exam_scene": card.exam_scene,
+        "exam_module": card.exam_module,
+        "analysis_status": card.analysis_status,
+        "analysis_level": card.analysis_level,
+    }
+
+
 def _review_history_item_response(row) -> ReviewHistoryItemResponse:
+    snapshot = getattr(row, "card_snapshot", None) or {}
+    card_source = "snapshot" if snapshot else ("current_card" if row.content else "missing")
+
+    content = snapshot.get("content") or row.content or ""
+    understanding = snapshot.get("understanding") or row.understanding
+    note = snapshot.get("note") or row.note
+    card_type = snapshot.get("card_type") or row.card_type
+    exam_scene = snapshot.get("exam_scene") or row.exam_scene
+    exam_module = snapshot.get("exam_module") or row.exam_module
+
     return ReviewHistoryItemResponse(
         review_log_id=row.review_log_id,
         card_id=row.card_id,
-        content=row.content or "",
-        understanding=row.understanding,
-        note=row.note,
-        card_type=row.card_type,
-        exam_scene=row.exam_scene,
-        exam_module=row.exam_module,
+        content=content,
+        understanding=understanding,
+        note=note,
+        card_type=card_type,
+        exam_scene=exam_scene,
+        exam_module=exam_module,
         review_count_in_range=row.review_count_in_range,
         last_result=row.last_result,
         last_result_label=REVIEW_RESULT_LABELS[row.last_result],
         last_reviewed_at=row.last_reviewed_at,
+        card_source=card_source,
     )
 
 
@@ -681,6 +707,7 @@ def get_review_history(
             ReviewLog.card_id.label("card_id"),
             ReviewLog.result.label("result"),
             ReviewLog.reviewed_at.label("reviewed_at"),
+            ReviewLog.card_snapshot.label("card_snapshot"),
             func.count(ReviewLog.id).over(partition_by=ReviewLog.card_id).label("review_count_in_range"),
             func.row_number()
             .over(
@@ -699,6 +726,7 @@ def get_review_history(
             filtered_logs.c.result.label("last_result"),
             filtered_logs.c.reviewed_at.label("last_reviewed_at"),
             filtered_logs.c.review_count_in_range,
+            filtered_logs.c.card_snapshot,
         )
         .where(filtered_logs.c.row_number == 1)
         .cte("latest_review_logs")
@@ -749,6 +777,7 @@ def get_review_history(
             latest_logs.c.review_count_in_range,
             latest_logs.c.last_result,
             latest_logs.c.last_reviewed_at,
+            latest_logs.c.card_snapshot,
         )
         .select_from(card_join)
         .where(*history_filters)
@@ -875,28 +904,49 @@ def get_review_history_detail(
         )
 
     card_response = None
-    card_obj = db.scalar(
-        select(Card).where(
-            Card.id == log.card_id,
-            Card.user_id == current_user.id,
-            Card.deleted_at.is_(None),
-            Card.status == "active",
-        )
-    )
+    card_source = "missing"
 
-    if card_obj is not None:
+    if log.card_snapshot:
+        s = log.card_snapshot
         card_response = ReviewHistoryDetailCardResponse(
-            id=card_obj.id,
-            card_id=card_obj.id,
-            content=card_obj.content,
-            understanding=card_obj.understanding,
-            note=card_obj.note,
-            card_type=card_obj.card_type,
-            exam_scene=card_obj.exam_scene,
-            exam_module=card_obj.exam_module,
-            review_state=card_obj.review_state,
-            next_review_at=card_obj.next_review_at,
+            id=log.card_id,
+            card_id=log.card_id,
+            content=s.get("content", ""),
+            understanding=s.get("understanding"),
+            note=s.get("note"),
+            card_type=s.get("card_type"),
+            exam_scene=s.get("exam_scene"),
+            exam_module=s.get("exam_module"),
+            review_state=None,
+            next_review_at=None,
+            card_source="snapshot",
         )
+        card_source = "snapshot"
+    else:
+        card_obj = db.scalar(
+            select(Card).where(
+                Card.id == log.card_id,
+                Card.user_id == current_user.id,
+                Card.deleted_at.is_(None),
+                Card.status == "active",
+            )
+        )
+
+        if card_obj is not None:
+            card_response = ReviewHistoryDetailCardResponse(
+                id=card_obj.id,
+                card_id=card_obj.id,
+                content=card_obj.content,
+                understanding=card_obj.understanding,
+                note=card_obj.note,
+                card_type=card_obj.card_type,
+                exam_scene=card_obj.exam_scene,
+                exam_module=card_obj.exam_module,
+                review_state=card_obj.review_state,
+                next_review_at=card_obj.next_review_at,
+                card_source="current_card",
+            )
+            card_source = "current_card"
 
     session_type_label = SESSION_TYPE_LABELS.get(log.session_type, "其他来源")
 
@@ -1112,10 +1162,13 @@ def submit_review_feedback(
                 detail="Session item does not match card",
             )
 
-        # Step 6: Apply Phase 2 feedback rules
+        # Step 6: Capture card snapshot BEFORE feedback mutates Card state
+        card_snapshot = _build_card_snapshot(card)
+
+        # Step 7: Apply Phase 2 feedback rules
         transitions = apply_review_feedback_to_card(card, payload.result, now)
 
-        # Step 7: Write review_log
+        # Step 8: Write review_log
         log = ReviewLog(
             user_id=current_user.id,
             card_id=card.id,
@@ -1124,6 +1177,7 @@ def submit_review_feedback(
             session_type=session.session_type,
             result=payload.result,
             reviewed_at=payload.reviewed_at or now,
+            card_snapshot=card_snapshot,
             card_state_before_review=transitions["review_state_before"],
             review_state_before=transitions["review_state_before"],
             review_state_after=transitions["review_state_after"],
@@ -1136,14 +1190,14 @@ def submit_review_feedback(
         )
         db.add(log)
 
-        # Step 8: Mark session_item reviewed
+        # Step 9: Mark session_item reviewed
         item.status = "reviewed"
         item.result = payload.result
         item.reviewed_at = payload.reviewed_at or now
         item.final_result = payload.result
         item.first_result = item.first_result or payload.result
 
-        # Step 9: Handle reappear items
+        # Step 10: Handle reappear items
         if should_append_reappear_item(payload.result, item.reappear_count):
             current_max_position = db.scalar(
                 select(func.max(ReviewSessionItem.position)).where(
@@ -1167,7 +1221,7 @@ def submit_review_feedback(
                 )
             )
 
-        # Step 10: Refresh session progress and find next item
+        # Step 11: Refresh session progress and find next item
         db.flush()
         _refresh_session_progress(db, session, now)
         next_item = _next_pending_item(db, session.id)
@@ -1183,7 +1237,7 @@ def submit_review_feedback(
             status="success",
         )
 
-        # Step 11: Mark succeeded
+        # Step 12: Mark succeeded
         mark_action_succeeded(db, action, response_payload=response.model_dump(mode="json"))
         db.commit()
 

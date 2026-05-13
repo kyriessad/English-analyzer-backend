@@ -139,6 +139,7 @@ class ReviewHistoryItemResponse(BaseModel):
     last_result: ReviewResult
     last_result_label: str
     last_reviewed_at: datetime
+    card_source: str = "current_card"
 
 
 class ReviewHistoryResponse(BaseModel):
@@ -196,6 +197,7 @@ class ReviewHistoryDetailCardResponse(BaseModel):
     exam_module: str | None = None
     review_state: str | None = None
     next_review_at: datetime | None = None
+    card_source: str = "current_card"
 
 
 class ReviewHistoryDetailResponse(BaseModel):
