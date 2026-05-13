@@ -347,7 +347,6 @@ def select_review_cards(user_id: UUID, limit: int, now: datetime, db: Session) -
                 Card.status == "active",
                 Card.review_state.in_(tuple(REVIEW_STATES)),
                 Card.is_review_ready.is_(True),
-                Card.analysis_status != "pending",
                 Card.needs_manual_fix.is_(False),
                 or_(
                     Card.review_state == "new",

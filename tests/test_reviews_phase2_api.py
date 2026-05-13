@@ -271,7 +271,7 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
 
         self.assertEqual(200, response.status_code, response.text)
         contents = {item["content"] for item in response.json()["items"]}
-        self.assertEqual({"ready done", "failed ready"}, contents)
+        self.assertEqual({"ready done", "pending card", "failed ready"}, contents)
 
     def test_overview_separates_daily_suggested_from_extra_new_only(self):
         daily_card_id = self.create_card(content="daily new", content_normalized="daily new")

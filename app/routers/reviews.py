@@ -80,7 +80,6 @@ def _review_ready_card_filters(user_id: UUID) -> list:
         *_active_card_filters(user_id),
         Card.review_state.in_(MAIN_REVIEW_STATES),
         Card.is_review_ready.is_(True),
-        Card.analysis_status != "pending",
         Card.needs_manual_fix.is_(False),
     ]
 
@@ -915,6 +914,7 @@ def get_review_history_detail(
 def get_today_reviews(
     limit: int = Query(default=5),
     restart: bool = Query(default=False),
+    session_type: str = Query(default="daily_suggested"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> TodayReviewsResponse:
@@ -924,7 +924,7 @@ def get_today_reviews(
     session, pending_items = _create_or_return_session(
         db,
         user=current_user,
-        session_type="daily_suggested",
+        session_type=session_type,
         now=now,
         limit=normalized_limit,
         restart=restart,
