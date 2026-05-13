@@ -1325,6 +1325,205 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
                 self.assertEqual(200, response.status_code, response.text)
                 self.assertEqual(expected_label, response.json()["result_label"])
 
+    # ===== Phase 6B-1: ClientAction zombie processing tests =====
+
+    def test_processing_non_zombie_returns_409(self):
+        """A: processing not yet zombie → 409, no duplicate ReviewLog, no Card change."""
+        card_id = self.create_card(content="non-zombie", content_normalized="non-zombie")
+        today, item = self._start_session()
+        client_action_id = str(uuid4())
+
+        # Manually insert a fresh processing ClientAction
+        with TestingSessionLocal() as db:
+            action = ClientAction(
+                user_id=self.user_uuid,
+                client_action_id=client_action_id,
+                action_type="review_feedback",
+                status="processing",
+            )
+            db.add(action)
+            db.commit()
+
+        # Submit with same client_action_id — should get 409
+        resp = self.client.post(
+            "/api/reviews/feedback",
+            headers=self.auth_headers(),
+            json={
+                "client_action_id": client_action_id,
+                "session_id": today["session_id"],
+                "session_item_id": item["session_item_id"],
+                "card_id": str(card_id),
+                "result": "forgot",
+            },
+        )
+        self.assertEqual(409, resp.status_code, resp.text)
+        self.assertIn("being processed", resp.json()["detail"])
+
+        # No ReviewLog should have been written
+        with TestingSessionLocal() as db:
+            logs = list(db.scalars(select(ReviewLog).where(ReviewLog.card_id == card_id)))
+            self.assertEqual(0, len(logs))
+            # Card review_state unchanged
+            card = db.get(Card, card_id)
+            self.assertEqual("new", card.review_state)
+
+    def test_processing_zombie_allows_reprocessing(self):
+        """B: processing zombie (>5 min) → re-processing allowed, one ReviewLog written."""
+        card_id = self.create_card(content="zombie", content_normalized="zombie")
+        today, item = self._start_session()
+        client_action_id = str(uuid4())
+
+        # Manually insert a zombie processing ClientAction (10 min ago)
+        ten_min_ago = datetime.now(timezone.utc) - timedelta(minutes=10)
+        with TestingSessionLocal() as db:
+            action = ClientAction(
+                user_id=self.user_uuid,
+                client_action_id=client_action_id,
+                action_type="review_feedback",
+                status="processing",
+                updated_at=ten_min_ago,
+            )
+            db.add(action)
+            db.commit()
+
+        # Submit with same client_action_id — zombie should be re-armed
+        resp = self.client.post(
+            "/api/reviews/feedback",
+            headers=self.auth_headers(),
+            json={
+                "client_action_id": client_action_id,
+                "session_id": today["session_id"],
+                "session_item_id": item["session_item_id"],
+                "card_id": str(card_id),
+                "result": "forgot",
+            },
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        self.assertEqual("success", resp.json()["status"])
+
+        # One ReviewLog should exist
+        with TestingSessionLocal() as db:
+            logs = list(db.scalars(select(ReviewLog).where(ReviewLog.card_id == card_id)))
+            self.assertEqual(1, len(logs))
+            self.assertEqual("forgot", logs[0].result)
+            # ClientAction → succeeded (not a duplicate row)
+            actions = list(db.scalars(
+                select(ClientAction).where(ClientAction.client_action_id == client_action_id)
+            ))
+            self.assertEqual(1, len(actions))
+            self.assertEqual("succeeded", actions[0].status)
+            # Card updated
+            card = db.get(Card, card_id)
+            self.assertEqual("strengthening", card.review_state)
+
+    def test_succeeded_no_duplicate_review_log(self):
+        """C: same client_action_id after success → no second ReviewLog, Card unchanged."""
+        card_id = self.create_card(content="idempotent", content_normalized="idempotent")
+        today, item = self._start_session()
+        client_action_id = str(uuid4())
+
+        # First submission — success
+        first = self.client.post(
+            "/api/reviews/feedback",
+            headers=self.auth_headers(),
+            json={
+                "client_action_id": client_action_id,
+                "session_id": today["session_id"],
+                "session_item_id": item["session_item_id"],
+                "card_id": str(card_id),
+                "result": "fluent",
+            },
+        )
+        self.assertEqual(200, first.status_code, first.text)
+        self.assertEqual("success", first.json()["status"])
+
+        # Capture Card state after first success
+        with TestingSessionLocal() as db:
+            card_after_first = db.get(Card, card_id)
+            state_after_first = card_after_first.review_state
+            review_count_after_first = card_after_first.review_count
+            log_count_after_first = db.scalar(
+                select(func.count()).select_from(ReviewLog).where(ReviewLog.card_id == card_id)
+            )
+
+        # Second submission with same client_action_id
+        second = self.client.post(
+            "/api/reviews/feedback",
+            headers=self.auth_headers(),
+            json={
+                "client_action_id": client_action_id,
+                "session_id": today["session_id"],
+                "session_item_id": item["session_item_id"],
+                "card_id": str(card_id),
+                "result": "got_it",
+            },
+        )
+        self.assertEqual(200, second.status_code, second.text)
+        self.assertEqual("success", second.json()["status"])
+
+        # Verify: no duplicate ReviewLog, Card state unchanged
+        with TestingSessionLocal() as db:
+            log_count_after_second = db.scalar(
+                select(func.count()).select_from(ReviewLog).where(ReviewLog.card_id == card_id)
+            )
+            self.assertEqual(log_count_after_first, log_count_after_second)
+            card_after_second = db.get(Card, card_id)
+            self.assertEqual(state_after_first, card_after_second.review_state)
+            self.assertEqual(review_count_after_first, card_after_second.review_count)
+
+    def test_processing_zombie_updates_request_payload(self):
+        """B2: zombie re-processing syncs request_payload to current request payload."""
+        card_id = self.create_card(content="zombie2", content_normalized="zombie2")
+        today, item = self._start_session()
+        client_action_id = str(uuid4())
+
+        ten_min_ago = datetime.now(timezone.utc) - timedelta(minutes=10)
+        old_payload = {"result": "forgot"}
+        with TestingSessionLocal() as db:
+            action = ClientAction(
+                user_id=self.user_uuid,
+                client_action_id=client_action_id,
+                action_type="review_feedback",
+                status="processing",
+                updated_at=ten_min_ago,
+                request_payload=old_payload,
+            )
+            db.add(action)
+            db.commit()
+
+        resp = self.client.post(
+            "/api/reviews/feedback",
+            headers=self.auth_headers(),
+            json={
+                "client_action_id": client_action_id,
+                "session_id": today["session_id"],
+                "session_item_id": item["session_item_id"],
+                "card_id": str(card_id),
+                "result": "shaky",
+            },
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        self.assertEqual("success", resp.json()["status"])
+
+        # Verify: only one ClientAction row, now succeeded, payload updated to new request
+        with TestingSessionLocal() as db:
+            actions = list(db.scalars(
+                select(ClientAction).where(ClientAction.client_action_id == client_action_id)
+            ))
+            self.assertEqual(1, len(actions))
+            self.assertEqual("succeeded", actions[0].status)
+            saved_payload = actions[0].request_payload
+            self.assertIsNotNone(saved_payload)
+            self.assertEqual("shaky", saved_payload.get("result"))
+
+        # Card / ReviewLog should reflect the actual (new) result
+        with TestingSessionLocal() as db:
+            logs = list(db.scalars(select(ReviewLog).where(ReviewLog.card_id == card_id)))
+            self.assertEqual(1, len(logs))
+            self.assertEqual("shaky", logs[0].result)
+            card = db.get(Card, card_id)
+            self.assertEqual("strengthening", card.review_state)
+
 
 if __name__ == "__main__":
     unittest.main()

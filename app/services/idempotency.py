@@ -84,3 +84,37 @@ def mark_action_failed(
     action.error_message = error_message
     action.processed_at = datetime.now(timezone.utc)
     db.flush()
+
+
+ZOMBIE_PROCESSING_TIMEOUT_MINUTES = 5
+
+
+def is_zombie_processing(action: ClientAction, timeout_minutes: int | None = None) -> bool:
+    """Return True if action is stuck in 'processing' longer than the timeout window."""
+    if action.status != "processing":
+        return False
+
+    timeout = timeout_minutes if timeout_minutes is not None else ZOMBIE_PROCESSING_TIMEOUT_MINUTES
+    check_time = action.updated_at or action.created_at
+    if check_time is None:
+        return False
+
+    now = datetime.now(timezone.utc)
+    if check_time.tzinfo is None:
+        check_time = check_time.replace(tzinfo=timezone.utc)
+
+    elapsed = (now - check_time).total_seconds()
+    return elapsed > timeout * 60
+
+
+def reset_zombie_processing(
+    db: Session,
+    action: ClientAction,
+    new_request_payload: dict | None = None,
+) -> ClientAction:
+    """Re-arm a zombie processing action so the current request can take over."""
+    action.updated_at = datetime.now(timezone.utc)
+    if new_request_payload is not None:
+        action.request_payload = new_request_payload
+    db.flush()
+    return action

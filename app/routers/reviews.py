@@ -33,9 +33,11 @@ from app.services.auth_service import get_current_user
 from app.services.idempotency import (
     create_processing_action,
     get_existing_client_action,
+    is_zombie_processing,
     mark_action_failed,
     mark_action_ignored,
     mark_action_succeeded,
+    reset_zombie_processing,
 )
 from app.services.review_rules import (
     apply_review_feedback_to_card,
@@ -973,6 +975,7 @@ def submit_review_feedback(
     now = utc_now()
 
     # Step 1: Check client_action_id idempotency
+    action = None
     existing_action = get_existing_client_action(db, current_user.id, payload.client_action_id)
     if existing_action is not None:
         if existing_action.status == "succeeded":
@@ -1002,20 +1005,29 @@ def submit_review_feedback(
                 ignored_reason=existing_action.error_message or "action_ignored",
             )
         if existing_action.status == "processing":
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Action is being processed, please retry later.",
-            )
+            if is_zombie_processing(existing_action):
+                # Zombie processing: re-arm and take over
+                action = reset_zombie_processing(
+                    db,
+                    existing_action,
+                    new_request_payload=payload.model_dump(mode="json"),
+                )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Action is being processed, please retry later.",
+                )
 
-    # Step 2: Create processing record (within transaction)
+    # Step 2: Create processing record if needed (skip for zombie reuse)
     try:
-        action = create_processing_action(
-            db,
-            current_user.id,
-            payload.client_action_id,
-            "review_feedback",
-            request_payload=payload.model_dump(mode="json"),
-        )
+        if action is None:
+            action = create_processing_action(
+                db,
+                current_user.id,
+                payload.client_action_id,
+                "review_feedback",
+                request_payload=payload.model_dump(mode="json"),
+            )
 
         # Step 3: Lock and validate session
         session = db.scalar(
