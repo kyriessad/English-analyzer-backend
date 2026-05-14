@@ -247,13 +247,14 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
             is_review_ready=True,
             needs_manual_fix=False,
         )
+        # Phase 6G: failed card with content — allowed into review
         self.create_card(
-            content="failed not ready",
-            content_normalized="failed not ready",
+            content="failed has content",
+            content_normalized="failed has content",
             understanding=None,
             analysis_status="failed",
-            is_review_ready=False,
-            needs_manual_fix=True,
+            is_review_ready=True,
+            needs_manual_fix=False,
         )
         self.create_card(
             content="failed ready",
@@ -271,7 +272,151 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
 
         self.assertEqual(200, response.status_code, response.text)
         contents = {item["content"] for item in response.json()["items"]}
-        self.assertEqual({"ready done", "pending card", "failed ready"}, contents)
+        self.assertIn("ready done", contents)
+        self.assertIn("pending card", contents)
+        self.assertIn("failed has content", contents)
+        self.assertIn("failed ready", contents)
+
+    # ========== Phase 6G: understanding/translation empty does not block review ==========
+
+    def test_phase6g_card_without_understanding_can_enter_review(self):
+        """Card with content but understanding=None can enter review session."""
+        self.create_card(
+            content="no understanding",
+            content_normalized="no understanding",
+            understanding=None,
+            is_review_ready=True,
+            needs_manual_fix=False,
+        )
+
+        response = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "new_only", "limit": 5, "restart": True},
+        )
+
+        self.assertEqual(200, response.status_code, response.text)
+        items = response.json()["items"]
+        self.assertEqual(1, len(items))
+        self.assertEqual("no understanding", items[0]["content"])
+
+    def test_phase6g_card_without_understanding_and_translation_can_enter_review(self):
+        """Card with content but both understanding=None and translation=None can enter review."""
+        self.create_card(
+            content="bare content",
+            content_normalized="bare content",
+            understanding=None,
+            translation=None,
+            is_review_ready=True,
+            needs_manual_fix=False,
+        )
+
+        response = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "new_only", "limit": 5, "restart": True},
+        )
+
+        self.assertEqual(200, response.status_code, response.text)
+        items = response.json()["items"]
+        self.assertEqual(1, len(items))
+        self.assertEqual("bare content", items[0]["content"])
+
+    def test_phase6g_empty_content_card_still_blocked(self):
+        """Card with empty content cannot enter review."""
+        self.create_card(
+            content="",
+            content_normalized="",
+            understanding="meaning",
+            is_review_ready=False,
+            needs_manual_fix=False,
+        )
+
+        response = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "new_only", "limit": 5, "restart": True},
+        )
+
+        self.assertEqual(200, response.status_code)
+        data = response.json()
+        self.assertIsNone(data["session_id"])
+        self.assertEqual([], data["items"])
+
+    def test_phase6g_deleted_card_still_blocked(self):
+        """Deleted cards cannot enter review."""
+        card_id = self.create_card(
+            content="deleted card",
+            content_normalized="deleted card",
+            is_review_ready=True,
+            needs_manual_fix=False,
+        )
+        with TestingSessionLocal() as db:
+            card = db.get(Card, card_id)
+            card.deleted_at = datetime(2026, 5, 1, tzinfo=timezone.utc)
+            card.status = "deleted"
+            db.commit()
+
+        response = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "new_only", "limit": 5, "restart": True},
+        )
+
+        self.assertEqual(200, response.status_code)
+        data = response.json()
+        self.assertIsNone(data["session_id"])
+        self.assertEqual([], data["items"])
+
+    def test_phase6g_all_session_types_allow_no_understanding_cards(self):
+        """daily_suggested, new_only, free_review all allow cards without understanding."""
+        self.create_card(
+            content="suggested card",
+            content_normalized="suggested card",
+            understanding=None,
+            is_review_ready=True,
+            needs_manual_fix=False,
+        )
+        # Create an older card for free_review
+        self.create_card(
+            content="old card",
+            content_normalized="old card",
+            understanding=None,
+            review_state="reviewing",
+            next_review_at=datetime(2026, 5, 1, tzinfo=timezone.utc),
+            is_review_ready=True,
+            needs_manual_fix=False,
+        )
+
+        for session_type in ("daily_suggested", "new_only", "free_review"):
+            with self.subTest(session_type=session_type):
+                response = self.client.post(
+                    "/api/review-sessions",
+                    headers=self.auth_headers(),
+                    json={"session_type": session_type, "limit": 5, "restart": True},
+                )
+                self.assertEqual(200, response.status_code, response.text)
+
+    def test_phase6g_normal_card_with_understanding_still_works(self):
+        """Regression: cards with understanding still enter review normally."""
+        self.create_card(
+            content="normal card",
+            content_normalized="normal card",
+            understanding="the meaning",
+            is_review_ready=True,
+            needs_manual_fix=False,
+        )
+
+        response = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "new_only", "limit": 5, "restart": True},
+        )
+
+        self.assertEqual(200, response.status_code, response.text)
+        items = response.json()["items"]
+        self.assertEqual(1, len(items))
+        self.assertEqual("normal card", items[0]["content"])
 
     def test_overview_separates_daily_suggested_from_extra_new_only(self):
         daily_card_id = self.create_card(content="daily new", content_normalized="daily new")

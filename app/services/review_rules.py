@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models.card import Card
@@ -346,8 +346,8 @@ def select_review_cards(user_id: UUID, limit: int, now: datetime, db: Session) -
                 Card.deleted_at.is_(None),
                 Card.status == "active",
                 Card.review_state.in_(tuple(REVIEW_STATES)),
-                Card.is_review_ready.is_(True),
-                Card.needs_manual_fix.is_(False),
+                # Phase 6G: content-based readiness — cards with non-empty content are always ready
+                func.length(func.trim(Card.content)) > 0,
                 or_(
                     Card.review_state == "new",
                     Card.review_state == "strengthening",

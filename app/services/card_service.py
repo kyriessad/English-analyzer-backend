@@ -22,11 +22,8 @@ def _has_text(value: str | None) -> bool:
 
 
 def recompute_card_readiness(card: Card) -> Card:
-    is_review_ready = _has_text(card.content) and (
-        _has_text(card.understanding) or _has_text(card.translation)
-    )
-    card.is_review_ready = is_review_ready
-    card.needs_manual_fix = (card.analysis_status == "failed") and not is_review_ready
+    card.is_review_ready = _has_text(card.content)
+    card.needs_manual_fix = False
     return card
 
 

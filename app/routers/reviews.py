@@ -81,8 +81,8 @@ def _review_ready_card_filters(user_id: UUID) -> list:
     return [
         *_active_card_filters(user_id),
         Card.review_state.in_(MAIN_REVIEW_STATES),
-        Card.is_review_ready.is_(True),
-        Card.needs_manual_fix.is_(False),
+        # Phase 6G: content-based readiness — cards with non-empty content are always ready
+        func.length(func.trim(Card.content)) > 0,
     ]
 
 

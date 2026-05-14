@@ -156,6 +156,7 @@ class CardsApiTest(unittest.TestCase):
         self.assertEqual("阅读", data["exam_module"])
 
     def test_patch_failed_not_ready_card_recomputes_readiness(self):
+        # Phase 6G: content alone → is_review_ready=True; needs_manual_fix always False
         created = self.create_card(
             local_temp_id="local-needs-fix",
             legacy_cloud_id="cloud-needs-fix",
@@ -163,8 +164,8 @@ class CardsApiTest(unittest.TestCase):
             translation=None,
             analysis_status="failed",
         )
-        self.assertFalse(created["is_review_ready"])
-        self.assertTrue(created["needs_manual_fix"])
+        self.assertTrue(created["is_review_ready"])
+        self.assertFalse(created["needs_manual_fix"])
 
         response = self.client.patch(
             f"/api/cards/{created['id']}",
