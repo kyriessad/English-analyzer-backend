@@ -1,5 +1,6 @@
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 from uuid import UUID, uuid4
 import unittest
 
@@ -2076,7 +2077,12 @@ class TodayReviewedApiTest(unittest.TestCase):
         self.token = auth_service.create_access_token(self.user_uuid)
         self.other_token = auth_service.create_access_token(self.other_user_uuid)
 
+        self._fixed_now = datetime(2026, 5, 15, 12, 0, tzinfo=timezone.utc)
+        self._utc_patcher = patch('app.routers.reviews.utc_now', return_value=self._fixed_now)
+        self._utc_patcher.start()
+
     def tearDown(self):
+        self._utc_patcher.stop()
         auth_service.settings = self.original_settings
         app.dependency_overrides.pop(get_db, None)
 
@@ -2084,7 +2090,7 @@ class TodayReviewedApiTest(unittest.TestCase):
         return {"Authorization": f"Bearer {token or self.token}"}
 
     def _now(self):
-        return datetime(2026, 5, 15, 10, 0, tzinfo=timezone.utc)
+        return self._fixed_now
 
     def create_card(self, **overrides):
         values = {
