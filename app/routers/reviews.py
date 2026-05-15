@@ -27,6 +27,8 @@ from app.schemas.reviews import (
     ReviewSessionCreateResponse,
     ReviewSummaryResponse,
     SessionSummaryResponse,
+    TodayReviewedItem,
+    TodayReviewedResponse,
     TodayReviewsResponse,
 )
 from app.services.auth_service import get_current_user
@@ -1314,3 +1316,91 @@ def get_session_summary(
         progress=progress,
         summary=summary,
     )
+
+
+@router.get("/today-reviewed", response_model=TodayReviewedResponse)
+def get_today_reviewed(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TodayReviewedResponse:
+    now = utc_now()
+    today = _local_review_date(now, current_user.timezone)
+    start_at, end_before = _history_date_bounds(today, today, current_user.timezone)
+
+    user_id = current_user.id
+
+    today_logs = (
+        select(
+            ReviewLog.card_id,
+            func.count(ReviewLog.id).label("today_review_count"),
+            func.max(ReviewLog.reviewed_at).label("last_reviewed_at"),
+        )
+        .where(
+            ReviewLog.user_id == user_id,
+            ReviewLog.reviewed_at >= start_at,
+            ReviewLog.reviewed_at < end_before,
+        )
+        .group_by(ReviewLog.card_id)
+        .cte("today_logs")
+    )
+
+    latest_log = (
+        select(
+            ReviewLog.card_id,
+            ReviewLog.result,
+            ReviewLog.reviewed_at,
+            func.row_number()
+            .over(
+                partition_by=ReviewLog.card_id,
+                order_by=(ReviewLog.reviewed_at.desc(), ReviewLog.id.desc()),
+            )
+            .label("rn"),
+        )
+        .where(
+            ReviewLog.user_id == user_id,
+            ReviewLog.reviewed_at >= start_at,
+            ReviewLog.reviewed_at < end_before,
+        )
+        .cte("latest_log")
+    )
+
+    query = (
+        select(
+            Card.id.label("card_id"),
+            Card.content,
+            Card.understanding,
+            Card.note,
+            Card.card_type,
+            Card.exam_scene,
+            Card.exam_module,
+            today_logs.c.today_review_count,
+            latest_log.c.result.label("last_result"),
+            latest_log.c.reviewed_at.label("last_reviewed_at"),
+        )
+        .select_from(
+            today_logs.join(Card, Card.id == today_logs.c.card_id)
+            .join(latest_log, (latest_log.c.card_id == today_logs.c.card_id) & (latest_log.c.rn == 1))
+        )
+        .where(*_active_card_filters(user_id))
+        .order_by(latest_log.c.reviewed_at.desc(), Card.id)
+    )
+
+    rows = db.execute(query).all()
+    items = [
+        TodayReviewedItem(
+            card_id=row.card_id,
+            content=row.content,
+            understanding=row.understanding or "",
+            note=row.note or "",
+            card_type=row.card_type,
+            exam_scene=row.exam_scene,
+            exam_module=row.exam_module,
+            today_review_count=row.today_review_count,
+            last_result=row.last_result,
+            last_result_label=REVIEW_RESULT_LABELS[row.last_result],
+            last_reviewed_at=row.last_reviewed_at,
+        )
+        for row in rows
+    ]
+
+    return TodayReviewedResponse(items=items, total=len(items))

@@ -4,7 +4,7 @@ from uuid import UUID, uuid4
 import unittest
 
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, func, select, update
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -2052,6 +2052,262 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
         overview = self.client.get("/api/reviews/overview", headers=self.auth_headers())
         self.assertEqual(200, overview.status_code)
         self.assertEqual(2, overview.json()["suggested"]["total_count"])
+
+
+class TodayReviewedApiTest(unittest.TestCase):
+    def setUp(self):
+        Base.metadata.drop_all(bind=engine)
+        Base.metadata.create_all(bind=engine)
+        app.dependency_overrides[get_db] = override_get_db
+        self.client = TestClient(app)
+        self.original_settings = auth_service.settings
+        auth_service.settings = replace(
+            app_settings,
+            jwt_secret_key="today-reviewed-secret-with-at-least-32-bytes",
+            jwt_algorithm="HS256",
+            jwt_expire_days=30,
+        )
+        self.user_uuid = uuid4()
+        self.other_user_uuid = uuid4()
+        with TestingSessionLocal() as db:
+            db.add(User(id=self.user_uuid, wx_openid=f"openid-{self.user_uuid}"))
+            db.add(User(id=self.other_user_uuid, wx_openid=f"openid-{self.other_user_uuid}"))
+            db.commit()
+        self.token = auth_service.create_access_token(self.user_uuid)
+        self.other_token = auth_service.create_access_token(self.other_user_uuid)
+
+    def tearDown(self):
+        auth_service.settings = self.original_settings
+        app.dependency_overrides.pop(get_db, None)
+
+    def auth_headers(self, token=None):
+        return {"Authorization": f"Bearer {token or self.token}"}
+
+    def _now(self):
+        return datetime(2026, 5, 15, 10, 0, tzinfo=timezone.utc)
+
+    def create_card(self, **overrides):
+        values = {
+            "user_id": self.user_uuid,
+            "content": f"card {uuid4()}",
+            "content_normalized": f"card {uuid4()}",
+            "card_type": "word",
+            "understanding": "meaning",
+            "analysis_status": "done",
+            "is_review_ready": True,
+            "needs_manual_fix": False,
+            "analysis_level": "pass",
+            "analysis_messages": [],
+            "understanding_source": "user",
+            "review_state": "reviewing",
+            "mastery_score": 0,
+            "recovery_stage": 0,
+            "review_count": 0,
+            "forgot_count": 0,
+            "shaky_count": 0,
+            "got_it_count": 0,
+            "fluent_count": 0,
+            "again_count": 0,
+            "hard_count": 0,
+            "good_count": 0,
+            "easy_count": 0,
+            "next_review_at": None,
+            "status": "active",
+        }
+        values.update(overrides)
+        with TestingSessionLocal() as db:
+            card = Card(**values)
+            db.add(card)
+            db.commit()
+            db.refresh(card)
+            return card.id
+
+    def create_review_log(self, card_id, result, reviewed_at, **overrides):
+        user_id = overrides.pop("user_id", self.user_uuid)
+        with TestingSessionLocal() as db:
+            session = ReviewSession(
+                user_id=user_id,
+                review_date=reviewed_at.date(),
+                timezone="Asia/Shanghai",
+                session_type=overrides.pop("session_type", "daily_suggested"),
+                started_at=reviewed_at,
+                status="completed",
+                batch_size=5,
+                total_count=1,
+                reviewed_count=1,
+                completed_count=1,
+                planned_new_count=0,
+                planned_review_count=1,
+                current_index=1,
+            )
+            db.add(session)
+            db.flush()
+            item = ReviewSessionItem(
+                session_id=session.id,
+                card_id=card_id,
+                position=0,
+                status="reviewed",
+                result=result,
+                reappear_count=0,
+                is_repeat=False,
+                repeat_count=0,
+                first_result=result,
+                final_result=result,
+                reviewed_at=reviewed_at,
+            )
+            db.add(item)
+            db.flush()
+            log = ReviewLog(
+                user_id=user_id,
+                card_id=card_id,
+                session_id=session.id,
+                session_item_id=item.id,
+                session_type=session.session_type,
+                result=result,
+                reviewed_at=reviewed_at,
+                card_state_before_review="reviewing",
+                review_state_before="reviewing",
+                review_state_after="reviewing",
+                mastery_score_before=1,
+                mastery_score_after=2,
+                recovery_stage_before=0,
+                recovery_stage_after=0,
+            )
+            db.add(log)
+            db.commit()
+            return log.id
+
+    def test_requires_auth(self):
+        response = self.client.get("/api/reviews/today-reviewed")
+        self.assertEqual(401, response.status_code)
+
+    def test_returns_today_reviewed_cards(self):
+        now = self._now()
+        card_a = self.create_card(content="hello world", understanding="你好世界")
+        card_b = self.create_card(content="good morning", understanding="早上好")
+        self.create_review_log(card_a, "got_it", now)
+        self.create_review_log(card_b, "shaky", now)
+
+        response = self.client.get("/api/reviews/today-reviewed", headers=self.auth_headers())
+        self.assertEqual(200, response.status_code)
+        data = response.json()
+        self.assertEqual(2, data["total"])
+        contents = {item["content"] for item in data["items"]}
+        self.assertIn("hello world", contents)
+        self.assertIn("good morning", contents)
+
+    def test_deduplicates_same_card(self):
+        now = self._now()
+        card = self.create_card(content="test card")
+        self.create_review_log(card, "shaky", now - timedelta(hours=2))
+        self.create_review_log(card, "got_it", now)
+
+        response = self.client.get("/api/reviews/today-reviewed", headers=self.auth_headers())
+        self.assertEqual(200, response.status_code)
+        data = response.json()
+        self.assertEqual(1, data["total"])
+
+    def test_today_review_count_correct(self):
+        now = self._now()
+        card = self.create_card(content="multi review")
+        self.create_review_log(card, "forgot", now - timedelta(hours=3))
+        self.create_review_log(card, "shaky", now - timedelta(hours=2))
+        self.create_review_log(card, "got_it", now)
+
+        response = self.client.get("/api/reviews/today-reviewed", headers=self.auth_headers())
+        self.assertEqual(200, response.status_code)
+        data = response.json()
+        self.assertEqual(1, data["total"])
+        self.assertEqual(3, data["items"][0]["today_review_count"])
+
+    def test_returns_latest_result(self):
+        now = self._now()
+        card = self.create_card(content="result test")
+        self.create_review_log(card, "forgot", now - timedelta(hours=2))
+        self.create_review_log(card, "fluent", now)
+
+        response = self.client.get("/api/reviews/today-reviewed", headers=self.auth_headers())
+        self.assertEqual(200, response.status_code)
+        item = response.json()["items"][0]
+        self.assertEqual("fluent", item["last_result"])
+        self.assertEqual("很熟了", item["last_result_label"])
+
+    def test_returns_current_card_content_not_snapshot(self):
+        now = self._now()
+        card_id = self.create_card(content="original content", understanding="original understanding")
+        self.create_review_log(card_id, "got_it", now)
+
+        with TestingSessionLocal() as db:
+            db.execute(
+                update(Card).where(Card.id == card_id).values(
+                    content="edited content",
+                    understanding="edited understanding",
+                )
+            )
+            db.commit()
+
+        response = self.client.get("/api/reviews/today-reviewed", headers=self.auth_headers())
+        self.assertEqual(200, response.status_code)
+        item = response.json()["items"][0]
+        self.assertEqual("edited content", item["content"])
+        self.assertEqual("edited understanding", item["understanding"])
+
+    def test_excludes_deleted_cards(self):
+        now = self._now()
+        card_a = self.create_card(content="active card")
+        card_b = self.create_card(content="deleted card")
+        self.create_review_log(card_a, "got_it", now)
+        self.create_review_log(card_b, "shaky", now)
+
+        with TestingSessionLocal() as db:
+            db.execute(
+                update(Card).where(Card.id == card_b).values(
+                    deleted_at=now, status="deleted"
+                )
+            )
+            db.commit()
+
+        response = self.client.get("/api/reviews/today-reviewed", headers=self.auth_headers())
+        self.assertEqual(200, response.status_code)
+        data = response.json()
+        self.assertEqual(1, data["total"])
+        self.assertEqual("active card", data["items"][0]["content"])
+
+    def test_excludes_non_today_reviews(self):
+        now = self._now()
+        card_today = self.create_card(content="today card")
+        card_yesterday = self.create_card(content="yesterday card")
+        self.create_review_log(card_today, "got_it", now)
+        self.create_review_log(card_yesterday, "got_it", now - timedelta(days=2))
+
+        response = self.client.get("/api/reviews/today-reviewed", headers=self.auth_headers())
+        self.assertEqual(200, response.status_code)
+        data = response.json()
+        self.assertEqual(1, data["total"])
+        self.assertEqual("today card", data["items"][0]["content"])
+
+    def test_excludes_other_user_cards(self):
+        now = self._now()
+        card = self.create_card(content="my card")
+        self.create_review_log(card, "got_it", now)
+
+        other_card = self.create_card(
+            content="other card", user_id=self.other_user_uuid
+        )
+        self.create_review_log(other_card, "got_it", now, user_id=self.other_user_uuid)
+
+        response = self.client.get("/api/reviews/today-reviewed", headers=self.auth_headers())
+        self.assertEqual(200, response.status_code)
+        data = response.json()
+        self.assertEqual(1, data["total"])
+        self.assertEqual("my card", data["items"][0]["content"])
+
+    def test_empty_today(self):
+        response = self.client.get("/api/reviews/today-reviewed", headers=self.auth_headers())
+        self.assertEqual(200, response.status_code)
+        data = response.json()
+        self.assertEqual(0, data["total"])
+        self.assertEqual([], data["items"])
 
 
 if __name__ == "__main__":

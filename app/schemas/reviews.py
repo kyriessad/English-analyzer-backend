@@ -209,3 +209,22 @@ class ReviewHistoryDetailResponse(BaseModel):
     session_type: str
     session_type_label: str
     card: ReviewHistoryDetailCardResponse | None = None
+
+
+class TodayReviewedItem(BaseModel):
+    card_id: UUID
+    content: str
+    understanding: str | None = ""
+    note: str | None = ""
+    card_type: str
+    exam_scene: str | None = None
+    exam_module: str | None = None
+    today_review_count: int
+    last_result: ReviewResult
+    last_result_label: str
+    last_reviewed_at: datetime
+
+
+class TodayReviewedResponse(BaseModel):
+    items: list[TodayReviewedItem]
+    total: int
