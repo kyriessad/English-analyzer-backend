@@ -411,18 +411,17 @@ def _select_new_only_cards(user_id: UUID, limit: int, db: Session) -> list[Card]
 
 
 def _select_free_review_cards(user_id: UUID, limit: int, now: datetime, db: Session) -> list[Card]:
+    """Phase 6L-hotfix: free_review is the last-resort fallback.
+
+    Select ALL eligible cards (any review_state), not only strengthening + due.
+    This ensures the degradation chain daily_suggested -> new_only -> free_review
+    always finds cards when the user's card library has any reviewable content.
+    """
     return list(
         db.scalars(
             select(Card)
-            .where(
-                *_review_ready_card_filters(user_id),
-                Card.review_state != "new",
-                or_(
-                    Card.review_state == "strengthening",
-                    Card.next_review_at <= now,
-                ),
-            )
-            .order_by(Card.next_review_at.is_(None), Card.next_review_at, Card.created_at, Card.id)
+            .where(*_review_ready_card_filters(user_id))
+            .order_by(Card.created_at, Card.id)
             .limit(limit)
         )
     )
@@ -575,7 +574,13 @@ def get_review_overview(
         .order_by(ReviewSession.started_at.desc(), ReviewSession.created_at.desc())
         .limit(1)
     )
-    if daily_session is not None and daily_session.total_count > 0:
+    # Phase 6L-hotfix-2 (Problem B): Refresh progress before reading planned counts.
+    # Without this, a daily session with all items reviewed but status not yet
+    # persisted as "completed" would report stale planned_new_count / planned_review_count,
+    # making the overview show "今日任务 1" while select_review_cards returns 0.
+    if daily_session is not None:
+        _refresh_session_progress(db, daily_session, now)
+    if daily_session is not None and daily_session.total_count > 0 and daily_session.status == "active":
         suggested_new_count = daily_session.planned_new_count
         suggested_review_count = daily_session.planned_review_count
 
