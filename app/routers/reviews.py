@@ -557,10 +557,7 @@ def get_review_overview(
         .select_from(Card)
         .where(*base_filters, Card.review_state == "new")
     ) or 0
-    suggested_new_count = min(
-        calculate_effective_new_quota(5, strengthening_count, due_count),
-        new_available_count,
-    )
+    suggested_new_count = new_available_count
     suggested_review_count = strengthening_count + due_count
 
     daily_session = db.scalar(
@@ -574,36 +571,70 @@ def get_review_overview(
         .order_by(ReviewSession.started_at.desc(), ReviewSession.created_at.desc())
         .limit(1)
     )
-    # Phase 6L-hotfix-2 (Problem B): Refresh progress before reading planned counts.
-    # Without this, a daily session with all items reviewed but status not yet
-    # persisted as "completed" would report stale planned_new_count / planned_review_count,
-    # making the overview show "今日任务 1" while select_review_cards returns 0.
     if daily_session is not None:
         _refresh_session_progress(db, daily_session, now)
-    if daily_session is not None and daily_session.total_count > 0 and daily_session.status == "active":
-        suggested_new_count = daily_session.planned_new_count
-        suggested_review_count = daily_session.planned_review_count
 
+    # Phase 6L-hotfix-4: 首页"今日任务" = 当前有效且属今日任务集合的唯一卡片数。
+    # 若有今日 daily_suggested session（active 或 completed），以 session items 中
+    # 仍存活的卡片数为准（自动过滤已删除卡）；否则以当前 review-ready 卡片数为准。
+    # 上限 normalize_review_limit(5)，与 select_review_cards 一致。
+    if daily_session is not None and daily_session.status in ("active", "completed"):
+        suggested_total_count = min(
+            db.scalar(
+                select(func.count(func.distinct(ReviewSessionItem.card_id)))
+                .select_from(ReviewSessionItem)
+                .join(Card, Card.id == ReviewSessionItem.card_id)
+                .where(
+                    ReviewSessionItem.session_id == daily_session.id,
+                    *_active_card_filters(current_user.id),
+                )
+            ) or 0,
+            normalize_review_limit(5),
+        )
+    else:
+        suggested_total_count = min(suggested_new_count + suggested_review_count, normalize_review_limit(5))
+
+    # 今日已完成 = 今天已获得至少一次反馈的现存唯一卡片数。
+    # JOIN Card 过滤已删除/非活跃卡片，避免孤儿 ReviewLog 污染统计。
+    # JOIN ReviewSession 限定今日 daily_suggested session。
+    # 按 card_id 去重，不计 reappear 重复反馈次数。
     completed_new_count = db.scalar(
-        select(func.count())
+        select(func.count(func.distinct(ReviewLog.card_id)))
         .select_from(ReviewLog)
         .join(ReviewSession, ReviewSession.id == ReviewLog.session_id)
+        .join(Card, Card.id == ReviewLog.card_id)
         .where(
             ReviewLog.user_id == current_user.id,
             ReviewLog.session_type == "daily_suggested",
             ReviewSession.review_date == today,
             ReviewLog.card_state_before_review == "new",
+            *_active_card_filters(current_user.id),
         )
     ) or 0
     completed_review_count = db.scalar(
-        select(func.count())
+        select(func.count(func.distinct(ReviewLog.card_id)))
         .select_from(ReviewLog)
         .join(ReviewSession, ReviewSession.id == ReviewLog.session_id)
+        .join(Card, Card.id == ReviewLog.card_id)
         .where(
             ReviewLog.user_id == current_user.id,
             ReviewLog.session_type == "daily_suggested",
             ReviewSession.review_date == today,
             ReviewLog.card_state_before_review != "new",
+            *_active_card_filters(current_user.id),
+        )
+    ) or 0
+
+    completed_unique = db.scalar(
+        select(func.count(func.distinct(ReviewLog.card_id)))
+        .select_from(ReviewLog)
+        .join(ReviewSession, ReviewSession.id == ReviewLog.session_id)
+        .join(Card, Card.id == ReviewLog.card_id)
+        .where(
+            ReviewLog.user_id == current_user.id,
+            ReviewLog.session_type == "daily_suggested",
+            ReviewSession.review_date == today,
+            *_active_card_filters(current_user.id),
         )
     ) or 0
     free_review_available_count = db.scalar(
@@ -645,11 +676,14 @@ def get_review_overview(
                 "status": active_session.status,
             }
 
-    suggested_total_count = suggested_review_count + suggested_new_count
-    completed_suggested_total = completed_review_count + completed_new_count
+    completed_suggested_total = completed_unique
+    # is_all_done 仅在以下情况为 true：
+    # 1. 根本没有待处理卡片 (suggested_total_count == 0)
+    # 2. 无活跃 session 且所有待处理卡片均已完成
+    # 不再因为 daily_session.status == "completed" 自动标为全完成，
+    # 避免新增卡后首页仍显示"今日已完成"。
     is_all_done = (
         suggested_total_count == 0
-        or (daily_session is not None and daily_session.status == "completed")
         or (
             active_session_response is None
             and suggested_total_count > 0

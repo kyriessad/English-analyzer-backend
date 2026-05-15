@@ -170,10 +170,13 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
         self.assertEqual(200, response.status_code, response.text)
         data = response.json()
         self.assertEqual(2, data["suggested"]["review_count"])
-        self.assertEqual(1, data["suggested"]["new_count"])
+        # Phase 6L-hotfix-4: suggested.new_count 不再按 new-quota 裁剪，
+        # 改为上报全部可学新卡数（与 select_review_cards 填充 slot 后一致）。
+        # total_count 上限为 session limit (5)。
+        self.assertEqual(20, data["suggested"]["new_count"])
         self.assertEqual(1, data["suggested"]["strengthening_count"])
         self.assertEqual(1, data["suggested"]["due_count"])
-        self.assertEqual(3, data["suggested"]["total_count"])
+        self.assertEqual(5, data["suggested"]["total_count"])
         self.assertEqual(0, data["completed_suggested"]["total_count"])
         self.assertEqual(20, data["extra_today"]["new_only_count"])
         self.assertEqual(2, data["extra_today"]["free_review_count"])
@@ -1884,34 +1887,171 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
         self.assertEqual("survives deletion", d["card"]["understanding"])
         self.assertEqual("snapshot", d["card"]["card_source"])
 
-    def test_deleted_card_no_snapshot_orphan_state(self):
-        """F: Deleted card + no snapshot → card_response is None (orphan)."""
-        card_id = self.create_card(
-            content="doomed card",
-            content_normalized="doomed card",
-        )
-        reviewed_at = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
-        log_id = self.create_review_log(card_id=card_id, result="forgot", reviewed_at=reviewed_at)
+    def test_overview_deleted_cards_not_counted_in_suggested(self):
+        """After deleting all cards, suggested.total_count must be 0."""
+        card1 = self.create_card(content="card one", content_normalized="card one")
+        card2 = self.create_card(content="card two", content_normalized="card two")
 
-        # Verify no snapshot
+        # Verify 2 cards visible
+        overview = self.client.get("/api/reviews/overview", headers=self.auth_headers())
+        self.assertEqual(200, overview.status_code)
+        self.assertEqual(2, overview.json()["suggested"]["total_count"])
+
+        # Soft-delete both cards
         with TestingSessionLocal() as db:
-            log = db.get(ReviewLog, log_id)
-            self.assertIsNone(log.card_snapshot)
+            for cid in (card1, card2):
+                card = db.get(Card, cid)
+                card.status = "deleted"
+                card.deleted_at = datetime.now(timezone.utc)
+            db.commit()
+
+        # After deletion, suggested.total_count must be 0
+        overview = self.client.get("/api/reviews/overview", headers=self.auth_headers())
+        self.assertEqual(200, overview.status_code)
+        self.assertEqual(0, overview.json()["suggested"]["total_count"])
+        self.assertTrue(overview.json()["is_all_done"])
+
+    def test_overview_completed_excludes_deleted_card_review_logs(self):
+        """completed_suggested must not count ReviewLogs of deleted cards."""
+        card_id = self.create_card(content="keep me", content_normalized="keep me")
+
+        # Review via daily_suggested API (actual today's date)
+        daily = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5},
+        ).json()
+        self.assertIsNotNone(daily.get("session_id"))
+        self.client.post(
+            "/api/reviews/feedback",
+            headers=self.auth_headers(),
+            json={
+                "client_action_id": str(uuid4()),
+                "session_id": daily["session_id"],
+                "session_item_id": daily["items"][0]["session_item_id"],
+                "card_id": str(card_id),
+                "result": "got_it",
+            },
+        )
+
+        # Verify completed_suggested includes the card
+        overview = self.client.get("/api/reviews/overview", headers=self.auth_headers())
+        self.assertEqual(1, overview.json()["completed_suggested"]["total_count"])
 
         # Soft-delete the card
         with TestingSessionLocal() as db:
             card = db.get(Card, card_id)
+            card.status = "deleted"
             card.deleted_at = datetime.now(timezone.utc)
             db.commit()
 
-        # History detail — card should be null
-        detail = self.client.get(
-            f"/api/reviews/history/{log_id}",
+        # After deletion, completed_suggested must be 0
+        overview = self.client.get("/api/reviews/overview", headers=self.auth_headers())
+        self.assertEqual(0, overview.json()["completed_suggested"]["total_count"])
+
+    def test_overview_suggested_reflects_only_active_cards_not_old_session(self):
+        """suggested counts must come from active cards in session items, not stale session planned counts."""
+        # 1 new + 2 strengthening gives select_review_cards 3 cards (new_quota=1 + 2 strengthening)
+        card1 = self.create_card(content="new card", content_normalized="new card", review_state="new")
+        card2 = self.create_card(content="strength one", content_normalized="strength one",
+                                 review_state="strengthening", mastery_score=1, review_count=1)
+        card3 = self.create_card(content="strength two", content_normalized="strength two",
+                                 review_state="strengthening", mastery_score=1, review_count=1)
+
+        # Create a daily_suggested session (today) — should have 3 items (1 new + 2 strengthening)
+        daily = self.client.post(
+            "/api/review-sessions",
             headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5},
+        ).json()
+        self.assertEqual(3, daily["progress"]["total"])
+
+        # Soft-delete card1 and card2
+        with TestingSessionLocal() as db:
+            for cid in (card1, card2):
+                card = db.get(Card, cid)
+                card.status = "deleted"
+                card.deleted_at = datetime.now(timezone.utc)
+            db.commit()
+
+        # Overview must now show only 1 (card3), NOT 3 from old session
+        overview = self.client.get("/api/reviews/overview", headers=self.auth_headers())
+        self.assertEqual(200, overview.status_code)
+        data = overview.json()
+        self.assertEqual(1, data["suggested"]["total_count"],
+                         "suggested.total_count should be 1 active card, not old session's 3")
+
+    def test_overview_completed_unique_active_cards_not_cumulative(self):
+        """Review 2 cards in one daily_suggested session → completed_suggested = 2, suggested = 2.
+        Ghost card reviewed today + deleted must not inflate completed_suggested."""
+        card1 = self.create_card(content="fresh new", content_normalized="fresh new", review_state="new")
+        card2 = self.create_card(content="fresh strengthening", content_normalized="fresh strengthening",
+                                 review_state="strengthening", mastery_score=1, review_count=1)
+
+        # Review card1 and card2 via daily_suggested
+        daily = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5},
+        ).json()
+        self.assertEqual(2, len(daily["items"]),
+                         f"Expected 2 items (1 new + 1 strengthening), got {len(daily['items'])}")
+        for item in daily["items"]:
+            self.client.post(
+                "/api/reviews/feedback",
+                headers=self.auth_headers(),
+                json={
+                    "client_action_id": str(uuid4()),
+                    "session_id": daily["session_id"],
+                    "session_item_id": item["session_item_id"],
+                    "card_id": str(item["card_id"]),
+                    "result": "got_it",
+                },
+            )
+
+        # Create a ghost card, review it today, then delete it — must not pollute completed_suggested
+        ghost_id = self.create_card(content="ghost", content_normalized="ghost")
+        ghost_session = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "restart": True},
+        ).json()
+        ghost_item = ghost_session["items"][0]
+        self.client.post(
+            "/api/reviews/feedback",
+            headers=self.auth_headers(),
+            json={
+                "client_action_id": str(uuid4()),
+                "session_id": ghost_session["session_id"],
+                "session_item_id": ghost_item["session_item_id"],
+                "card_id": str(ghost_item["card_id"]),
+                "result": "got_it",
+            },
         )
-        self.assertEqual(200, detail.status_code, detail.text)
-        d = detail.json()
-        self.assertIsNone(d["card"])
+        with TestingSessionLocal() as db:
+            ghost = db.get(Card, ghost_id)
+            ghost.status = "deleted"
+            ghost.deleted_at = datetime.now(timezone.utc)
+            db.commit()
+
+        overview = self.client.get("/api/reviews/overview", headers=self.auth_headers())
+        self.assertEqual(200, overview.status_code)
+        data = overview.json()
+        # 2 active cards reviewed (not 3 including ghost — ghost is deleted)
+        self.assertEqual(2, data["completed_suggested"]["total_count"],
+                         "completed_suggested total must exclude deleted ghost card")
+        # Latest session (ghost) has 1 item for the deleted ghost → 0 active cards
+        self.assertEqual(0, data["suggested"]["total_count"],
+                         "suggested total from latest session with only deleted card = 0")
+
+    def test_overview_suggested_correct_before_session_creation(self):
+        """suggested.total_count must be correct even without creating a review session."""
+        self.create_card(content="alpha", content_normalized="alpha")
+        self.create_card(content="beta", content_normalized="beta")
+
+        overview = self.client.get("/api/reviews/overview", headers=self.auth_headers())
+        self.assertEqual(200, overview.status_code)
+        self.assertEqual(2, overview.json()["suggested"]["total_count"])
 
 
 if __name__ == "__main__":
