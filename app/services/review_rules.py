@@ -347,8 +347,84 @@ def _dedupe_cards(cards: list[Card]) -> list[Card]:
     return deduped
 
 
-def select_review_cards(user_id: UUID, limit: int, now: datetime, db: Session) -> list[Card]:
+def select_review_cards(
+    user_id: UUID,
+    limit: int,
+    now: datetime,
+    db: Session,
+    today_reviewed_card_ids: set[UUID] | None = None,
+    goal_mode: bool = False,
+) -> list[Card]:
     normalized_limit = normalize_review_limit(limit)
+
+    # Phase 6P-later-2: goal_mode — select only today-unreviewed cards in priority order.
+    if goal_mode and today_reviewed_card_ids is not None:
+        all_ready = list(
+            db.scalars(
+                select(Card).where(
+                    Card.user_id == user_id,
+                    Card.deleted_at.is_(None),
+                    Card.status == "active",
+                    Card.review_state.in_(tuple(REVIEW_STATES)),
+                    func.length(func.trim(Card.content)) > 0,
+                )
+            )
+        )
+        all_ready = _dedupe_cards(all_ready)
+
+        not_reviewed = [card for card in all_ready if card.id not in today_reviewed_card_ids]
+
+        now_snapshot = datetime.now()
+        p1 = sort_strengthening_cards(
+            [card for card in not_reviewed if _get_value(card, "review_state") == "strengthening"],
+            now,
+        )
+        p2 = sort_due_cards(
+            [
+                card
+                for card in not_reviewed
+                if _get_value(card, "review_state") in ("reviewing", "mastered")
+                and get_due_reason(card, now) in {"recovery_due", "reviewing_due", "mastered_due"}
+            ],
+            now,
+        )
+        p3 = sort_new_cards(
+            [card for card in not_reviewed if _get_value(card, "review_state") == "new"]
+        )
+
+        p1_p3_ids = {_card_id(card) for card in p1 + p2 + p3}
+
+        p4 = sorted(
+            [
+                card
+                for card in not_reviewed
+                if _get_value(card, "review_state") == "mastered"
+                and _card_id(card) not in p1_p3_ids
+            ],
+            key=lambda card: (
+                _as_sort_datetime(_get_value(card, "created_at"), now_snapshot),
+                _card_id(card),
+            ),
+        )
+
+        p1_p4_ids = p1_p3_ids | {_card_id(card) for card in p4}
+
+        p5 = sorted(
+            [
+                card
+                for card in not_reviewed
+                if _get_value(card, "review_state") == "reviewing"
+                and _get_value(card, "last_review_result") == "fluent"
+                and _card_id(card) not in p1_p4_ids
+            ],
+            key=lambda card: (
+                _as_sort_datetime(_get_value(card, "created_at"), now_snapshot),
+                _card_id(card),
+            ),
+        )
+
+        return _dedupe_cards(p1 + p2 + p3 + p4 + p5)[:int(limit)]
+
     candidate_cards = list(
         db.scalars(
             select(Card).where(

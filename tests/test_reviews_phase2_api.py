@@ -2256,6 +2256,519 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
         self.assertIsNone(with_gp_data["active_session"])
         self.assertIsNotNone(with_gp_data["goal_progress"])
 
+    # ===== Phase 6P-later-2: daily_goal session tests =====
+
+    def test_goal_session_no_daily_goal_old_behavior(self):
+        """Not passing daily_goal keeps old limit-based behavior."""
+        for i in range(5):
+            self.create_card(
+                content=f"old behavior {i}",
+                content_normalized=f"old behavior {i}",
+                review_state="new",
+            )
+
+        resp = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5},
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        data = resp.json()
+        self.assertEqual(5, data["progress"]["total"])
+        self.assertEqual(5, len(data["items"]))
+
+    def test_goal_session_daily_goal_null_old_behavior(self):
+        """Explicit daily_goal=null keeps old behavior."""
+        for i in range(5):
+            self.create_card(
+                content=f"null goal {i}",
+                content_normalized=f"null goal {i}",
+                review_state="new",
+            )
+
+        resp = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "daily_goal": None},
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        self.assertEqual(5, resp.json()["progress"]["total"])
+
+    def test_goal_session_daily_goal_abc_422(self):
+        """Non-int daily_goal returns 422."""
+        resp = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "daily_goal": "abc"},
+        )
+        self.assertEqual(422, resp.status_code)
+
+    def test_goal_session_daily_goal_7_fallback(self):
+        """daily_goal=7 falls back to target=5."""
+        for i in range(5):
+            self.create_card(
+                content=f"goal 7 fallback {i}",
+                content_normalized=f"goal 7 fallback {i}",
+                review_state="new",
+            )
+
+        resp = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "daily_goal": 7},
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        data = resp.json()
+        # target=5 (fallback from 7), completed=0, remaining=5, effective_limit=5
+        self.assertEqual(5, data["progress"]["total"])
+
+    def test_goal_session_daily_goal_999_fallback(self):
+        """daily_goal=999 falls back to target=5."""
+        for i in range(5):
+            self.create_card(
+                content=f"goal 999 fallback {i}",
+                content_normalized=f"goal 999 fallback {i}",
+                review_state="new",
+            )
+
+        resp = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "daily_goal": 999},
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        self.assertEqual(5, resp.json()["progress"]["total"])
+
+    def test_goal_session_5_unreviewed_returns_5(self):
+        """daily_goal=5, completed=0, 5 unreviewed → returns 5."""
+        for i in range(5):
+            self.create_card(
+                content=f"goal 5 card {i}",
+                content_normalized=f"goal 5 card {i}",
+                review_state="new",
+            )
+
+        resp = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "daily_goal": 5},
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        data = resp.json()
+        self.assertEqual(5, data["progress"]["total"])
+        self.assertEqual(5, len(data["items"]))
+
+    def test_goal_session_completed_4_returns_1(self):
+        """daily_goal=5, completed=4, 1 unreviewed → returns 1."""
+        now = self._today_noon_utc()
+        # 4 cards reviewed today
+        for i in range(4):
+            cid = self.create_card(
+                content=f"reviewed {i}",
+                content_normalized=f"reviewed {i}",
+            )
+            self.create_review_log(cid, "got_it", now, session_type="daily_suggested")
+        # 1 unreviewed card
+        self.create_card(
+            content="unreviewed one",
+            content_normalized="unreviewed one",
+            review_state="new",
+        )
+
+        resp = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "daily_goal": 5},
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        data = resp.json()
+        self.assertEqual(1, data["progress"]["total"],
+                         "remaining=1 should only return 1 card, not forced to 3 or 5")
+
+    def test_goal_session_daily_goal_10_returns_10(self):
+        """daily_goal=10, limit=5, completed=0, 10 unreviewed → returns 10."""
+        for i in range(10):
+            self.create_card(
+                content=f"goal 10 card {i}",
+                content_normalized=f"goal 10 card {i}",
+                review_state="new",
+            )
+
+        resp = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "daily_goal": 10},
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        data = resp.json()
+        self.assertEqual(10, data["progress"]["total"],
+                         "daily_goal=10 should return 10 cards, not capped by limit=5")
+
+    def test_goal_session_daily_goal_3_returns_3(self):
+        """daily_goal=3, limit=5, completed=0, 5 unreviewed → returns 3."""
+        for i in range(5):
+            self.create_card(
+                content=f"goal 3 card {i}",
+                content_normalized=f"goal 3 card {i}",
+                review_state="new",
+            )
+
+        resp = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "daily_goal": 3},
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        data = resp.json()
+        self.assertEqual(3, data["progress"]["total"])
+
+    def test_goal_session_completed_5_goal_mode_false(self):
+        """daily_goal=5, completed=5 → goal_mode=False, old behavior, not blocked."""
+        now = self._today_noon_utc()
+        for i in range(5):
+            cid = self.create_card(
+                content=f"met {i}",
+                content_normalized=f"met {i}",
+            )
+            self.create_review_log(cid, "got_it", now, session_type="daily_suggested")
+        # Additional unreviewed cards for old logic to use
+        self.create_card(
+            content="extra new",
+            content_normalized="extra new",
+            review_state="new",
+        )
+
+        resp = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "daily_goal": 5},
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        data = resp.json()
+        # goal_mode=False, old behavior picks the extra new card
+        self.assertIsNotNone(data["session_id"])
+        self.assertGreater(data["progress"]["total"], 0)
+
+    def test_goal_session_completed_7_goal_mode_false(self):
+        """daily_goal=5, completed=7 → goal_mode=False, not blocked."""
+        now = self._today_noon_utc()
+        for i in range(7):
+            cid = self.create_card(
+                content=f"over {i}",
+                content_normalized=f"over {i}",
+            )
+            self.create_review_log(cid, "got_it", now, session_type="daily_suggested")
+        self.create_card(
+            content="extra",
+            content_normalized="extra",
+            review_state="new",
+        )
+
+        resp = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "daily_goal": 5},
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        self.assertIsNotNone(resp.json()["session_id"],
+                             "should not block session creation when overachieved")
+
+    def test_goal_session_only_2_unreviewed_returns_2(self):
+        """daily_goal=5, completed=0, only 2 unreviewed → returns 2, no error."""
+        self.create_card(
+            content="c1", content_normalized="c1", review_state="new"
+        )
+        self.create_card(
+            content="c2", content_normalized="c2", review_state="new"
+        )
+
+        resp = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "daily_goal": 5},
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        data = resp.json()
+        self.assertEqual(2, data["progress"]["total"])
+
+    def test_goal_session_zero_review_ready_cards(self):
+        """daily_goal=5, completed=0, 0 review-ready → session_id=null, same as current."""
+        resp = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "daily_goal": 5},
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        data = resp.json()
+        self.assertIsNone(data["session_id"])
+        self.assertEqual([], data["items"])
+
+    def test_goal_session_strengthening_priority_over_reviewed(self):
+        """Unreviewed strengthening comes before reviewed cards. Reviewed excluded entirely."""
+        now = self._today_noon_utc()
+        # reviewed strengthening card
+        c_reviewed = self.create_card(
+            content="reviewed strengthening",
+            content_normalized="reviewed strengthening",
+            review_state="strengthening",
+            mastery_score=1,
+            review_count=1,
+        )
+        self.create_review_log(c_reviewed, "shaky", now, session_type="daily_suggested")
+        # unreviewed strengthening
+        c_unreviewed = self.create_card(
+            content="unreviewed strengthening",
+            content_normalized="unreviewed strengthening",
+            review_state="strengthening",
+            mastery_score=1,
+            review_count=1,
+        )
+
+        resp = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "daily_goal": 5},
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        data = resp.json()
+        contents = {item["content"] for item in data["items"]}
+        self.assertIn("unreviewed strengthening", contents)
+        self.assertNotIn("reviewed strengthening", contents,
+                         "today-reviewed cards must not appear in goal_mode session")
+        self.assertEqual(1, data["progress"]["total"])
+
+    def test_goal_session_new_before_mastered_filler(self):
+        """New cards (P3) should come before mastered filler (P4)."""
+        # mastered filler: mastered but next_review_at far in future (not due)
+        self.create_card(
+            content="mastered filler",
+            content_normalized="mastered filler",
+            review_state="mastered",
+            mastery_score=5,
+            next_review_at=datetime(2126, 1, 1, tzinfo=timezone.utc),
+        )
+        # new card
+        self.create_card(
+            content="new card",
+            content_normalized="new card",
+            review_state="new",
+        )
+
+        resp = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "daily_goal": 5},
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        data = resp.json()
+        self.assertEqual(2, data["progress"]["total"])
+        # new card (P3) should appear before mastered filler (P4)
+        contents = [item["content"] for item in data["items"]]
+        self.assertEqual(
+            ["new card", "mastered filler"], contents,
+            "P3 (new) must come before P4 (mastered filler)"
+        )
+
+    def test_goal_session_mastered_filler_non_due(self):
+        """Mastered filler (P4) with next_review_at > now is selectable."""
+        self.create_card(
+            content="non-due mastered",
+            content_normalized="non-due mastered",
+            review_state="mastered",
+            mastery_score=5,
+            next_review_at=datetime(2126, 1, 1, tzinfo=timezone.utc),
+        )
+
+        resp = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "daily_goal": 5},
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        data = resp.json()
+        self.assertEqual(1, data["progress"]["total"])
+        self.assertEqual("non-due mastered", data["items"][0]["content"])
+
+    def test_goal_session_fluent_filler_accurate_fields(self):
+        """P5 fluent-like filler = reviewing + last_review_result=fluent, not due."""
+        self.create_card(
+            content="fluent card",
+            content_normalized="fluent card",
+            review_state="reviewing",
+            mastery_score=4,
+            last_review_result="fluent",
+            next_review_at=datetime(2126, 1, 1, tzinfo=timezone.utc),
+        )
+
+        resp = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "daily_goal": 5},
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        data = resp.json()
+        self.assertEqual(1, data["progress"]["total"])
+        self.assertEqual("fluent card", data["items"][0]["content"])
+
+    def test_goal_session_do_not_fill_with_reviewed_cards(self):
+        """goal=5, completed=2, remaining=3, only 1 unreviewed → returns 1, not 3."""
+        now = self._today_noon_utc()
+        # 2 cards reviewed today
+        for i in range(2):
+            cid = self.create_card(
+                content=f"reviewed {i}",
+                content_normalized=f"reviewed {i}",
+            )
+            self.create_review_log(cid, "got_it", now, session_type="daily_suggested")
+        # 1 unreviewed card
+        self.create_card(
+            content="only unreviewed",
+            content_normalized="only unreviewed",
+            review_state="new",
+        )
+
+        resp = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "daily_goal": 5},
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        data = resp.json()
+        self.assertEqual(1, data["progress"]["total"],
+                         "must NOT fill remaining slots with already-reviewed cards")
+        self.assertEqual("only unreviewed", data["items"][0]["content"])
+
+    def test_goal_session_dedup_p2_p4(self):
+        """Mastered + due card appears in P2, not duplicated in P4."""
+        self.create_card(
+            content="due mastered",
+            content_normalized="due mastered",
+            review_state="mastered",
+            mastery_score=5,
+            next_review_at=NOW - timedelta(days=1),  # due
+        )
+
+        resp = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "daily_goal": 5},
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        data = resp.json()
+        self.assertEqual(1, data["progress"]["total"],
+                         "card in both P2 and P4 must only appear once")
+
+    def test_goal_session_dedup_p4_p5(self):
+        """Fluent-like reviewing card that is due appears in P2, not duplicated in P5."""
+        self.create_card(
+            content="fluent due",
+            content_normalized="fluent due",
+            review_state="reviewing",
+            mastery_score=4,
+            last_review_result="fluent",
+            next_review_at=NOW - timedelta(days=1),  # due → P2
+        )
+
+        resp = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "daily_goal": 5},
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        data = resp.json()
+        self.assertEqual(1, data["progress"]["total"],
+                         "card in both P2 and P5 must only appear once")
+
+    def test_goal_session_content_only_card(self):
+        """Content-only card (no understanding) can enter goal_mode session."""
+        self.create_card(
+            content="content only",
+            content_normalized="content only",
+            understanding=None,
+            is_review_ready=True,
+            needs_manual_fix=False,
+            review_state="new",
+        )
+
+        resp = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "daily_goal": 5},
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        data = resp.json()
+        self.assertEqual(1, data["progress"]["total"])
+        self.assertEqual("content only", data["items"][0]["content"])
+
+    def test_goal_session_today_cross_session_type(self):
+        """Cards reviewed via new_only or free_review also excluded from daily_suggested goal_mode."""
+        now = self._today_noon_utc()
+        # Card reviewed via new_only today
+        cn = self.create_card(content="new only reviewed", content_normalized="new only reviewed")
+        self.create_review_log(cn, "got_it", now, session_type="new_only")
+        # Card reviewed via free_review today
+        cf = self.create_card(content="free review reviewed", content_normalized="free review reviewed")
+        self.create_review_log(cf, "fluent", now, session_type="free_review")
+        # Unreviewed card
+        self.create_card(
+            content="fresh card",
+            content_normalized="fresh card",
+            review_state="new",
+        )
+
+        resp = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "daily_goal": 5},
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        data = resp.json()
+        contents = {item["content"] for item in data["items"]}
+        self.assertIn("fresh card", contents)
+        self.assertNotIn("new only reviewed", contents)
+        self.assertNotIn("free review reviewed", contents)
+        self.assertEqual(1, data["progress"]["total"])
+
+    def test_goal_session_new_only_ignores_daily_goal(self):
+        """new_only session type ignores daily_goal, still uses old limit."""
+        for i in range(5):
+            self.create_card(
+                content=f"new only {i}",
+                content_normalized=f"new only {i}",
+                review_state="new",
+            )
+
+        resp = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "new_only", "limit": 5, "daily_goal": 10},
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        data = resp.json()
+        # new_only ignores daily_goal, still returns limit=5 cards
+        self.assertEqual(5, data["progress"]["total"],
+                         "new_only must ignore daily_goal and use limit=5")
+
+    def test_goal_session_free_review_ignores_daily_goal(self):
+        """free_review session type ignores daily_goal."""
+        for i in range(5):
+            self.create_card(
+                content=f"free rv {i}",
+                content_normalized=f"free rv {i}",
+                review_state="reviewing",
+                next_review_at=NOW - timedelta(days=1),
+            )
+
+        resp = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "free_review", "limit": 5, "daily_goal": 3},
+        )
+        self.assertEqual(200, resp.status_code, resp.text)
+        data = resp.json()
+        self.assertEqual(5, data["progress"]["total"],
+                         "free_review must ignore daily_goal and use limit=5")
+
 
 class TodayReviewedApiTest(unittest.TestCase):
     def setUp(self):

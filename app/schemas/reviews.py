@@ -92,6 +92,7 @@ class ReviewSessionCreateRequest(BaseModel):
     session_type: ReviewSessionType = "daily_suggested"
     limit: int = 5
     restart: bool = False
+    daily_goal: int | None = None
 
 
 class ReviewSessionCreateResponse(BaseModel):
