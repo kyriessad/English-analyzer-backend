@@ -40,12 +40,27 @@ class ActiveReviewSessionResponse(BaseModel):
     status: ReviewSessionStatus
 
 
+class GoalProgressResponse(BaseModel):
+    """Phase 6P-later-1: daily-goal-aware progress in overview response."""
+    target: int
+    completed_unique_today: int
+    display_numerator: int
+    display_denominator: int
+    is_goal_met: bool
+    is_overachieved: bool
+    remaining_to_goal: int
+    has_goal_contributing_cards: bool
+    has_any_reviewable_cards: bool
+    is_goal_blocked: bool
+
+
 class ReviewOverviewResponse(BaseModel):
     suggested: ReviewSuggestedOverview
     completed_suggested: ReviewCompletedSuggestedOverview
     extra_today: ReviewExtraTodayOverview
     is_all_done: bool
     active_session: ActiveReviewSessionResponse | None = None
+    goal_progress: GoalProgressResponse
 
 
 class ReviewProgressResponse(BaseModel):

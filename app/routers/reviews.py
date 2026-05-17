@@ -11,6 +11,7 @@ from app.models.card import Card
 from app.models.review import ReviewLog, ReviewSession, ReviewSessionItem
 from app.models.user import User, utc_now
 from app.schemas.reviews import (
+    GoalProgressResponse,
     ReviewFeedbackRequest,
     ReviewFeedbackResponse,
     ReviewHistoryDetailCardResponse,
@@ -46,6 +47,7 @@ from app.services.review_rules import (
     calculate_effective_new_quota,
     calculate_reappear_insert_position,
     get_due_reason,
+    normalize_daily_goal,
     normalize_review_limit,
     select_review_cards,
     should_append_reappear_item,
@@ -533,6 +535,7 @@ def _session_create_response(
 
 @router.get("/overview", response_model=ReviewOverviewResponse)
 def get_review_overview(
+    daily_goal: int = Query(default=5),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> ReviewOverviewResponse:
@@ -693,6 +696,65 @@ def get_review_overview(
         )
     )
 
+    # Phase 6P-later-1: goal_progress — daily-goal-aware progress independent of suggested.
+    target = normalize_daily_goal(daily_goal)
+    day_start_utc, day_end_utc = _history_date_bounds(today, today, current_user.timezone)
+
+    completed_unique_today = db.scalar(
+        select(func.count(func.distinct(ReviewLog.card_id)))
+        .select_from(ReviewLog)
+        .join(Card, Card.id == ReviewLog.card_id)
+        .where(
+            ReviewLog.user_id == current_user.id,
+            ReviewLog.reviewed_at >= day_start_utc,
+            ReviewLog.reviewed_at < day_end_utc,
+            *_active_card_filters(current_user.id),
+        )
+    ) or 0
+
+    has_goal_contributing_cards = db.scalar(
+        select(
+            select(Card.id)
+            .where(
+                *_review_ready_card_filters(current_user.id),
+                ~Card.id.in_(
+                    select(ReviewLog.card_id)
+                    .where(
+                        ReviewLog.user_id == current_user.id,
+                        ReviewLog.reviewed_at >= day_start_utc,
+                        ReviewLog.reviewed_at < day_end_utc,
+                    )
+                ),
+            )
+            .exists()
+        )
+    )
+
+    has_any_reviewable_cards = db.scalar(
+        select(
+            select(Card.id)
+            .where(*_review_ready_card_filters(current_user.id))
+            .exists()
+        )
+    )
+
+    is_goal_met = completed_unique_today >= target
+    is_overachieved = completed_unique_today > target
+    is_goal_blocked = (not is_goal_met) and (not has_goal_contributing_cards)
+
+    goal_progress = GoalProgressResponse(
+        target=target,
+        completed_unique_today=completed_unique_today,
+        display_numerator=min(completed_unique_today, target),
+        display_denominator=target,
+        is_goal_met=is_goal_met,
+        is_overachieved=is_overachieved,
+        remaining_to_goal=max(target - completed_unique_today, 0),
+        has_goal_contributing_cards=has_goal_contributing_cards,
+        has_any_reviewable_cards=has_any_reviewable_cards,
+        is_goal_blocked=is_goal_blocked,
+    )
+
     db.commit()
 
     return ReviewOverviewResponse(
@@ -715,6 +777,7 @@ def get_review_overview(
         },
         is_all_done=is_all_done,
         active_session=active_session_response,
+        goal_progress=goal_progress,
     )
 
 

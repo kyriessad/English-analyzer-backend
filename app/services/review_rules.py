@@ -12,6 +12,8 @@ from app.models.card import Card
 
 
 VALID_LIMITS = {5, 10, 15}
+VALID_DAILY_GOALS = {3, 5, 10}
+DAILY_GOAL_DEFAULT = 5
 VALID_RESULTS = {"forgot", "shaky", "got_it", "fluent"}
 REVIEW_STATES = {"new", "strengthening", "reviewing", "mastered"}
 BASE_INTERVAL_DAYS = {
@@ -91,6 +93,14 @@ def normalize_review_limit(limit: Any) -> int:
     except (TypeError, ValueError):
         return 5
     return normalized if normalized in VALID_LIMITS else 5
+
+
+def normalize_daily_goal(value: Any) -> int:
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        return DAILY_GOAL_DEFAULT
+    return normalized if normalized in VALID_DAILY_GOALS else DAILY_GOAL_DEFAULT
 
 
 def get_new_quota(limit: int) -> int:

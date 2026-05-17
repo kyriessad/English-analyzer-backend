@@ -2055,6 +2055,208 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
         self.assertEqual(2, overview.json()["suggested"]["total_count"])
 
 
+    # ===== Phase 6P-later-1: goal_progress tests =====
+
+    def _today_noon_utc(self):
+        return datetime.now(timezone.utc).replace(hour=12, minute=0, second=0, microsecond=0)
+
+    def test_goal_progress_default_daily_goal(self):
+        self.create_card(content="gp default", content_normalized="gp default")
+        overview = self.client.get("/api/reviews/overview", headers=self.auth_headers())
+        self.assertEqual(200, overview.status_code)
+        gp = overview.json()["goal_progress"]
+        self.assertEqual(5, gp["target"])
+
+    def test_goal_progress_daily_goal_3(self):
+        overview = self.client.get(
+            "/api/reviews/overview?daily_goal=3", headers=self.auth_headers()
+        )
+        self.assertEqual(200, overview.status_code)
+        self.assertEqual(3, overview.json()["goal_progress"]["target"])
+
+    def test_goal_progress_daily_goal_10(self):
+        overview = self.client.get(
+            "/api/reviews/overview?daily_goal=10", headers=self.auth_headers()
+        )
+        self.assertEqual(200, overview.status_code)
+        self.assertEqual(10, overview.json()["goal_progress"]["target"])
+
+    def test_goal_progress_invalid_daily_goal_fallback(self):
+        for invalid in (7, 999):
+            with self.subTest(daily_goal=invalid):
+                overview = self.client.get(
+                    f"/api/reviews/overview?daily_goal={invalid}",
+                    headers=self.auth_headers(),
+                )
+                self.assertEqual(200, overview.status_code)
+                self.assertEqual(5, overview.json()["goal_progress"]["target"])
+
+    def test_goal_progress_zero_cards(self):
+        overview = self.client.get("/api/reviews/overview", headers=self.auth_headers())
+        self.assertEqual(200, overview.status_code)
+        gp = overview.json()["goal_progress"]
+        self.assertEqual(0, gp["completed_unique_today"])
+        self.assertFalse(gp["has_goal_contributing_cards"])
+        self.assertFalse(gp["has_any_reviewable_cards"])
+        self.assertTrue(gp["is_goal_blocked"])
+
+    def test_goal_progress_completed_counts_all_session_types(self):
+        now = self._today_noon_utc()
+        card_a = self.create_card(content="cs a", content_normalized="cs a")
+        card_b = self.create_card(content="cs b", content_normalized="cs b")
+        card_c = self.create_card(content="cs c", content_normalized="cs c")
+        self.create_review_log(card_a, "got_it", now, session_type="daily_suggested")
+        self.create_review_log(card_b, "fluent", now, session_type="new_only")
+        self.create_review_log(card_c, "shaky", now, session_type="free_review")
+
+        overview = self.client.get(
+            "/api/reviews/overview?daily_goal=5", headers=self.auth_headers()
+        )
+        self.assertEqual(200, overview.status_code)
+        gp = overview.json()["goal_progress"]
+        self.assertEqual(3, gp["completed_unique_today"])
+
+    def test_goal_progress_same_card_not_double_counted(self):
+        now = self._today_noon_utc()
+        card = self.create_card(content="same card", content_normalized="same card")
+        self.create_review_log(card, "got_it", now - timedelta(hours=2), session_type="daily_suggested")
+        self.create_review_log(card, "fluent", now, session_type="free_review")
+
+        overview = self.client.get(
+            "/api/reviews/overview?daily_goal=5", headers=self.auth_headers()
+        )
+        self.assertEqual(200, overview.status_code)
+        self.assertEqual(1, overview.json()["goal_progress"]["completed_unique_today"])
+
+    def test_goal_progress_deleted_card_not_counted(self):
+        now = self._today_noon_utc()
+        card_keep = self.create_card(content="keep", content_normalized="keep")
+        card_del = self.create_card(content="delete me", content_normalized="delete me")
+        self.create_review_log(card_keep, "got_it", now, session_type="daily_suggested")
+        self.create_review_log(card_del, "fluent", now, session_type="daily_suggested")
+
+        with TestingSessionLocal() as db:
+            card = db.get(Card, card_del)
+            card.deleted_at = now
+            card.status = "deleted"
+            db.commit()
+
+        overview = self.client.get(
+            "/api/reviews/overview?daily_goal=5", headers=self.auth_headers()
+        )
+        self.assertEqual(200, overview.status_code)
+        self.assertEqual(1, overview.json()["goal_progress"]["completed_unique_today"])
+
+    def test_goal_progress_is_goal_met(self):
+        now = self._today_noon_utc()
+        for i in range(5):
+            card_id = self.create_card(content=f"met {i}", content_normalized=f"met {i}")
+            self.create_review_log(card_id, "got_it", now, session_type="daily_suggested")
+
+        overview = self.client.get(
+            "/api/reviews/overview?daily_goal=5", headers=self.auth_headers()
+        )
+        self.assertEqual(200, overview.status_code)
+        gp = overview.json()["goal_progress"]
+        self.assertTrue(gp["is_goal_met"])
+        self.assertFalse(gp["is_overachieved"])
+        self.assertEqual(5, gp["display_numerator"])
+
+    def test_goal_progress_is_overachieved(self):
+        now = self._today_noon_utc()
+        for i in range(7):
+            card_id = self.create_card(content=f"over {i}", content_normalized=f"over {i}")
+            self.create_review_log(card_id, "got_it", now, session_type="daily_suggested")
+
+        overview = self.client.get(
+            "/api/reviews/overview?daily_goal=5", headers=self.auth_headers()
+        )
+        self.assertEqual(200, overview.status_code)
+        gp = overview.json()["goal_progress"]
+        self.assertTrue(gp["is_overachieved"])
+        self.assertEqual(5, gp["display_numerator"])
+        self.assertEqual(5, gp["display_denominator"])
+        self.assertEqual(7, gp["completed_unique_today"])
+
+    def test_goal_progress_is_goal_blocked_true(self):
+        now = self._today_noon_utc()
+        for i in range(3):
+            card_id = self.create_card(content=f"blocked {i}", content_normalized=f"blocked {i}")
+            self.create_review_log(card_id, "got_it", now, session_type="daily_suggested")
+
+        overview = self.client.get(
+            "/api/reviews/overview?daily_goal=5", headers=self.auth_headers()
+        )
+        self.assertEqual(200, overview.status_code)
+        gp = overview.json()["goal_progress"]
+        self.assertFalse(gp["is_goal_met"])
+        self.assertTrue(gp["is_goal_blocked"])
+
+    def test_goal_progress_is_goal_blocked_false_when_more_cards(self):
+        now = self._today_noon_utc()
+        card_a = self.create_card(content="reviewed a", content_normalized="reviewed a")
+        card_b = self.create_card(content="unreviewed b", content_normalized="unreviewed b")
+        self.create_review_log(card_a, "got_it", now, session_type="daily_suggested")
+        # card_b not reviewed — still available
+
+        overview = self.client.get(
+            "/api/reviews/overview?daily_goal=5", headers=self.auth_headers()
+        )
+        self.assertEqual(200, overview.status_code)
+        gp = overview.json()["goal_progress"]
+        self.assertFalse(gp["is_goal_met"])
+        self.assertFalse(gp["is_goal_blocked"])
+
+    def test_goal_progress_all_reviewed_today(self):
+        now = self._today_noon_utc()
+        for i in range(3):
+            card_id = self.create_card(content=f"all rev {i}", content_normalized=f"all rev {i}")
+            self.create_review_log(card_id, "got_it", now, session_type="daily_suggested")
+
+        overview = self.client.get(
+            "/api/reviews/overview?daily_goal=5", headers=self.auth_headers()
+        )
+        self.assertEqual(200, overview.status_code)
+        gp = overview.json()["goal_progress"]
+        self.assertFalse(gp["has_goal_contributing_cards"])
+        self.assertTrue(gp["has_any_reviewable_cards"])
+
+    def test_goal_progress_other_user_not_counted(self):
+        now = self._today_noon_utc()
+        my_card = self.create_card(content="my card", content_normalized="my card")
+        other_card = self.create_card(
+            content="other card", content_normalized="other card",
+            user_id=self.other_user_uuid,
+        )
+        self.create_review_log(my_card, "got_it", now, session_type="daily_suggested")
+        self.create_review_log(other_card, "fluent", now, user_id=self.other_user_uuid, session_type="daily_suggested")
+
+        overview = self.client.get(
+            "/api/reviews/overview?daily_goal=5", headers=self.auth_headers()
+        )
+        self.assertEqual(200, overview.status_code)
+        gp = overview.json()["goal_progress"]
+        self.assertEqual(1, gp["completed_unique_today"])
+
+    def test_goal_progress_old_fields_unchanged(self):
+        card_id = self.create_card(content="old fields", content_normalized="old fields")
+
+        without_gp = self.client.get("/api/reviews/overview", headers=self.auth_headers())
+        with_gp = self.client.get("/api/reviews/overview?daily_goal=3", headers=self.auth_headers())
+
+        self.assertEqual(200, without_gp.status_code)
+        self.assertEqual(200, with_gp.status_code)
+        without = without_gp.json()
+        with_gp_data = with_gp.json()
+
+        for field in ("suggested", "completed_suggested", "extra_today", "is_all_done"):
+            self.assertEqual(without[field], with_gp_data[field],
+                             f"{field} must not change when daily_goal is passed")
+
+        self.assertIsNone(with_gp_data["active_session"])
+        self.assertIsNotNone(with_gp_data["goal_progress"])
+
+
 class TodayReviewedApiTest(unittest.TestCase):
     def setUp(self):
         Base.metadata.drop_all(bind=engine)
