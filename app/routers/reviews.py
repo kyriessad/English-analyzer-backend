@@ -223,6 +223,7 @@ def _build_card_snapshot(card: Card) -> dict:
         "card_type": card.card_type,
         "exam_scene": card.exam_scene,
         "exam_module": card.exam_module,
+        "where_encountered": card.where_encountered,
         "analysis_status": card.analysis_status,
         "analysis_level": card.analysis_level,
     }
@@ -238,6 +239,7 @@ def _review_history_item_response(row) -> ReviewHistoryItemResponse:
     card_type = snapshot.get("card_type") or row.card_type
     exam_scene = snapshot.get("exam_scene") or row.exam_scene
     exam_module = snapshot.get("exam_module") or row.exam_module
+    where_encountered = snapshot.get("where_encountered") or row.where_encountered
 
     return ReviewHistoryItemResponse(
         review_log_id=row.review_log_id,
@@ -248,6 +250,7 @@ def _review_history_item_response(row) -> ReviewHistoryItemResponse:
         card_type=card_type,
         exam_scene=exam_scene,
         exam_module=exam_module,
+        where_encountered=where_encountered,
         review_count_in_range=row.review_count_in_range,
         last_result=row.last_result,
         last_result_label=REVIEW_RESULT_LABELS[row.last_result],
@@ -916,6 +919,7 @@ def get_review_history(
                 Card.note.ilike(pattern),
                 Card.exam_scene.ilike(pattern),
                 Card.exam_module.ilike(pattern),
+                Card.where_encountered.ilike(pattern),
             )
         )
 
@@ -929,6 +933,7 @@ def get_review_history(
             Card.card_type,
             Card.exam_scene,
             Card.exam_module,
+            Card.where_encountered,
             latest_logs.c.review_count_in_range,
             latest_logs.c.last_result,
             latest_logs.c.last_reviewed_at,
@@ -1072,6 +1077,7 @@ def get_review_history_detail(
             card_type=s.get("card_type"),
             exam_scene=s.get("exam_scene"),
             exam_module=s.get("exam_module"),
+            where_encountered=s.get("where_encountered"),
             review_state=None,
             next_review_at=None,
             card_source="snapshot",
@@ -1097,6 +1103,7 @@ def get_review_history_detail(
                 card_type=card_obj.card_type,
                 exam_scene=card_obj.exam_scene,
                 exam_module=card_obj.exam_module,
+                where_encountered=card_obj.where_encountered,
                 review_state=card_obj.review_state,
                 next_review_at=card_obj.next_review_at,
                 card_source="current_card",

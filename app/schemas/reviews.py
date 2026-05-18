@@ -152,6 +152,7 @@ class ReviewHistoryItemResponse(BaseModel):
     card_type: str | None = None
     exam_scene: str | None = None
     exam_module: str | None = None
+    where_encountered: str | None = None
     review_count_in_range: int
     last_result: ReviewResult
     last_result_label: str
@@ -212,6 +213,7 @@ class ReviewHistoryDetailCardResponse(BaseModel):
     card_type: str | None = None
     exam_scene: str | None = None
     exam_module: str | None = None
+    where_encountered: str | None = None
     review_state: str | None = None
     next_review_at: datetime | None = None
     card_source: str = "current_card"

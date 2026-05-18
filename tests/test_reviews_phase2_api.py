@@ -1888,6 +1888,279 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
         self.assertEqual("survives deletion", d["card"]["understanding"])
         self.assertEqual("snapshot", d["card"]["card_source"])
 
+    def test_snapshot_includes_where_encountered(self):
+        """_build_card_snapshot captures where_encountered at review time."""
+        card_id = self.create_card(
+            content="clutch",
+            content_normalized="clutch",
+            where_encountered="NBA解说",
+        )
+        today = self.client.get(
+            "/api/reviews/today?limit=5&restart=true", headers=self.auth_headers()
+        ).json()
+        item = today["items"][0]
+
+        fb = self.client.post(
+            "/api/reviews/feedback",
+            headers=self.auth_headers(),
+            json={
+                "client_action_id": str(uuid4()),
+                "session_id": today["session_id"],
+                "session_item_id": item["session_item_id"],
+                "card_id": str(card_id),
+                "result": "got_it",
+            },
+        )
+        self.assertEqual(200, fb.status_code, fb.text)
+
+        with TestingSessionLocal() as db:
+            log = db.scalar(select(ReviewLog).where(ReviewLog.card_id == card_id))
+            self.assertIsNotNone(log)
+            self.assertIsNotNone(log.card_snapshot)
+            self.assertEqual("NBA解说", log.card_snapshot.get("where_encountered"))
+
+    def test_history_detail_snapshot_returns_where_encountered(self):
+        """GET /api/reviews/history/{log_id} returns snapshot where_encountered."""
+        card_id = self.create_card(
+            content="break a leg",
+            content_normalized="break a leg",
+            where_encountered="美剧Friends",
+        )
+        today = self.client.get(
+            "/api/reviews/today?limit=5&restart=true", headers=self.auth_headers()
+        ).json()
+        item = today["items"][0]
+
+        fb = self.client.post(
+            "/api/reviews/feedback",
+            headers=self.auth_headers(),
+            json={
+                "client_action_id": str(uuid4()),
+                "session_id": today["session_id"],
+                "session_item_id": item["session_item_id"],
+                "card_id": str(card_id),
+                "result": "fluent",
+            },
+        )
+        self.assertEqual(200, fb.status_code, fb.text)
+
+        with TestingSessionLocal() as db:
+            log = db.scalar(select(ReviewLog).where(ReviewLog.card_id == card_id))
+            log_id = str(log.id)
+
+        detail = self.client.get(
+            f"/api/reviews/history/{log_id}",
+            headers=self.auth_headers(),
+        )
+        self.assertEqual(200, detail.status_code, detail.text)
+        d = detail.json()
+        self.assertIsNotNone(d["card"])
+        self.assertEqual("snapshot", d["card"]["card_source"])
+        self.assertEqual("美剧Friends", d["card"]["where_encountered"])
+
+    def test_history_detail_snapshot_where_encountered_unchanged_after_card_edit(self):
+        """Editing Card.where_encountered must not change old history detail snapshot."""
+        card_id = self.create_card(
+            content="original",
+            content_normalized="original",
+            where_encountered="old source",
+        )
+        today = self.client.get(
+            "/api/reviews/today?limit=5&restart=true", headers=self.auth_headers()
+        ).json()
+        item = today["items"][0]
+
+        fb = self.client.post(
+            "/api/reviews/feedback",
+            headers=self.auth_headers(),
+            json={
+                "client_action_id": str(uuid4()),
+                "session_id": today["session_id"],
+                "session_item_id": item["session_item_id"],
+                "card_id": str(card_id),
+                "result": "got_it",
+            },
+        )
+        self.assertEqual(200, fb.status_code, fb.text)
+
+        with TestingSessionLocal() as db:
+            log = db.scalar(select(ReviewLog).where(ReviewLog.card_id == card_id))
+            log_id = str(log.id)
+
+        # Edit the card's where_encountered after review
+        with TestingSessionLocal() as db:
+            card = db.get(Card, card_id)
+            card.where_encountered = "new edited source"
+            db.commit()
+
+        # History detail must still return old snapshot value
+        detail = self.client.get(
+            f"/api/reviews/history/{log_id}",
+            headers=self.auth_headers(),
+        )
+        self.assertEqual(200, detail.status_code, detail.text)
+        d = detail.json()
+        self.assertIsNotNone(d["card"])
+        self.assertEqual("snapshot", d["card"]["card_source"])
+        self.assertEqual("old source", d["card"]["where_encountered"])
+
+    def test_history_detail_old_snapshot_without_where_encountered_returns_null(self):
+        """Old snapshot without where_encountered key returns null, not error."""
+        card_id = self.create_card(
+            content="no source",
+            content_normalized="no source",
+        )
+        now = datetime(2026, 5, 10, 12, 0, tzinfo=timezone.utc)
+
+        # Directly insert a ReviewLog with old-style snapshot (no where_encountered)
+        with TestingSessionLocal() as db:
+            session = ReviewSession(
+                user_id=self.user_uuid,
+                review_date=now.date(),
+                timezone="Asia/Shanghai",
+                session_type="daily_suggested",
+                started_at=now,
+                status="completed",
+                batch_size=5,
+                total_count=1,
+                reviewed_count=1,
+                completed_count=1,
+            )
+            db.add(session)
+            db.flush()
+
+            item = ReviewSessionItem(
+                session_id=session.id,
+                card_id=card_id,
+                position=0,
+                status="reviewed",
+                result="got_it",
+            )
+            db.add(item)
+            db.flush()
+
+            old_snapshot = {
+                "card_id": str(card_id),
+                "content": "no source",
+                "understanding": None,
+                "note": None,
+                "card_type": "word",
+                "exam_scene": None,
+                "exam_module": None,
+                "analysis_status": "done",
+                "analysis_level": "pass",
+            }
+            log = ReviewLog(
+                user_id=self.user_uuid,
+                card_id=card_id,
+                session_id=session.id,
+                session_item_id=item.id,
+                session_type="daily_suggested",
+                result="got_it",
+                reviewed_at=now,
+                card_snapshot=old_snapshot,
+                card_state_before_review="new",
+                review_state_before="new",
+                review_state_after="reviewing",
+                mastery_score_before=0,
+                mastery_score_after=1,
+                recovery_stage_before=0,
+                recovery_stage_after=0,
+            )
+            db.add(log)
+            db.commit()
+            log_id = str(log.id)
+
+        # History detail must return null for where_encountered, not crash
+        detail = self.client.get(
+            f"/api/reviews/history/{log_id}",
+            headers=self.auth_headers(),
+        )
+        self.assertEqual(200, detail.status_code, detail.text)
+        d = detail.json()
+        self.assertIsNotNone(d["card"])
+        self.assertIsNone(d["card"]["where_encountered"])
+
+    def test_history_detail_card_where_encountered_null_when_not_set(self):
+        """History detail returns null when Card.where_encountered is not set."""
+        card_id = self.create_card(
+            content="plain card",
+            content_normalized="plain card",
+        )
+        today = self.client.get(
+            "/api/reviews/today?limit=5&restart=true", headers=self.auth_headers()
+        ).json()
+        item = today["items"][0]
+
+        fb = self.client.post(
+            "/api/reviews/feedback",
+            headers=self.auth_headers(),
+            json={
+                "client_action_id": str(uuid4()),
+                "session_id": today["session_id"],
+                "session_item_id": item["session_item_id"],
+                "card_id": str(card_id),
+                "result": "got_it",
+            },
+        )
+        self.assertEqual(200, fb.status_code, fb.text)
+
+        with TestingSessionLocal() as db:
+            log = db.scalar(select(ReviewLog).where(ReviewLog.card_id == card_id))
+            log_id = str(log.id)
+
+        detail = self.client.get(
+            f"/api/reviews/history/{log_id}",
+            headers=self.auth_headers(),
+        )
+        self.assertEqual(200, detail.status_code, detail.text)
+        d = detail.json()
+        self.assertIsNotNone(d["card"])
+        self.assertIsNone(d["card"]["where_encountered"])
+
+    def test_history_list_search_by_where_encountered(self):
+        """GET /api/reviews/history?search=<keyword> finds cards by where_encountered."""
+        card_id = self.create_card(
+            content="clutch",
+            content_normalized="clutch",
+            where_encountered="NBA解说",
+        )
+        today = self.client.get(
+            "/api/reviews/today?limit=5&restart=true", headers=self.auth_headers()
+        ).json()
+        item = today["items"][0]
+
+        fb = self.client.post(
+            "/api/reviews/feedback",
+            headers=self.auth_headers(),
+            json={
+                "client_action_id": str(uuid4()),
+                "session_id": today["session_id"],
+                "session_item_id": item["session_item_id"],
+                "card_id": str(card_id),
+                "result": "got_it",
+            },
+        )
+        self.assertEqual(200, fb.status_code, fb.text)
+
+        # Search by NBA should find the card
+        response = self.client.get(
+            "/api/reviews/history?search=NBA",
+            headers=self.auth_headers(),
+        )
+        self.assertEqual(200, response.status_code, response.text)
+        data = response.json()
+        self.assertEqual(1, data["total"])
+        self.assertEqual("NBA解说", data["items"][0]["where_encountered"])
+
+        # Search by unrelated keyword returns empty
+        response2 = self.client.get(
+            "/api/reviews/history?search=xyznotfound",
+            headers=self.auth_headers(),
+        )
+        self.assertEqual(200, response2.status_code, response2.text)
+        self.assertEqual(0, response2.json()["total"])
+
     def test_overview_deleted_cards_not_counted_in_suggested(self):
         """After deleting all cards, suggested.total_count must be 0."""
         card1 = self.create_card(content="card one", content_normalized="card one")
