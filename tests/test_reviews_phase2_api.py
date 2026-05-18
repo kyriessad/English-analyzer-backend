@@ -3055,6 +3055,30 @@ class TodayReviewedApiTest(unittest.TestCase):
         self.assertEqual(1, data["total"])
         self.assertEqual("my card", data["items"][0]["content"])
 
+    def test_returns_where_encountered(self):
+        now = self._now()
+        card = self.create_card(
+            content="clutch",
+            understanding="关键时刻顶得住",
+            where_encountered="NBA解说",
+        )
+        self.create_review_log(card, "got_it", now)
+
+        response = self.client.get("/api/reviews/today-reviewed", headers=self.auth_headers())
+        self.assertEqual(200, response.status_code)
+        item = response.json()["items"][0]
+        self.assertEqual("NBA解说", item["where_encountered"])
+
+    def test_where_encountered_null_when_not_set(self):
+        now = self._now()
+        card = self.create_card(content="no source", understanding="no source")
+        self.create_review_log(card, "got_it", now)
+
+        response = self.client.get("/api/reviews/today-reviewed", headers=self.auth_headers())
+        self.assertEqual(200, response.status_code)
+        item = response.json()["items"][0]
+        self.assertIsNone(item["where_encountered"])
+
     def test_empty_today(self):
         response = self.client.get("/api/reviews/today-reviewed", headers=self.auth_headers())
         self.assertEqual(200, response.status_code)

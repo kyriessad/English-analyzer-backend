@@ -236,6 +236,7 @@ class TodayReviewedItem(BaseModel):
     card_type: str
     exam_scene: str | None = None
     exam_module: str | None = None
+    where_encountered: str | None = None
     today_review_count: int
     last_result: ReviewResult
     last_result_label: str
