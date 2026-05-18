@@ -306,6 +306,42 @@ class CardsApiTest(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         self.assertEqual("error", response.json()["level"])
 
+    def test_create_card_with_where_encountered(self):
+        card = self.create_card(
+            local_temp_id="local-where-1",
+            legacy_cloud_id="cloud-where-1",
+            where_encountered="NBA 解说",
+        )
+
+        self.assertEqual("NBA 解说", card["where_encountered"])
+
+    def test_update_card_where_encountered(self):
+        created = self.create_card(
+            local_temp_id="local-where-2",
+            legacy_cloud_id="cloud-where-2",
+            where_encountered="工作邮件",
+        )
+        self.assertEqual("工作邮件", created["where_encountered"])
+
+        response = self.client.patch(
+            f"/api/cards/{created['id']}",
+            headers=self.auth_headers(),
+            json={"where_encountered": "美剧 Friends"},
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("美剧 Friends", response.json()["where_encountered"])
+
+    def test_create_card_without_where_encountered_is_null(self):
+        card = self.create_card(
+            local_temp_id="local-where-3",
+            legacy_cloud_id="cloud-where-3",
+        )
+
+        self.assertIsNone(card["where_encountered"])
+        self.assertEqual("look forward to", card["content"])
+        self.assertIn("exam_scene", card)  # exam_scene field still present and unaffected
+
     def test_review_preview_api_still_works(self):
         response = self.client.post(
             "/api/review/preview-today",

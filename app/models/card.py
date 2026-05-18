@@ -57,6 +57,7 @@ class Card(Base):
     exam_module: Mapped[str | None] = mapped_column(String(64), nullable=True)
     understanding: Mapped[str | None] = mapped_column(Text, nullable=True)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    where_encountered: Mapped[str | None] = mapped_column(Text, nullable=True)
     translation: Mapped[str | None] = mapped_column(Text, nullable=True)
     analysis_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     is_review_ready: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

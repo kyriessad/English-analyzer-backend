@@ -28,6 +28,7 @@ class CardCreate(BaseModel):
         validation_alias=AliasChoices("understanding", "user_understanding", "ai_understanding"),
     )
     note: str | None = Field(default=None, validation_alias=AliasChoices("note", "notes"))
+    where_encountered: str | None = None
     translation: str | None = Field(
         default=None,
         validation_alias=AliasChoices("translation", "meaning_cn", "context_translation"),
@@ -48,6 +49,7 @@ class CardUpdate(BaseModel):
         validation_alias=AliasChoices("understanding", "user_understanding", "ai_understanding"),
     )
     note: str | None = Field(default=None, validation_alias=AliasChoices("note", "notes"))
+    where_encountered: str | None = None
     translation: str | None = Field(
         default=None,
         validation_alias=AliasChoices("translation", "meaning_cn", "context_translation"),
@@ -72,6 +74,7 @@ class CardResponse(BaseModel):
     exam_module: str | None = None
     understanding: str | None = None
     note: str | None = None
+    where_encountered: str | None = None
     translation: str | None = None
     analysis_status: AnalysisStatus
     is_review_ready: bool
