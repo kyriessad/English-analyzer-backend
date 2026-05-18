@@ -127,6 +127,7 @@ def _item_response(item: ReviewSessionItem, now: datetime) -> ReviewItemResponse
         content=card.content,
         understanding=card.understanding or "",
         note=card.note or "",
+        where_encountered=card.where_encountered,
         card_type=card.card_type,
         review_state=card.review_state,
         mastery_score=card.mastery_score,

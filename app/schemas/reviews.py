@@ -74,6 +74,7 @@ class ReviewItemResponse(BaseModel):
     content: str
     understanding: str | None = ""
     note: str | None = ""
+    where_encountered: str | None = None
     card_type: str
     review_state: ReviewState
     mastery_score: int

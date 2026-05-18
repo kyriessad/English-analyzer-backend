@@ -2769,6 +2769,38 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
         self.assertEqual(5, data["progress"]["total"],
                          "free_review must ignore daily_goal and use limit=5")
 
+    def test_review_session_item_includes_where_encountered(self):
+        self.create_card(
+            content="look forward to",
+            content_normalized="look forward to",
+            where_encountered="NBA 解说",
+        )
+
+        response = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "restart": True},
+        )
+
+        self.assertEqual(200, response.status_code, response.text)
+        items = response.json()["items"]
+        self.assertEqual(1, len(items))
+        self.assertEqual("NBA 解说", items[0]["where_encountered"])
+
+    def test_review_session_item_where_encountered_is_null_when_not_set(self):
+        self.create_card(content="look up", content_normalized="look up")
+
+        response = self.client.post(
+            "/api/review-sessions",
+            headers=self.auth_headers(),
+            json={"session_type": "daily_suggested", "limit": 5, "restart": True},
+        )
+
+        self.assertEqual(200, response.status_code, response.text)
+        items = response.json()["items"]
+        self.assertEqual(1, len(items))
+        self.assertIsNone(items[0]["where_encountered"])
+
 
 class TodayReviewedApiTest(unittest.TestCase):
     def setUp(self):
