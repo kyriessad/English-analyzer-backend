@@ -227,7 +227,11 @@ def _classify_text(text: str, tokens: list[str]) -> str:
         return "unknown"
 
     if not re.search(r"\s", text) and re.search(r"[\d-]", text):
-        return "unknown"
+        # Hyphenated alphabetic compound words (e.g. well-known, full-time, e-mail)
+        # are valid English — only reject when the string also contains a digit or
+        # doesn't consist solely of letters and hyphens starting with a letter.
+        if re.search(r"\d", text) or not re.fullmatch(r"[A-Za-z][A-Za-z-]+", text):
+            return "unknown"
 
     token_count = len(tokens)
 

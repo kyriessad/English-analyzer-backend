@@ -117,5 +117,155 @@ class AnalyzerExampleGateTest(unittest.TestCase):
         self.assertEqual(result["exampleTranslation"], "她渴望成功。")
 
 
+class ValidatorClassificationTest(unittest.TestCase):
+    """
+    Phase 8H: verify that validate_english classifies inputs correctly,
+    including the Rule-3 fix for hyphenated compound words.
+    """
+
+    def _cat(self, text: str) -> str:
+        from app.services.validator import validate_english
+        return validate_english(text)["category"]
+
+    # ── Common words ──────────────────────────────────────────────
+    def test_clutch_is_word(self):
+        self.assertEqual(self._cat("clutch"), "word")
+
+    def test_crave_is_word(self):
+        self.assertEqual(self._cat("crave"), "word")
+
+    # ── Phrases ───────────────────────────────────────────────────
+    def test_break_a_leg_is_phrase(self):
+        self.assertEqual(self._cat("break a leg"), "phrase")
+
+    def test_pick_up_is_phrase(self):
+        self.assertEqual(self._cat("pick up"), "phrase")
+
+    def test_commit_guilty_is_phrase(self):
+        self.assertEqual(self._cat("commit guilty"), "phrase")
+
+    # ── Hyphenated compound words (Rule-3 fix) ────────────────────
+    def test_well_known_is_word(self):
+        self.assertEqual(self._cat("well-known"), "word")
+
+    def test_full_time_is_word(self):
+        self.assertEqual(self._cat("full-time"), "word")
+
+    def test_part_time_is_word(self):
+        self.assertEqual(self._cat("part-time"), "word")
+
+    def test_up_to_date_is_word(self):
+        self.assertEqual(self._cat("up-to-date"), "word")
+
+    def test_state_of_the_art_is_word(self):
+        self.assertEqual(self._cat("state-of-the-art"), "word")
+
+    def test_long_term_is_word(self):
+        self.assertEqual(self._cat("long-term"), "word")
+
+    def test_self_control_is_word(self):
+        self.assertEqual(self._cat("self-control"), "word")
+
+    def test_e_mail_is_word(self):
+        self.assertEqual(self._cat("e-mail"), "word")
+
+    def test_co_worker_is_word(self):
+        self.assertEqual(self._cat("co-worker"), "word")
+
+    def test_follow_up_is_word(self):
+        self.assertEqual(self._cat("follow-up"), "word")
+
+    def test_check_in_is_word(self):
+        self.assertEqual(self._cat("check-in"), "word")
+
+    def test_make_up_is_word(self):
+        self.assertEqual(self._cat("make-up"), "word")
+
+    # ── Numbers / symbols — must stay unknown or error ────────────
+    def test_2024_not_example_eligible(self):
+        result = __import__("app.services.validator", fromlist=["validate_english"]).validate_english("2024")
+        self.assertIn(result["category"], ("unknown",))
+        self.assertEqual(result["level"], "error")
+
+    def test_numeric_range_not_example_eligible(self):
+        result = __import__("app.services.validator", fromlist=["validate_english"]).validate_english("100-200")
+        self.assertIn(result["category"], ("unknown",))
+        self.assertEqual(result["level"], "error")
+
+    def test_negative_number_not_example_eligible(self):
+        result = __import__("app.services.validator", fromlist=["validate_english"]).validate_english("-50")
+        self.assertIn(result["category"], ("unknown",))
+        self.assertEqual(result["level"], "error")
+
+    # ── COVID-19 stays unknown (has digit) ────────────────────────
+    def test_covid19_is_unknown(self):
+        self.assertEqual(self._cat("COVID-19"), "unknown")
+
+
+class HyphenatedWordExampleChainTest(unittest.TestCase):
+    """
+    Phase 8H: verify that hyphenated words (after Rule-3 fix) enter
+    example generation, and that the gate logic is correct.
+    """
+
+    def _call_with_mocks(self, text):
+        from app.services.analyzer import analyze_text
+
+        with (
+            patch("app.services.analyzer.get_cache", return_value=None),
+            patch("app.services.analyzer.set_cache"),
+            patch("app.services.analyzer.translate_to_zh",
+                  return_value={"ok": True, "translation": "测试", "provider": "tencent"}),
+            patch("app.services.analyzer.generate_understanding", return_value="u"),
+            patch("app.services.analyzer.generate_example_with_hunyuan") as mock_hunyuan,
+            patch("app.services.analyzer._generate_example_with_tmt") as mock_tmt,
+        ):
+            mock_hunyuan.return_value = (None, None)
+            mock_tmt.return_value = (None, None)
+            result = analyze_text(text)
+            return result, mock_hunyuan, mock_tmt
+
+    def test_well_known_calls_hunyuan(self):
+        result, mock_hunyuan, _ = self._call_with_mocks("well-known")
+        self.assertEqual(result["category"], "word")
+        mock_hunyuan.assert_called_once_with("well-known", "测试")
+
+    def test_full_time_calls_hunyuan(self):
+        result, mock_hunyuan, _ = self._call_with_mocks("full-time")
+        self.assertEqual(result["category"], "word")
+        mock_hunyuan.assert_called_once()
+
+    def test_follow_up_calls_hunyuan(self):
+        result, mock_hunyuan, _ = self._call_with_mocks("follow-up")
+        self.assertEqual(result["category"], "word")
+        mock_hunyuan.assert_called_once()
+
+    def test_unknown_category_skips_hunyuan(self):
+        result, mock_hunyuan, mock_tmt = self._call_with_mocks("COVID-19")
+        self.assertEqual(result["category"], "unknown")
+        mock_hunyuan.assert_not_called()
+        mock_tmt.assert_not_called()
+
+    def test_hyphenated_word_hunyuan_result_propagated(self):
+        from app.services.analyzer import analyze_text
+
+        with (
+            patch("app.services.analyzer.get_cache", return_value=None),
+            patch("app.services.analyzer.set_cache"),
+            patch("app.services.analyzer.translate_to_zh",
+                  return_value={"ok": True, "translation": "全职", "provider": "tencent"}),
+            patch("app.services.analyzer.generate_understanding", return_value="u"),
+            patch("app.services.analyzer.generate_example_with_hunyuan",
+                  return_value=("She works full-time.", "她全职工作。")),
+            patch("app.services.analyzer._generate_example_with_tmt",
+                  return_value=(None, None)),
+        ):
+            result = analyze_text("full-time")
+
+        self.assertEqual(result["category"], "word")
+        self.assertEqual(result["exampleSentence"], "She works full-time.")
+        self.assertEqual(result["exampleTranslation"], "她全职工作。")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -62,7 +62,7 @@ TEST_SAMPLES = [
     {"id": 42, "text": "B2B", "expected_level": "pass", "expected_category": "unknown", "note": "含数字术语，不应 error"},
     {"id": 43, "text": "P2P", "expected_level": "pass", "expected_category": "unknown", "note": "含数字术语，不应 error"},
     {"id": 44, "text": "COVID-19", "expected_level": "pass", "expected_category": "unknown", "note": "含数字/连字符术语"},
-    {"id": 45, "text": "e-mail", "expected_level": "pass", "expected_category": "unknown", "note": "连字符词，不应 error"},
+    {"id": 45, "text": "e-mail", "expected_level": "pass", "expected_category": "word", "note": "连字符词，Phase 8H 修复后应判 word"},
     {"id": 46, "text": "look forward to", "expected_level": "pass", "expected_category": "phrase", "note": "短语"},
     {"id": 47, "text": "give up", "expected_level": "pass", "expected_category": "phrase", "note": "短语"},
     {"id": 48, "text": "take notes", "expected_level": "pass", "expected_category": "phrase", "note": "短语"},
