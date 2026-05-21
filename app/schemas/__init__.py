@@ -29,3 +29,5 @@ class AnalyzeResponse(BaseModel):
     errors: list[str] = Field(default_factory=list)
     provider: str | None = None
     cacheHit: bool = False
+    exampleSentence: str | None = None
+    exampleTranslation: str | None = None
