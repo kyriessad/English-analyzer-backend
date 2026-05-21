@@ -1,8 +1,10 @@
 """
-Use Tencent Hunyuan LLM to generate an English example sentence for a word or phrase.
+Generate English example sentences via TokenHub Hunyuan (OpenAI-compatible API).
 Failure is always silent and never affects the main analysis flow.
 """
 import json
+
+import requests
 
 from app.core.config import settings
 
@@ -12,55 +14,66 @@ def generate_example_with_hunyuan(
     chinese_meaning: str | None = None,
 ) -> tuple[str | None, str | None]:
     """
-    Call Tencent Hunyuan ChatCompletions to generate an example sentence.
+    Call TokenHub Hunyuan ChatCompletions to generate an example sentence.
 
     Returns (exampleSentence, exampleTranslation) or (None, None) on any failure,
-    including missing credentials, service not activated, or validation mismatch.
+    including missing API key, network error, or validation mismatch.
     """
     try:
-        from tencentcloud.common import credential as tencent_credential
-        from tencentcloud.common.profile.client_profile import ClientProfile
-        from tencentcloud.common.profile.http_profile import HttpProfile
-        from tencentcloud.hunyuan.v20230901 import hunyuan_client
-        from tencentcloud.hunyuan.v20230901 import models as hunyuan_models
-
-        secret_id = (settings.tencent_secret_id or "").strip()
-        secret_key = (settings.tencent_secret_key or "").strip()
-        if not secret_id or not secret_key:
+        api_key = (settings.hunyuan_api_key or "").strip()
+        if not api_key:
             return None, None
 
-        cred = tencent_credential.Credential(secret_id, secret_key)
-        http_profile = HttpProfile()
-        http_profile.endpoint = "hunyuan.tencentcloudapi.com"
-        http_profile.reqTimeout = 12
-        client_profile = ClientProfile()
-        client_profile.httpProfile = http_profile
-        client = hunyuan_client.HunyuanClient(cred, "", client_profile)
+        base_url = settings.hunyuan_base_url
+        model = settings.hunyuan_model
 
-        meaning_hint = f"（中文含义：{chinese_meaning}）" if chinese_meaning else ""
-        prompt = (
-            f'请为英文单词或短语"{text}"{meaning_hint}生成一个自然的英文例句，并提供该例句的中文翻译。\n'
-            "要求：\n"
-            f'1. exampleSentence 必须是完整英文句子，且必须自然地包含"{text}"或其变形（过去式、进行时等均可）\n'
-            "2. 例句要简洁、日常、生动易懂，不少于 4 个英文单词\n"
-            "3. exampleTranslation 是该例句的中文翻译\n"
-            "4. 仅返回以下 JSON 格式，不要有任何其他内容或 Markdown：\n"
+        meaning_hint = f"（含义：{chinese_meaning}）" if chinese_meaning else ""
+
+        system_prompt = (
+            "You are an English teacher helping Chinese learners. "
+            "Generate a natural English example sentence and its Chinese translation. "
+            "You must ONLY return valid JSON, no markdown, no explanation."
+        )
+
+        user_prompt = (
+            f'Create an example sentence for the English word/phrase "{text}"{meaning_hint}.\n'
+            "Requirements:\n"
+            f'1. exampleSentence must be a natural, complete English sentence that contains "{text}" or its inflection\n'
+            "2. The example should be concise, daily-life, suitable for English learners\n"
+            "3. exampleTranslation must be the natural Chinese translation of the example sentence\n"
+            "4. Return ONLY a JSON object (no markdown, no extra text):\n"
             '{"exampleSentence": "...", "exampleTranslation": "..."}'
         )
 
-        msg = hunyuan_models.Message()
-        msg.Role = "user"
-        msg.Content = prompt
+        resp = requests.post(
+            f"{base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.2,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=15,
+        )
 
-        req = hunyuan_models.ChatCompletionsRequest()
-        req.Model = "hunyuan-lite"
-        req.Messages = [msg]
-        req.Stream = False
+        if resp.status_code != 200:
+            return None, None
 
-        resp = client.ChatCompletions(req)
-        content = str(resp.Choices[0].Message.Content or "").strip()
+        content = str(
+            resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+        ).strip()
 
-        # Extract JSON — guard against leading/trailing prose from the model
+        if not content:
+            return None, None
+
+        # Extract JSON — guard against markdown wrapping
         start = content.find("{")
         end = content.rfind("}") + 1
         if start == -1 or end <= start:
@@ -76,7 +89,7 @@ def generate_example_with_hunyuan(
         # Must not be the bare input text itself
         if sentence.lower().strip() == text.lower().strip():
             return None, None
-        # Must contain the original input (substring, handles inflections like craved/craving)
+        # Must contain the original input (substring, case-insensitive)
         if text.lower() not in sentence.lower():
             return None, None
         # Must be a real sentence, not a single word
