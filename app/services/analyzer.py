@@ -12,9 +12,13 @@ validator.py 检测
 ↓
 调用 understanding.py 生成理解
 ↓
+（word/phrase）调用 Free Dictionary API 获取真实例句
+↓
 返回统一结构
 """
 from typing import Any
+
+import requests
 
 from app.schemas import Category, Level
 from app.services.cache import get_cache, make_cache_key, set_cache
@@ -24,6 +28,28 @@ from app.services.validator import validate_english
 
 
 TRANSLATION_UNAVAILABLE_WARNING = "翻译暂时不可用，已先保存英文内容。"
+_DICT_API_BASE = "https://api.dictionaryapi.dev/api/v2/entries/en"
+
+
+def _fetch_dictionary_example(word: str, timeout: int = 5) -> str | None:
+    """从 Free Dictionary API 取首条真实英文例句，失败返回 None。"""
+    try:
+        url = f"{_DICT_API_BASE}/{requests.utils.quote(word.strip())}"
+        resp = requests.get(url, timeout=timeout)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if not isinstance(data, list):
+            return None
+        for entry in data:
+            for meaning in entry.get("meanings", []):
+                for defn in meaning.get("definitions", []):
+                    example = str(defn.get("example") or "").strip()
+                    if example:
+                        return example
+        return None
+    except Exception:
+        return None
 
 
 def _build_response(
@@ -38,6 +64,8 @@ def _build_response(
     errors: list[str] | None = None,
     provider: str | None = None,
     cache_hit: bool = False,
+    example_sentence: str | None = None,
+    example_translation: str | None = None,
 ) -> dict[str, Any]:
     return {
         "ok": ok,
@@ -50,6 +78,8 @@ def _build_response(
         "errors": errors or [],
         "provider": provider,
         "cacheHit": cache_hit,
+        "exampleSentence": example_sentence,
+        "exampleTranslation": example_translation,
     }
 
 
@@ -96,6 +126,19 @@ def analyze_text(
             translation,
         )
 
+        # 对单词和短语尝试从词典获取真实例句，并翻译该例句
+        example_sentence: str | None = None
+        example_translation: str | None = None
+        if category in ("word", "phrase") and translation_result.get("ok"):
+            example_sentence = _fetch_dictionary_example(normalized_text)
+            if example_sentence:
+                try:
+                    ex_result = translate_to_zh(example_sentence)
+                    if ex_result.get("ok"):
+                        example_translation = ex_result.get("translation")
+                except Exception:
+                    pass
+
         level: Level = validation_level
         response = _build_response(
             ok=True,
@@ -108,6 +151,8 @@ def analyze_text(
             errors=[],
             provider=provider,
             cache_hit=False,
+            example_sentence=example_sentence,
+            example_translation=example_translation,
         )
 
         if translation_result.get("ok") and translation:
