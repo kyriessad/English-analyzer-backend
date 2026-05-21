@@ -144,15 +144,17 @@ def analyze_text(
         )
 
         # 对单词和短语用 TokenHub Hunyuan 生成 AI 例句
+        # translation 用作 Hunyuan prompt 的中文提示，为 None 时 Hunyuan 仍可尝试生成
         example_sentence: str | None = None
         example_translation: str | None = None
-        if category in ("word", "phrase") and translation:
+        if category in ("word", "phrase"):
             example_sentence, example_translation = generate_example_with_hunyuan(
                 normalized_text, translation
             )
             if example_sentence:
                 logger.info("[analyzer] Hunyuan SUCCESS for '%s'", normalized_text)
-            else:
+            elif translation:
+                # TMT builds Chinese template sentences from translation — skip when unavailable
                 logger.info("[analyzer] Hunyuan failed, trying TMT fallback for '%s'", normalized_text)
                 example_sentence, example_translation = _generate_example_with_tmt(
                     normalized_text, translation, category
@@ -161,6 +163,8 @@ def analyze_text(
                     logger.info("[analyzer] TMT fallback SUCCESS for '%s'", normalized_text)
                 else:
                     logger.info("[analyzer] TMT fallback also failed for '%s'", normalized_text)
+            else:
+                logger.info("[analyzer] Hunyuan failed, TMT skipped (no translation) for '%s'", normalized_text)
 
         level: Level = validation_level
         response = _build_response(
