@@ -197,9 +197,9 @@ class ValidatorClassificationTest(unittest.TestCase):
         self.assertIn(result["category"], ("unknown",))
         self.assertEqual(result["level"], "error")
 
-    # ── COVID-19 stays unknown (has digit) ────────────────────────
-    def test_covid19_is_unknown(self):
-        self.assertEqual(self._cat("COVID-19"), "unknown")
+    # ── Phase 8I: COVID-19 reclassified as word (has letter + digit) ──
+    def test_covid19_is_word(self):
+        self.assertEqual(self._cat("COVID-19"), "word")
 
 
 class HyphenatedWordExampleChainTest(unittest.TestCase):
@@ -240,11 +240,11 @@ class HyphenatedWordExampleChainTest(unittest.TestCase):
         self.assertEqual(result["category"], "word")
         mock_hunyuan.assert_called_once()
 
-    def test_unknown_category_skips_hunyuan(self):
-        result, mock_hunyuan, mock_tmt = self._call_with_mocks("COVID-19")
-        self.assertEqual(result["category"], "unknown")
-        mock_hunyuan.assert_not_called()
-        mock_tmt.assert_not_called()
+    def test_covid19_calls_hunyuan(self):
+        """Phase 8I: COVID-19 is now classified as word and enters Hunyuan."""
+        result, mock_hunyuan, _ = self._call_with_mocks("COVID-19")
+        self.assertEqual(result["category"], "word")
+        mock_hunyuan.assert_called_once()
 
     def test_hyphenated_word_hunyuan_result_propagated(self):
         from app.services.analyzer import analyze_text
@@ -265,6 +265,246 @@ class HyphenatedWordExampleChainTest(unittest.TestCase):
         self.assertEqual(result["category"], "word")
         self.assertEqual(result["exampleSentence"], "She works full-time.")
         self.assertEqual(result["exampleTranslation"], "她全职工作。")
+
+
+class AlphanumericClassificationTest(unittest.TestCase):
+    """Phase 8I: alphanumeric terms and abbreviations classified as word."""
+
+    def _cat(self, text: str) -> str:
+        from app.services.validator import validate_english
+        return validate_english(text)["category"]
+
+    # ── Alphanumeric terms → word ──────────────────────────────────
+    def test_5g_is_word(self):
+        self.assertEqual(self._cat("5G"), "word")
+
+    def test_b2b_is_word(self):
+        self.assertEqual(self._cat("B2B"), "word")
+
+    def test_h1n1_is_word(self):
+        self.assertEqual(self._cat("H1N1"), "word")
+
+    def test_mp3_is_word(self):
+        self.assertEqual(self._cat("MP3"), "word")
+
+    def test_web3_is_word(self):
+        self.assertEqual(self._cat("Web3"), "word")
+
+    def test_gpt4_is_word(self):
+        self.assertEqual(self._cat("GPT-4"), "word")
+
+    def test_covid19_is_word(self):
+        self.assertEqual(self._cat("COVID-19"), "word")
+
+    # ── Abbreviations with dots → word ────────────────────────────
+    def test_us_abbreviation_is_word(self):
+        self.assertEqual(self._cat("U.S."), "word")
+
+    def test_eg_abbreviation_is_word(self):
+        self.assertEqual(self._cat("e.g."), "word")
+
+    def test_ie_abbreviation_is_word(self):
+        self.assertEqual(self._cat("i.e."), "word")
+
+    def test_dr_abbreviation_is_word(self):
+        self.assertEqual(self._cat("Dr."), "word")
+
+    # ── Symbol-like inputs → unknown ──────────────────────────────
+    def test_hash_na_is_unknown(self):
+        self.assertEqual(self._cat("#N/A"), "unknown")
+
+    def test_at_signs_is_unknown(self):
+        from app.services.validator import validate_english
+        result = validate_english("@@@")
+        self.assertIn(result["level"], ("error",))
+
+    def test_slash_is_unknown(self):
+        from app.services.validator import validate_english
+        result = validate_english("/")
+        self.assertIn(result["level"], ("error",))
+
+    # ── Pure numbers stay unknown/error ───────────────────────────
+    def test_pure_number_2024(self):
+        from app.services.validator import validate_english
+        result = validate_english("2024")
+        self.assertEqual(result["level"], "error")
+
+    def test_numeric_range(self):
+        from app.services.validator import validate_english
+        result = validate_english("100-200")
+        self.assertEqual(result["level"], "error")
+
+    # ── Real sentence still → sentence (not confused with abbrev) ─
+    def test_complete_sentence_not_word(self):
+        self.assertEqual(self._cat("I went home."), "sentence")
+
+    def test_multiword_sentence_not_word(self):
+        self.assertEqual(self._cat("She loves English."), "sentence")
+
+
+class AlphanumericExampleChainTest(unittest.TestCase):
+    """Phase 8I: alphanumeric / abbreviation words enter Hunyuan generation."""
+
+    def _call_with_mocks(self, text):
+        from app.services.analyzer import analyze_text
+        with (
+            patch("app.services.analyzer.get_cache", return_value=None),
+            patch("app.services.analyzer.set_cache"),
+            patch("app.services.analyzer.translate_to_zh",
+                  return_value={"ok": True, "translation": "测试", "provider": "tencent"}),
+            patch("app.services.analyzer.generate_understanding", return_value="u"),
+            patch("app.services.analyzer.generate_example_with_hunyuan") as mock_h,
+            patch("app.services.analyzer._generate_example_with_tmt") as mock_t,
+        ):
+            mock_h.return_value = (None, None)
+            mock_t.return_value = (None, None)
+            result = analyze_text(text)
+            return result, mock_h, mock_t
+
+    def test_5g_calls_hunyuan(self):
+        result, mock_h, _ = self._call_with_mocks("5G")
+        self.assertEqual(result["category"], "word")
+        mock_h.assert_called_once()
+
+    def test_b2b_calls_hunyuan(self):
+        result, mock_h, _ = self._call_with_mocks("B2B")
+        self.assertEqual(result["category"], "word")
+        mock_h.assert_called_once()
+
+    def test_gpt4_calls_hunyuan(self):
+        result, mock_h, _ = self._call_with_mocks("GPT-4")
+        self.assertEqual(result["category"], "word")
+        mock_h.assert_called_once()
+
+    def test_us_abbreviation_calls_hunyuan(self):
+        result, mock_h, _ = self._call_with_mocks("U.S.")
+        self.assertEqual(result["category"], "word")
+        mock_h.assert_called_once()
+
+    def test_eg_abbreviation_calls_hunyuan(self):
+        result, mock_h, _ = self._call_with_mocks("e.g.")
+        self.assertEqual(result["category"], "word")
+        mock_h.assert_called_once()
+
+    def test_pure_number_skips_hunyuan(self):
+        result, mock_h, mock_t = self._call_with_mocks("2024")
+        self.assertEqual(result["ok"], False)
+        mock_h.assert_not_called()
+        mock_t.assert_not_called()
+
+    def test_hash_na_skips_hunyuan(self):
+        # #N/A has no validation error (N/A are letters) but category=unknown → no example
+        result, mock_h, mock_t = self._call_with_mocks("#N/A")
+        self.assertEqual(result["category"], "unknown")
+        mock_h.assert_not_called()
+        mock_t.assert_not_called()
+
+    def test_alphanumeric_example_propagated(self):
+        from app.services.analyzer import analyze_text
+        with (
+            patch("app.services.analyzer.get_cache", return_value=None),
+            patch("app.services.analyzer.set_cache"),
+            patch("app.services.analyzer.translate_to_zh",
+                  return_value={"ok": True, "translation": "新冠", "provider": "tencent"}),
+            patch("app.services.analyzer.generate_understanding", return_value="u"),
+            patch("app.services.analyzer.generate_example_with_hunyuan",
+                  return_value=("COVID-19 changed the world.", "新冠疫情改变了世界。")),
+            patch("app.services.analyzer._generate_example_with_tmt", return_value=(None, None)),
+        ):
+            result = analyze_text("COVID-19")
+        self.assertEqual(result["category"], "word")
+        self.assertEqual(result["exampleSentence"], "COVID-19 changed the world.")
+
+
+class ExampleValidationTest(unittest.TestCase):
+    """Phase 8I: word and phrase morphology matching in _text_in_sentence."""
+
+    def _check(self, text: str, sentence: str, allow_inflection: bool) -> bool:
+        from app.services.hunyuan_example import _text_in_sentence
+        return _text_in_sentence(text, sentence, allow_inflection=allow_inflection)
+
+    # ── Exact match (both modes) ───────────────────────────────────
+    def test_exact_word_match(self):
+        self.assertTrue(self._check("crave", "She craves chocolate.", False))
+
+    def test_exact_phrase_match(self):
+        self.assertTrue(self._check("break a leg", "Break a leg at the interview!", False))
+
+    # ── Single-word inflections (loose mode) ──────────────────────
+    def test_crave_craves(self):
+        self.assertTrue(self._check("crave", "She craves chocolate at night.", True))
+
+    def test_crave_craved(self):
+        self.assertTrue(self._check("crave", "He craved attention.", True))
+
+    def test_crave_craving(self):
+        self.assertTrue(self._check("crave", "He was craving attention.", True))
+
+    def test_avoid_avoided(self):
+        self.assertTrue(self._check("avoid", "She avoided the question.", True))
+
+    def test_avoid_avoiding(self):
+        self.assertTrue(self._check("avoid", "He is avoiding her.", True))
+
+    def test_admire_admired(self):
+        self.assertTrue(self._check("admire", "I admired his courage.", True))
+
+    def test_admire_admiring(self):
+        self.assertTrue(self._check("admire", "She was admiring the view.", True))
+
+    def test_deadline_deadlines(self):
+        self.assertTrue(self._check("deadline", "We have two deadlines this week.", True))
+
+    # ── Phrase core-verb inflections (loose mode) ──────────────────
+    def test_break_out_broke_out(self):
+        self.assertTrue(self._check("break out", "A fire broke out last night.", True))
+
+    def test_break_out_broken_out(self):
+        self.assertTrue(self._check("break out", "The disease has broken out again.", True))
+
+    def test_break_out_breaking_out(self):
+        self.assertTrue(self._check("break out", "A conflict is breaking out.", True))
+
+    def test_give_up_gave_up(self):
+        self.assertTrue(self._check("give up", "She gave up smoking.", True))
+
+    def test_give_up_given_up(self):
+        self.assertTrue(self._check("give up", "He has given up the idea.", True))
+
+    def test_pick_up_picked_up(self):
+        self.assertTrue(self._check("pick up", "He picked up the phone.", True))
+
+    def test_pick_up_picking_up(self):
+        self.assertTrue(self._check("pick up", "She is picking up speed.", True))
+
+    def test_come_across_came_across(self):
+        self.assertTrue(self._check("come across", "I came across an old photo.", True))
+
+    # ── Alphanumeric / hyphenated: exact match suffices ───────────
+    def test_covid19_exact(self):
+        self.assertTrue(self._check("COVID-19", "COVID-19 changed the way people work.", False))
+
+    def test_gpt4_exact(self):
+        self.assertTrue(self._check("GPT-4", "GPT-4 can answer questions.", False))
+
+    def test_well_known_exact(self):
+        self.assertTrue(self._check("well-known", "He is a well-known actor.", False))
+
+    # ── Must NOT pass: pure synonym, phrase not present ───────────
+    def test_crave_synonym_fails(self):
+        self.assertFalse(self._check("crave", "She really wanted chocolate.", True))
+
+    def test_break_out_synonym_fails(self):
+        self.assertFalse(self._check("break out", "A fire started last night.", True))
+
+    def test_break_a_leg_good_luck_fails(self):
+        self.assertFalse(self._check("break a leg", "Good luck with your interview.", True))
+
+    def test_commit_guilty_dispersed_fails(self):
+        # "committing" and "guilty" both appear but not adjacent → must fail
+        self.assertFalse(
+            self._check("commit guilty", "He was found guilty of committing a crime.", True)
+        )
 
 
 if __name__ == "__main__":

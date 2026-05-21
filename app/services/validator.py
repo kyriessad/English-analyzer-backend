@@ -219,6 +219,15 @@ def _get_format_warnings(normalized_text: str, has_english: bool) -> list[str]:
     return warnings
 
 
+def _is_abbreviation_like(text: str) -> bool:
+    """True if *text* looks like an abbreviation: U.S., e.g., Dr., i.e., etc.
+
+    Criteria: no spaces, ends with '.', every dot-separated segment is 1–4 letters.
+    """
+    segments = [s for s in text.rstrip(".").split(".") if s]
+    return bool(segments) and all(re.fullmatch(r"[A-Za-z]{1,4}", s) for s in segments)
+
+
 def _classify_text(text: str, tokens: list[str]) -> str:
     if len(text) > 180:
         return "paragraph"
@@ -226,13 +235,26 @@ def _classify_text(text: str, tokens: list[str]) -> str:
     if _has_chinese(text) and _has_english(text):
         return "unknown"
 
-    if not re.search(r"\s", text) and re.search(r"[\d-]", text):
-        # Hyphenated alphabetic compound words (e.g. well-known, full-time, e-mail)
-        # are valid English — only reject when the string also contains a digit or
-        # doesn't consist solely of letters and hyphens starting with a letter.
-        if re.search(r"\d", text) or not re.fullmatch(r"[A-Za-z][A-Za-z-]+", text):
+    # No-space inputs are single-unit entries (word, abbreviation, alphanumeric term).
+    # Accept them when every character is a valid word character AND the text has at
+    # least one English letter.  This covers:
+    #   COVID-19, 5G, B2B, GPT-4, well-known, e-mail  → word
+    #   U.S., e.g., Dr., i.e.                          → word (abbreviation)
+    # And rejects:
+    #   #N/A, @@@, /, !!!  (non-word symbols present)  → unknown
+    #   2024, 100-200, -50 (no English letter)         → unknown
+    if not re.search(r"\s", text):
+        if not re.fullmatch(r"[A-Za-z0-9.\-'']+", text):
             return "unknown"
+        if not _has_english(text):
+            return "unknown"
+        # Abbreviations end with '.' and have short alpha segments — return "word"
+        # immediately so SENTENCE_END_RE below does not fire on them.
+        if text.endswith(".") and _is_abbreviation_like(text):
+            return "word"
+        return "word"
 
+    # Multi-word inputs: apply sentence heuristics on token count / trailing punctuation.
     token_count = len(tokens)
 
     if SENTENCE_END_RE.search(text):

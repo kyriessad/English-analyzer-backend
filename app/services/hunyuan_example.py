@@ -11,15 +11,107 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Common irregular verb forms.  Only past/participle/progressive/3sg that cannot
+# be derived from the base by simple suffixing rules are listed.
+_IRREGULAR_FORMS: dict[str, set[str]] = {
+    "be":         {"am", "is", "are", "was", "were", "been", "being"},
+    "break":      {"broke", "broken", "breaking", "breaks"},
+    "bring":      {"brought", "bringing", "brings"},
+    "build":      {"built", "building", "builds"},
+    "buy":        {"bought", "buying", "buys"},
+    "catch":      {"caught", "catching", "catches"},
+    "come":       {"came", "coming", "comes"},
+    "cut":        {"cutting", "cuts"},
+    "do":         {"did", "done", "doing", "does"},
+    "draw":       {"drew", "drawn", "drawing", "draws"},
+    "drink":      {"drank", "drunk", "drinking", "drinks"},
+    "drive":      {"drove", "driven", "driving", "drives"},
+    "eat":        {"ate", "eaten", "eating", "eats"},
+    "fall":       {"fell", "fallen", "falling", "falls"},
+    "feel":       {"felt", "feeling", "feels"},
+    "find":       {"found", "finding", "finds"},
+    "fly":        {"flew", "flown", "flying", "flies"},
+    "get":        {"got", "gotten", "getting", "gets"},
+    "give":       {"gave", "given", "giving", "gives"},
+    "go":         {"went", "gone", "going", "goes"},
+    "grow":       {"grew", "grown", "growing", "grows"},
+    "have":       {"had", "having", "has"},
+    "hear":       {"heard", "hearing", "hears"},
+    "hold":       {"held", "holding", "holds"},
+    "keep":       {"kept", "keeping", "keeps"},
+    "know":       {"knew", "known", "knowing", "knows"},
+    "lead":       {"led", "leading", "leads"},
+    "leave":      {"left", "leaving", "leaves"},
+    "let":        {"letting", "lets"},
+    "lose":       {"lost", "losing", "loses"},
+    "make":       {"made", "making", "makes"},
+    "mean":       {"meant", "meaning", "means"},
+    "meet":       {"met", "meeting", "meets"},
+    "pay":        {"paid", "paying", "pays"},
+    "put":        {"putting", "puts"},
+    "read":       {"reading", "reads"},
+    "run":        {"ran", "running", "runs"},
+    "say":        {"said", "saying", "says"},
+    "see":        {"saw", "seen", "seeing", "sees"},
+    "sell":       {"sold", "selling", "sells"},
+    "send":       {"sent", "sending", "sends"},
+    "set":        {"setting", "sets"},
+    "show":       {"showed", "shown", "showing", "shows"},
+    "sit":        {"sat", "sitting", "sits"},
+    "speak":      {"spoke", "spoken", "speaking", "speaks"},
+    "spend":      {"spent", "spending", "spends"},
+    "stand":      {"stood", "standing", "stands"},
+    "take":       {"took", "taken", "taking", "takes"},
+    "teach":      {"taught", "teaching", "teaches"},
+    "tell":       {"told", "telling", "tells"},
+    "think":      {"thought", "thinking", "thinks"},
+    "throw":      {"threw", "thrown", "throwing", "throws"},
+    "understand": {"understood", "understanding", "understands"},
+    "wake":       {"woke", "woken", "waking", "wakes"},
+    "wear":       {"wore", "worn", "wearing", "wears"},
+    "win":        {"won", "winning", "wins"},
+    "write":      {"wrote", "written", "writing", "writes"},
+}
+
+
+def _generate_word_forms(base: str) -> set[str]:
+    """Return a set of common inflected forms of *base* (already lowercase).
+
+    Covers:
+    - Irregular forms via _IRREGULAR_FORMS table
+    - Regular +s / +ed / +ing
+    - E-ending: drop -e before -ing / -ed  (crave → craving, craved)
+    - Y-ending after consonant: -y → -ies / -ied  (study → studies, studied)
+    - Sibilant endings: add -es  (watch → watches)
+    """
+    forms: set[str] = {base}
+    if base in _IRREGULAR_FORMS:
+        forms |= _IRREGULAR_FORMS[base]
+    forms |= {base + "s", base + "ed", base + "ing"}
+    if base.endswith("e") and len(base) > 2:
+        stem = base[:-1]
+        forms |= {stem + "ing", stem + "ed", stem + "er", stem + "ers"}
+    if len(base) > 1 and base.endswith("y") and base[-2] not in "aeiou":
+        forms |= {base[:-1] + "ies", base[:-1] + "ied"}
+    if base.endswith(("s", "sh", "ch", "x", "z")):
+        forms.add(base + "es")
+    return forms
+
 
 def _text_in_sentence(text: str, sentence: str, *, allow_inflection: bool = False) -> bool:
-    """Check whether *text* (or its common inflections) appears in *sentence*.
+    """Check whether *text* (or its morphological variants) appears in *sentence*.
 
-    When *allow_inflection* is True, common regular inflections are also
-    accepted: +s, +es, +d, +ed, +ing, and for words ending in -e the
-    forms with dropped -e (e.g. crave → craving, craved).
+    Single-word inputs:
+        Exact case-insensitive substring match, then common inflections via
+        _generate_word_forms when allow_inflection is True.
+
+    Multi-word phrase inputs (allow_inflection only):
+        Inflect ONLY the first word; require the inflected form plus the
+        remaining words to appear as a contiguous substring.  This prevents
+        "commit guilty" from passing just because "committing" and "guilty"
+        appear separately in the sentence.
     """
-    lower_text = text.lower()
+    lower_text = text.lower().strip()
     lower_sentence = sentence.lower()
 
     if lower_text in lower_sentence:
@@ -28,25 +120,21 @@ def _text_in_sentence(text: str, sentence: str, *, allow_inflection: bool = Fals
     if not allow_inflection:
         return False
 
-    # Generate common inflected forms
-    candidates = {
-        lower_text + "s",
-        lower_text + "es",
-        lower_text + "d",
-        lower_text + "ed",
-        lower_text + "ing",
-    }
-    # For words ending in -e, also try dropping -e before adding suffix
-    if lower_text.endswith("e") and len(lower_text) > 2:
-        stem = lower_text[:-1]
-        candidates.update({stem + "ing", stem + "ed", stem + "es", stem + "s", stem + "d"})
+    phrase_words = lower_text.split()
 
-    words = lower_sentence.split()
-    for w in words:
-        w_clean = w.strip(".,!?;:\"'()[]{}")
-        if w_clean in candidates:
+    if len(phrase_words) == 1:
+        # Single word: check every generated form as a whole token
+        candidates = _generate_word_forms(lower_text)
+        sentence_tokens = [w.strip(".,!?;:\"'()[]{}") for w in lower_sentence.split()]
+        return any(tok in candidates for tok in sentence_tokens)
+
+    # Multi-word phrase: inflect the first word, keep the rest contiguous.
+    # e.g. "break out" → check "broke out", "broken out", "breaking out" …
+    first_word = phrase_words[0]
+    rest = " ".join(phrase_words[1:])
+    for form in _generate_word_forms(first_word):
+        if f"{form} {rest}" in lower_sentence:
             return True
-
     return False
 
 
