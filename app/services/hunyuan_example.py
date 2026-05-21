@@ -39,8 +39,9 @@ def _call_and_validate(
         user_prompt = (
             f'Create an example sentence for the English word/phrase "{text}"{meaning_hint}.\n'
             "STRICT requirements:\n"
-            f'1. You MUST use the exact word/phrase "{text}" in the exampleSentence — '
-            "do NOT use synonyms, do NOT use different forms, do NOT use inflections\n"
+            f'1. The exampleSentence MUST contain the exact word "{text}". '
+            f'Use the base form "{text}" — do NOT use synonyms, '
+            f'do NOT use different forms, do NOT use inflections like -ing, -ed, -s\n'
             "2. The example should be concise, daily-life, suitable for English learners\n"
             "3. exampleTranslation must be the natural Chinese translation of the example sentence\n"
             "4. Return ONLY a JSON object (no markdown, no extra text):\n"
