@@ -1,5 +1,174 @@
 # Current Development Phase
 
+## Phase 8I — Alphanumeric Classification, Abbreviation Detection & Example Morphology Matching
+
+**Status:** Completed (2026-05-21)
+**Type:** Classification fix + Example validation improvement
+**Backend commit:** `54db753`
+
+---
+
+### 一、修复了什么
+
+#### 后端：`app/services/validator.py`
+
+**`_classify_text` no-space 分支重写**：
+
+旧 Rule 3 只允许纯字母连字符词，含数字一律 `unknown`。新规则：
+
+```
+无空格输入 → 检查是否全由 [A-Za-z0-9.\-'']+ 组成
+  → 不是（含 # / @ ! 等）→ unknown
+  → 是，但无英文字母 → unknown
+  → 是，有英文字母，末尾有 . 且满足 _is_abbreviation_like → word（绕过 SENTENCE_END_RE）
+  → 其他 → word
+```
+
+效果：
+- `COVID-19 / 5G / B2B / H1N1 / MP3 / Web3 / GPT-4` → `word`（进入例句生成）
+- `U.S. / e.g. / i.e. / Dr.` → `word`（不再被 SENTENCE_END_RE 判为 sentence）
+- `#N/A` → `unknown`（含 `#` `/` 非法字符）
+- `2024 / 100-200 / -50` → `unknown`（无英文字母）
+
+**新函数 `_is_abbreviation_like(text)`**：
+
+判断缩写句点模式：末尾有 `.`，所有点分段均为 1-4 个字母。
+
+#### 后端：`app/services/hunyuan_example.py`
+
+**新增 `_IRREGULAR_FORMS` 表**（36 个常见不规则动词）和 **`_generate_word_forms(base)`**：
+
+生成通用词形集合：
+- 不规则形式（break→broke/broken，give→gave/given，come→came 等）
+- 规则 +s / +ed / +ing
+- e 结尾去 e（crave→craving/craved）
+- y→ies/ied（study→studied）
+- 同化结尾 +es（watch→watches）
+
+**`_text_in_sentence` 重写**：
+
+| 输入类型 | 新行为 |
+|---|---|
+| 单词 | 精确子串检查 + 词形集合 token 匹配 |
+| 短语 | 精确子串检查 + **仅第一词**词形变化，其余词**连续出现** |
+
+核心约束：短语不允许拆分匹配，防止 `commit guilty` 因 `committing` 和 `guilty` 分散出现而通过。
+
+#### 测试：`tests/test_analyzer_unit.py`
+
+新增 51 个测试，3 个新类：
+- `AlphanumericClassificationTest`：5G/B2B/H1N1/GPT-4/U.S./e.g./Dr./#N/A/2024 等分类验证
+- `AlphanumericExampleChainTest`：含 mock 确认 COVID-19/5G/GPT-4/U.S. 进入 Hunyuan，#N/A/2024 不进入
+- `ExampleValidationTest`：crave→craves/craved/craving、break out→broke out/broken out、commit guilty 负例等 22 项
+
+更新 2 个旧测试：`test_covid19_is_unknown` → `test_covid19_is_word`，`test_unknown_category_skips_hunyuan` → `test_covid19_calls_hunyuan`。
+
+全量：**269 passed**（含 31 subtests）。
+
+---
+
+### 二、修改前后分类对照
+
+| input | old category | new category | should_gen_example | reason |
+|---|---|---|---|---|
+| COVID-19 | unknown | **word** | Y | 含字母，合法字符集 |
+| 5G | unknown | **word** | Y | 含字母，合法字符集 |
+| B2B | unknown | **word** | Y | 含字母，合法字符集 |
+| H1N1 | unknown | **word** | Y | 含字母，合法字符集 |
+| MP3 | unknown | **word** | Y | 含字母，合法字符集 |
+| Web3 | unknown | **word** | Y | 含字母，合法字符集 |
+| GPT-4 | unknown | **word** | Y | 含字母，合法字符集 |
+| U.S. | sentence | **word** | Y | 缩写检测，绕过 SENTENCE_END_RE |
+| e.g. | sentence | **word** | Y | 缩写检测，绕过 SENTENCE_END_RE |
+| i.e. | sentence | **word** | Y | 缩写检测 |
+| Dr. | sentence | **word** | Y | 缩写检测 |
+| #N/A | phrase | **unknown** | N | 含 # / 非法字符 |
+| 2024 | unknown | unknown | N | 无英文字母（error） |
+| well-known | word | word | Y | 不变（Phase 8H 已修复） |
+| break a leg | phrase | phrase | Y | 不变 |
+| I went home. | sentence | sentence | N | 不变 |
+
+---
+
+### 三、例句词形校验对照
+
+| input | example sentence | old result | new result | reason |
+|---|---|---|---|---|
+| crave | She craves chocolate. | pass | pass | "crave" 是 "craves" 子串 |
+| crave | He was craving attention. | pass | pass | e-stem: craving |
+| crave | She really wanted chocolate. | fail | fail | 纯同义，无 crave 形式 |
+| avoid | She avoided the question. | pass | pass | "avoid" 是 "avoided" 子串 |
+| admire | She was admiring the view. | pass | pass | e-stem: admiring |
+| break out | A fire broke out last night. | **fail** | **pass** | 短语词形：broke out |
+| break out | The disease has broken out. | **fail** | **pass** | 短语词形：broken out |
+| give up | She gave up smoking. | **fail** | **pass** | 短语词形：gave up |
+| pick up | He picked up the phone. | **fail** | **pass** | 短语词形：picked up |
+| come across | I came across an old photo. | **fail** | **pass** | 短语词形：came across |
+| break a leg | Good luck with your interview. | fail | fail | 无 break a leg 形式 |
+| commit guilty | He was found guilty of committing a crime. | fail | fail | committing + guilty 不连续 |
+| COVID-19 | COVID-19 changed the world. | N/A（不生成） | pass | 精确子串，现在进入生成 |
+
+---
+
+### 四、明确没有处理的边界
+
+| 场景 | 状态 |
+|---|---|
+| 完整句子（I love English.）不生成例句 | 不变，产品语义保留 |
+| `commit guilty` 分类仍为 phrase，进入 Hunyuan | 不阻断（产品无害），但词形校验正确拒绝非连续匹配 |
+| `make a` 分类为 phrase，`made a` 通过 loose 校验 | 可接受（产品允许 phrase） |
+| 完整缩写如 `NASA` 无点号 → word | 不变，一直正确 |
+| 不规则名词复数（analysis→analyses）| 未处理，但 analysis 是 analyses 的子串，实际可过 |
+| 不做例句持久化 | 不变 |
+| 不换模型 | 不变 |
+| 数据库 schema 不变 | 不变 |
+
+---
+
+### 五、硬编码白名单声明
+
+**本次实现不含任何针对具体样例的白名单。**
+
+- 分类规则基于字符集结构（`[A-Za-z0-9.\-'']+` + `_has_english`）
+- 缩写检测基于段长通用规则（每段 1-4 字母）
+- 词形基于通用生成规则（+s/ed/ing/e-stem/y-stem）+ 不规则动词补充表
+- COVID-20 / GPT-5 / part-time / co-founder / avoided / admiring / picked up 等同类词无需新增白名单即可适配
+
+---
+
+### 六、人工验收步骤
+
+重启后端：`uvicorn app.main:app --reload`
+
+微信开发者工具重新编译后，在小程序输入：
+
+| 输入 | 预期 category | 预期 | 日志 |
+|---|---|---|---|
+| COVID-19 | word | 有例句，含 "COVID-19" | [hunyuan][diag] pass |
+| GPT-4 | word | 有例句，含 "GPT-4" | [hunyuan][diag] pass |
+| 5G | word | 有例句，含 "5G" | [hunyuan][diag] pass |
+| B2B | word | 有例句，含 "B2B" | [hunyuan][diag] pass |
+| U.S. | word | 有例句，含 "U.S." | [hunyuan][diag] pass |
+| e.g. | word | 有例句，含 "e.g." | [hunyuan][diag] pass |
+| clutch | word | 有例句 | [hunyuan][diag] pass |
+| crave | word | 有例句 | [hunyuan][diag] pass |
+| break out | phrase | 有例句（broke out 可通过） | [hunyuan][diag] pass |
+| give up | phrase | 有例句（gave up 可通过） | [hunyuan][diag] pass |
+| well-known | word | 有例句 | [hunyuan][diag] pass |
+| #N/A | unknown | 无例句，error/pass | 不进入 Hunyuan |
+| 2024 | unknown | 无例句，error | 不进入 Hunyuan |
+
+---
+
+### 七、测试验证
+
+- `python -m pytest tests/test_analyzer_unit.py -v` → 86/86 passed
+- `python -m pytest -q` → 269 passed, 31 subtests passed
+- `node --check pages/add/add.js` → OK
+- `git diff --check` → OK（仅 LF/CRLF 警告，无内容问题）
+
+---
+
 ## Phase 8H — Example Generation Full-Coverage Diagnosis & Minimal Fix
 
 **Status:** Completed (2026-05-21)
