@@ -62,6 +62,12 @@ def _call_and_validate(
     retry_eligible is True when the sentence was valid but didn't contain
     the original word (or its inflections, when inflection mode is on).
     """
+    _mode = "strict" if strict else "loose"
+    logger.info(
+        "[hunyuan][diag] start | text=%r | mode=%s | has_translation=%s",
+        text, _mode, chinese_meaning is not None,
+    )
+
     api_key = (settings.hunyuan_api_key or "").strip()
     base_url = settings.hunyuan_base_url
     model = settings.hunyuan_model
@@ -102,23 +108,30 @@ def _call_and_validate(
         )
 
     url = f"{base_url}/chat/completions"
-    resp = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.2,
-            "response_format": {"type": "json_object"},
-        },
-        timeout=15,
-    )
+    try:
+        resp = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.2,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=15,
+        )
+    except requests.exceptions.Timeout:
+        logger.warning(
+            "[hunyuan][diag] fail_reason=model_timeout | text=%r | mode=%s",
+            text, _mode,
+        )
+        return None, None, False
 
     if resp.status_code != 200:
         error_hint = ""
@@ -128,62 +141,93 @@ def _call_and_validate(
         except Exception:
             error_hint = resp.text[:200]
         logger.warning(
-            "[hunyuan] HTTP %s from %s: %s",
-            resp.status_code, base_url, error_hint,
+            "[hunyuan][diag] fail_reason=model_api_error | text=%r | mode=%s | HTTP %s: %s",
+            text, _mode, resp.status_code, error_hint,
         )
         return None, None, False
 
     body = resp.json()
     choices = body.get("choices", [])
     if not choices:
-        logger.warning("[hunyuan] response has no choices")
+        logger.warning(
+            "[hunyuan][diag] fail_reason=empty_response | text=%r | mode=%s | no choices",
+            text, _mode,
+        )
         return None, None, False
 
     content = str(choices[0].get("message", {}).get("content", "")).strip()
     if not content:
-        logger.warning("[hunyuan] response content is empty")
+        logger.warning(
+            "[hunyuan][diag] fail_reason=empty_response | text=%r | mode=%s | empty content",
+            text, _mode,
+        )
         return None, None, False
 
-    logger.info("[hunyuan] content length: %d", len(content))
+    logger.info(
+        "[hunyuan][diag] raw_response(300)=%r | text=%r | mode=%s",
+        content[:300], text, _mode,
+    )
 
     # Extract JSON — guard against markdown wrapping
     start = content.find("{")
     end = content.rfind("}") + 1
     if start == -1 or end <= start:
-        logger.warning("[hunyuan] no JSON object found in content: %s", content[:120])
+        logger.warning(
+            "[hunyuan][diag] fail_reason=json_parse_failed | text=%r | mode=%s | no JSON braces",
+            text, _mode,
+        )
         return None, None, False
 
     try:
         data = json.loads(content[start:end])
     except json.JSONDecodeError as e:
-        logger.warning("[hunyuan] JSON parse failed: %s | raw: %s", e, content[:200])
+        logger.warning(
+            "[hunyuan][diag] fail_reason=json_parse_failed | text=%r | mode=%s | %s",
+            text, _mode, e,
+        )
         return None, None, False
 
     sentence = str(data.get("exampleSentence") or "").strip()
     translation = str(data.get("exampleTranslation") or "").strip()
 
+    logger.info(
+        "[hunyuan][diag] parsed | text=%r | mode=%s | exampleSentence=%r",
+        text, _mode, sentence[:120] if sentence else "",
+    )
+
     # Both fields must be present
     if not sentence or not translation:
-        logger.warning("[hunyuan] validation FAIL: sentence or translation empty")
+        logger.warning(
+            "[hunyuan][diag] fail_reason=missing_example_sentence | text=%r | mode=%s"
+            " | sentence_empty=%s | translation_empty=%s",
+            text, _mode, not sentence, not translation,
+        )
         return None, None, False
     # Must not be the bare input text itself
     if sentence.lower().strip() == text.lower().strip():
-        logger.warning("[hunyuan] validation FAIL: sentence equals input text")
+        logger.warning(
+            "[hunyuan][diag] fail_reason=exact_match_failed | text=%r | mode=%s"
+            " | sentence equals input text",
+            text, _mode,
+        )
         return None, None, False
     # Must be a real sentence, not a single word
     if len(sentence.split()) < 3:
-        logger.warning("[hunyuan] validation FAIL: too few words: %s", sentence)
+        logger.warning(
+            "[hunyuan][diag] fail_reason=too_few_words | text=%r | mode=%s | sentence=%r",
+            text, _mode, sentence,
+        )
         return None, None, False
     # Must contain the original input or allowed inflections
     if not _text_in_sentence(text, sentence, allow_inflection=not strict):
+        _fail_reason = "exact_match_failed" if strict else "loose_match_failed"
         logger.warning(
-            "[hunyuan] validation FAIL: sentence does not contain '%s'%s: %s",
-            text, " or its inflections" if not strict else "",
-            sentence[:120],
+            "[hunyuan][diag] fail_reason=%s | text=%r | mode=%s | sentence=%r",
+            _fail_reason, text, _mode, sentence[:120],
         )
         return None, None, True
 
-    logger.info("[hunyuan] SUCCESS for '%s': %s", text, sentence[:80])
+    logger.info("[hunyuan][diag] pass | text=%r | mode=%s | sentence=%r", text, _mode, sentence[:80])
     return sentence, translation, False
 
 
@@ -203,11 +247,12 @@ def generate_example_with_hunyuan(
     try:
         api_key = (settings.hunyuan_api_key or "").strip()
         if not api_key:
-            logger.info("[hunyuan] HUNYUAN_API_KEY not configured, skipping")
+            logger.info("[hunyuan][diag] fail_reason=model_api_error | HUNYUAN_API_KEY not configured")
             return None, None
 
         logger.info(
-            "[hunyuan] API key configured: True | base_url: %s | model: %s",
+            "[hunyuan][diag] entry | text=%r | has_translation=%s | base_url=%s | model=%s",
+            text, chinese_meaning is not None,
             settings.hunyuan_base_url, settings.hunyuan_model,
         )
 
@@ -220,13 +265,22 @@ def generate_example_with_hunyuan(
 
         # Only retry when the model produced a valid sentence but didn't contain the word
         if not retry_eligible:
+            logger.info(
+                "[hunyuan][diag] no_retry | text=%r | strict attempt not retry_eligible",
+                text,
+            )
             return None, None
 
-        logger.info("[hunyuan] retrying with inflection-tolerant prompt for '%s'", text)
+        logger.info("[hunyuan][diag] retry | text=%r | strict failed with retry_eligible=True", text)
         sentence, translation, _ = _call_and_validate(
             text, chinese_meaning, strict=False,
         )
+        if sentence is None:
+            logger.warning(
+                "[hunyuan][diag] fail_reason=loose_match_failed | text=%r | loose retry also failed",
+                text,
+            )
         return sentence, translation
     except Exception:
-        logger.exception("[hunyuan] unexpected error for '%s'", text)
+        logger.exception("[hunyuan][diag] fail_reason=model_api_error | unexpected error for %r", text)
         return None, None

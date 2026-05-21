@@ -42,6 +42,11 @@ def _generate_example_with_tmt(
     Builds Chinese sentence templates using the Chinese translation, translates
     zh→en, and returns the first result whose English contains the original word.
     """
+    _trans_hint = translation[:40] if translation else ""
+    logger.info(
+        "[tmt][diag] start | text=%r | category=%s | translation_hint=%r",
+        word, category, _trans_hint,
+    )
     try:
         from app.providers.tencent_translator import TencentTranslator
         translator = TencentTranslator()
@@ -50,6 +55,10 @@ def _generate_example_with_tmt(
         # Use only the primary segment of the translation (handles "渴望；渴求" → "渴望")
         t = translation.split("；")[0].split(";")[0].split("，")[0].split(",")[0].strip()
         if not t:
+            logger.warning(
+                "[tmt][diag] fail_reason=tmt_fallback_failed | text=%r | empty primary segment",
+                word,
+            )
             return None, None
 
         for zh in [
@@ -59,13 +68,25 @@ def _generate_example_with_tmt(
         ]:
             try:
                 en = translator.translate_to_en(zh)
+                logger.info(
+                    "[tmt][diag] attempt | text=%r | zh=%r | en=%r | match=%s",
+                    word, zh, (en or "")[:80], bool(en and word_lower in en.lower()),
+                )
                 if en and word_lower in en.lower():
                     return en.strip(), zh
             except Exception:
                 continue
 
+        logger.warning(
+            "[tmt][diag] fail_reason=tmt_fallback_failed | text=%r | all templates failed",
+            word,
+        )
         return None, None
     except Exception:
+        logger.warning(
+            "[tmt][diag] fail_reason=tmt_fallback_failed | text=%r | exception in TMT setup",
+            word,
+        )
         return None, None
 
 
