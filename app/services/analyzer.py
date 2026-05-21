@@ -12,14 +12,14 @@ validator.py 检测
 ↓
 调用 understanding.py 生成理解
 ↓
-（word/phrase）调用 Free Dictionary API 获取真实例句
+（word/phrase）调用 Tencent Hunyuan 生成 AI 例句
 ↓
 返回统一结构
 """
+import json
 from typing import Any
 
-import requests
-
+from app.core.config import settings
 from app.schemas import Category, Level
 from app.services.cache import get_cache, make_cache_key, set_cache
 from app.services.translator import translate_to_zh
@@ -28,28 +28,113 @@ from app.services.validator import validate_english
 
 
 TRANSLATION_UNAVAILABLE_WARNING = "翻译暂时不可用，已先保存英文内容。"
-_DICT_API_BASE = "https://api.dictionaryapi.dev/api/v2/entries/en"
+
+_CATEGORY_CN = {"word": "单词", "phrase": "短语", "sentence": "句子"}
 
 
-def _fetch_dictionary_example(word: str, timeout: int = 5) -> str | None:
-    """从 Free Dictionary API 取首条真实英文例句，失败返回 None。"""
+def _generate_example_with_hunyuan(
+    word: str,
+    translation: str,
+    category: str,
+) -> tuple[str | None, str | None]:
+    """Use Tencent Hunyuan LLM to generate an AI example sentence and Chinese translation."""
     try:
-        url = f"{_DICT_API_BASE}/{requests.utils.quote(word.strip())}"
-        resp = requests.get(url, timeout=timeout)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        if not isinstance(data, list):
-            return None
-        for entry in data:
-            for meaning in entry.get("meanings", []):
-                for defn in meaning.get("definitions", []):
-                    example = str(defn.get("example") or "").strip()
-                    if example:
-                        return example
-        return None
+        from tencentcloud.common import credential as tencent_credential
+        from tencentcloud.common.profile.client_profile import ClientProfile
+        from tencentcloud.common.profile.http_profile import HttpProfile
+        from tencentcloud.hunyuan.v20230901 import hunyuan_client
+        from tencentcloud.hunyuan.v20230901 import models as hunyuan_models
+
+        cred = tencent_credential.Credential(
+            settings.tencent_secret_id, settings.tencent_secret_key
+        )
+        http_profile = HttpProfile()
+        http_profile.endpoint = "hunyuan.tencentcloudapi.com"
+        http_profile.reqTimeout = 10
+        client_profile = ClientProfile()
+        client_profile.httpProfile = http_profile
+
+        client = hunyuan_client.HunyuanClient(cred, "", client_profile)
+
+        category_cn = _CATEGORY_CN.get(category, "内容")
+        prompt = (
+            f'请为英文{category_cn}"{word}"（中文含义：{translation}）'
+            f"生成一个自然的英文例句，并提供该例句的中文翻译。\n"
+            f"要求：\n"
+            f'1. 例句必须自然地包含"{word}"或其变形（过去式、进行时等均可）\n'
+            f"2. 例句要简洁、日常、生动易懂\n"
+            f"3. 仅返回JSON格式，不添加任何其他内容：\n"
+            f'{{"sentence": "...", "translation": "..."}}'
+        )
+
+        msg = hunyuan_models.Message()
+        msg.Role = "user"
+        msg.Content = prompt
+
+        req = hunyuan_models.ChatCompletionsRequest()
+        req.Model = "hunyuan-lite"
+        req.Messages = [msg]
+        req.Stream = False
+
+        resp = client.ChatCompletions(req)
+        content = str(resp.Choices[0].Message.Content or "").strip()
+
+        # 提取 JSON，防止 Hunyuan 在 JSON 前后加了说明文字
+        start = content.find("{")
+        end = content.rfind("}") + 1
+        if start == -1 or end == 0:
+            return None, None
+
+        data = json.loads(content[start:end])
+        sentence = str(data.get("sentence") or "").strip()
+        trans = str(data.get("translation") or "").strip()
+
+        # 验证：例句不能与输入词相同，且必须包含输入词（防止 Hunyuan 不遵守 prompt）
+        if not sentence or sentence.lower().strip() == word.lower().strip():
+            return None, None
+        if word.lower() not in sentence.lower():
+            return None, None
+
+        return sentence, trans or None
     except Exception:
-        return None
+        return None, None
+
+
+def _generate_example_with_tmt(
+    word: str,
+    translation: str,
+    category: str,
+) -> tuple[str | None, str | None]:
+    """
+    Fallback example generation using TMT bidirectional translation.
+    Builds Chinese sentence templates using the Chinese translation, translates
+    zh→en, and returns the first result whose English contains the original word.
+    """
+    try:
+        from app.providers.tencent_translator import TencentTranslator
+        translator = TencentTranslator()
+
+        word_lower = word.lower().strip()
+        # Use only the primary segment of the translation (handles "渴望；渴求" → "渴望")
+        t = translation.split("；")[0].split(";")[0].split("，")[0].split(",")[0].strip()
+        if not t:
+            return None, None
+
+        for zh in [
+            f"他非常{t}，每天都如此。",
+            f"这让她感到{t}。",
+            f"她{t}这件事。",
+        ]:
+            try:
+                en = translator.translate_to_en(zh)
+                if en and word_lower in en.lower():
+                    return en.strip(), zh
+            except Exception:
+                continue
+
+        return None, None
+    except Exception:
+        return None, None
 
 
 def _build_response(
@@ -126,18 +211,17 @@ def analyze_text(
             translation,
         )
 
-        # 对单词和短语尝试从词典获取真实例句，并翻译该例句
+        # 对单词和短语用 Tencent Hunyuan 生成 AI 例句
         example_sentence: str | None = None
         example_translation: str | None = None
-        if category in ("word", "phrase") and translation_result.get("ok"):
-            example_sentence = _fetch_dictionary_example(normalized_text)
-            if example_sentence:
-                try:
-                    ex_result = translate_to_zh(example_sentence)
-                    if ex_result.get("ok"):
-                        example_translation = ex_result.get("translation")
-                except Exception:
-                    pass
+        if category in ("word", "phrase") and translation:
+            example_sentence, example_translation = _generate_example_with_hunyuan(
+                normalized_text, translation, category
+            )
+            if not example_sentence:
+                example_sentence, example_translation = _generate_example_with_tmt(
+                    normalized_text, translation, category
+                )
 
         level: Level = validation_level
         response = _build_response(
