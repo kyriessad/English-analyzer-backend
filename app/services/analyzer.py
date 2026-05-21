@@ -16,6 +16,7 @@ validator.py 检测
 ↓
 返回统一结构
 """
+import logging
 from typing import Any
 
 from app.schemas import Category, Level
@@ -24,6 +25,8 @@ from app.services.hunyuan_example import generate_example_with_hunyuan
 from app.services.translator import translate_to_zh
 from app.services.understanding import generate_understanding
 from app.services.validator import validate_english
+
+logger = logging.getLogger(__name__)
 
 
 TRANSLATION_UNAVAILABLE_WARNING = "翻译暂时不可用，已先保存英文内容。"
@@ -140,17 +143,24 @@ def analyze_text(
             translation,
         )
 
-        # 对单词和短语用 Tencent Hunyuan 生成 AI 例句
+        # 对单词和短语用 TokenHub Hunyuan 生成 AI 例句
         example_sentence: str | None = None
         example_translation: str | None = None
         if category in ("word", "phrase") and translation:
             example_sentence, example_translation = generate_example_with_hunyuan(
                 normalized_text, translation
             )
-            if not example_sentence:
+            if example_sentence:
+                logger.info("[analyzer] Hunyuan SUCCESS for '%s'", normalized_text)
+            else:
+                logger.info("[analyzer] Hunyuan failed, trying TMT fallback for '%s'", normalized_text)
                 example_sentence, example_translation = _generate_example_with_tmt(
                     normalized_text, translation, category
                 )
+                if example_sentence:
+                    logger.info("[analyzer] TMT fallback SUCCESS for '%s'", normalized_text)
+                else:
+                    logger.info("[analyzer] TMT fallback also failed for '%s'", normalized_text)
 
         level: Level = validation_level
         response = _build_response(
