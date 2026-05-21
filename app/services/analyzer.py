@@ -12,92 +12,21 @@ validator.py 检测
 ↓
 调用 understanding.py 生成理解
 ↓
-（word/phrase）调用 Tencent Hunyuan 生成 AI 例句
+（word/phrase）调用 Hunyuan 生成 AI 例句，失败则 TMT 兜底
 ↓
 返回统一结构
 """
-import json
 from typing import Any
 
-from app.core.config import settings
 from app.schemas import Category, Level
 from app.services.cache import get_cache, make_cache_key, set_cache
+from app.services.hunyuan_example import generate_example_with_hunyuan
 from app.services.translator import translate_to_zh
 from app.services.understanding import generate_understanding
 from app.services.validator import validate_english
 
 
 TRANSLATION_UNAVAILABLE_WARNING = "翻译暂时不可用，已先保存英文内容。"
-
-_CATEGORY_CN = {"word": "单词", "phrase": "短语", "sentence": "句子"}
-
-
-def _generate_example_with_hunyuan(
-    word: str,
-    translation: str,
-    category: str,
-) -> tuple[str | None, str | None]:
-    """Use Tencent Hunyuan LLM to generate an AI example sentence and Chinese translation."""
-    try:
-        from tencentcloud.common import credential as tencent_credential
-        from tencentcloud.common.profile.client_profile import ClientProfile
-        from tencentcloud.common.profile.http_profile import HttpProfile
-        from tencentcloud.hunyuan.v20230901 import hunyuan_client
-        from tencentcloud.hunyuan.v20230901 import models as hunyuan_models
-
-        cred = tencent_credential.Credential(
-            settings.tencent_secret_id, settings.tencent_secret_key
-        )
-        http_profile = HttpProfile()
-        http_profile.endpoint = "hunyuan.tencentcloudapi.com"
-        http_profile.reqTimeout = 10
-        client_profile = ClientProfile()
-        client_profile.httpProfile = http_profile
-
-        client = hunyuan_client.HunyuanClient(cred, "", client_profile)
-
-        category_cn = _CATEGORY_CN.get(category, "内容")
-        prompt = (
-            f'请为英文{category_cn}"{word}"（中文含义：{translation}）'
-            f"生成一个自然的英文例句，并提供该例句的中文翻译。\n"
-            f"要求：\n"
-            f'1. 例句必须自然地包含"{word}"或其变形（过去式、进行时等均可）\n'
-            f"2. 例句要简洁、日常、生动易懂\n"
-            f"3. 仅返回JSON格式，不添加任何其他内容：\n"
-            f'{{"sentence": "...", "translation": "..."}}'
-        )
-
-        msg = hunyuan_models.Message()
-        msg.Role = "user"
-        msg.Content = prompt
-
-        req = hunyuan_models.ChatCompletionsRequest()
-        req.Model = "hunyuan-lite"
-        req.Messages = [msg]
-        req.Stream = False
-
-        resp = client.ChatCompletions(req)
-        content = str(resp.Choices[0].Message.Content or "").strip()
-
-        # 提取 JSON，防止 Hunyuan 在 JSON 前后加了说明文字
-        start = content.find("{")
-        end = content.rfind("}") + 1
-        if start == -1 or end == 0:
-            return None, None
-
-        data = json.loads(content[start:end])
-        sentence = str(data.get("sentence") or "").strip()
-        trans = str(data.get("translation") or "").strip()
-
-        # 验证：例句不能与输入词相同，且必须包含输入词（防止 Hunyuan 不遵守 prompt）
-        if not sentence or sentence.lower().strip() == word.lower().strip():
-            return None, None
-        if word.lower() not in sentence.lower():
-            return None, None
-
-        return sentence, trans or None
-    except Exception:
-        return None, None
 
 
 def _generate_example_with_tmt(
@@ -215,8 +144,8 @@ def analyze_text(
         example_sentence: str | None = None
         example_translation: str | None = None
         if category in ("word", "phrase") and translation:
-            example_sentence, example_translation = _generate_example_with_hunyuan(
-                normalized_text, translation, category
+            example_sentence, example_translation = generate_example_with_hunyuan(
+                normalized_text, translation
             )
             if not example_sentence:
                 example_sentence, example_translation = _generate_example_with_tmt(
