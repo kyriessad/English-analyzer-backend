@@ -1,5 +1,80 @@
 # Current Development Phase
 
+## Phase 8J — Backend Hotfix: Cap Repeat Item from Restoring mastered
+
+**Status:** Completed (2026-05-26)
+**Type:** Backend hotfix — review_state cap only
+**Backend commit:** (see below)
+
+---
+
+### 一、修复目的
+
+Phase 8J 只读审查发现：回炉项（`is_repeat=True`）在同一 session 内，若 `first_result` 为 `shaky` 或 `forgot`，用户再次点 `fluent` 时，原本会直接恢复 `mastered`。本次 hotfix 精准堵住这个漏洞。
+
+---
+
+### 二、修改范围
+
+| 文件 | 改动内容 |
+|---|---|
+| `app/services/review_rules.py` | `calculate_review_state_after_feedback` 增加 `is_reappear` / `first_failed_result` 可选参数；`apply_review_feedback_to_card` 同样增加并透传 |
+| `app/routers/reviews.py` | Step 7 调用 `apply_review_feedback_to_card` 时传入 `is_reappear=item.is_repeat`，`first_failed_result=item.first_result` |
+| `tests/test_review_rules.py` | 新增 `RepeatItemMasteredCapTest`（5 个测试用例） |
+
+---
+
+### 三、核心逻辑变化
+
+`calculate_review_state_after_feedback` fluent 路径：
+
+```python
+if mastery_score_after >= 5 and recovery_stage_after == 0:
+    # Phase 8J: repeat item that originally failed cannot restore mastered in the same round
+    if is_reappear and first_failed_result in {"forgot", "shaky"}:
+        return "reviewing"
+    return "mastered"
+```
+
+- 仅在 `is_reappear=True` 且 `first_failed_result in {"forgot", "shaky"}` 时将 `review_state_after` 从 `mastered` 改为 `reviewing`
+- 默认参数 `is_reappear=False` 保持原行为完全不变
+
+---
+
+### 四、明确未改动的内容
+
+- `mastery_score` 计算：不受 cap 影响，`fluent` 后仍正常提升
+- `recovery_stage` 计算：不受 cap 影响
+- `next_review_at` 计算：不受 cap 影响
+- `ReviewLog.result`：仍记录真实 feedback（`fluent`），不改
+- `ReviewLog` schema：不变
+- 数据库 schema：不变，无 migration
+- 4 档反馈枚举：不变
+- 回炉算法（`should_append_reappear_item`）：不变
+- `daily_suggested` / `new_only` / `free_review` 调度链：不变
+- 前端：不变
+
+---
+
+### 五、测试结果
+
+```
+tests/test_review_rules.py — 13 passed (8 original + 5 new)
+RepeatItemMasteredCapTest::test_repeat_fluent_after_shaky_capped_to_reviewing PASSED
+RepeatItemMasteredCapTest::test_repeat_fluent_after_forgot_capped_to_reviewing PASSED
+RepeatItemMasteredCapTest::test_non_repeat_fluent_still_reaches_mastered PASSED
+RepeatItemMasteredCapTest::test_repeat_fluent_after_got_it_not_blocked PASSED
+RepeatItemMasteredCapTest::test_apply_feedback_repeat_shaky_fluent_caps_state_not_score PASSED
+
+python -m pytest -q — 262 passed, 12 pre-existing failures in
+  test_reviews_phase2_api.py (goal_progress/goal_session timezone tests,
+  confirmed pre-existing: same 12 failures before this diff)
+
+git diff --check — OK
+```
+
+---
+
 ## Phase 8I — Alphanumeric Classification, Abbreviation Detection & Example Morphology Matching
 
 **Status:** Completed (2026-05-21)

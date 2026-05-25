@@ -154,6 +154,8 @@ def calculate_review_state_after_feedback(
     result: str,
     mastery_score_after: int,
     recovery_stage_after: int,
+    is_reappear: bool = False,
+    first_failed_result: str | None = None,
 ) -> str:
     _validate_result(result)
 
@@ -164,6 +166,9 @@ def calculate_review_state_after_feedback(
         return "reviewing"
 
     if mastery_score_after >= 5 and recovery_stage_after == 0:
+        # Phase 8J: repeat item that originally failed cannot restore mastered in the same round
+        if is_reappear and first_failed_result in {"forgot", "shaky"}:
+            return "reviewing"
         return "mastered"
 
     return "reviewing"
@@ -211,7 +216,13 @@ def calculate_reappear_insert_position(current_position: int, current_max_positi
     return min(int(current_position) + 5, int(current_max_position) + 1)
 
 
-def apply_review_feedback_to_card(card: Card, result: str, now: datetime) -> dict[str, Any]:
+def apply_review_feedback_to_card(
+    card: Card,
+    result: str,
+    now: datetime,
+    is_reappear: bool = False,
+    first_failed_result: str | None = None,
+) -> dict[str, Any]:
     _validate_result(result)
 
     review_state_before = card.review_state or "new"
@@ -225,6 +236,8 @@ def apply_review_feedback_to_card(card: Card, result: str, now: datetime) -> dic
         result,
         mastery_score_after,
         recovery_stage_after,
+        is_reappear=is_reappear,
+        first_failed_result=first_failed_result,
     )
     if review_state_before == "new" and result == "fluent":
         review_state_after = "reviewing"

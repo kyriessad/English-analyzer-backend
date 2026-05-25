@@ -1329,7 +1329,11 @@ def submit_review_feedback(
         card_snapshot = _build_card_snapshot(card)
 
         # Step 7: Apply Phase 2 feedback rules
-        transitions = apply_review_feedback_to_card(card, payload.result, now)
+        transitions = apply_review_feedback_to_card(
+            card, payload.result, now,
+            is_reappear=item.is_repeat,
+            first_failed_result=item.first_result,
+        )
 
         # Step 8: Write review_log
         log = ReviewLog(

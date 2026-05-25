@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import unittest
 
 from app.services.review_rules import (
+    apply_review_feedback_to_card,
     calculate_effective_new_quota,
     calculate_mastery_score_after_feedback,
     calculate_next_review_at,
@@ -120,6 +121,63 @@ class ReviewRulesTest(unittest.TestCase):
             make_card(id="older", review_state="new", created_at=NOW - timedelta(days=1)),
         ]
         self.assertEqual(["older", "newer"], [card.id for card in sort_new_cards(new_cards)])
+
+
+class RepeatItemMasteredCapTest(unittest.TestCase):
+    """Phase 8J: repeat item that failed cannot restore mastered in the same round."""
+
+    def test_repeat_fluent_after_shaky_capped_to_reviewing(self):
+        # core case: mastered card, shaky first → reappear → fluent → reviewing, NOT mastered
+        state = calculate_review_state_after_feedback(
+            "fluent", 5, 0,
+            is_reappear=True,
+            first_failed_result="shaky",
+        )
+        self.assertEqual("reviewing", state)
+
+    def test_repeat_fluent_after_forgot_capped_to_reviewing(self):
+        state = calculate_review_state_after_feedback(
+            "fluent", 5, 0,
+            is_reappear=True,
+            first_failed_result="forgot",
+        )
+        self.assertEqual("reviewing", state)
+
+    def test_non_repeat_fluent_still_reaches_mastered(self):
+        # default params: non-repeat item must still be able to reach mastered
+        state = calculate_review_state_after_feedback("fluent", 5, 0)
+        self.assertEqual("mastered", state)
+
+    def test_repeat_fluent_after_got_it_not_blocked(self):
+        # first_failed_result not in {forgot, shaky} → cap does not apply
+        state = calculate_review_state_after_feedback(
+            "fluent", 5, 0,
+            is_reappear=True,
+            first_failed_result="got_it",
+        )
+        self.assertEqual("mastered", state)
+
+    def test_apply_feedback_repeat_shaky_fluent_caps_state_not_score(self):
+        # integration: apply_review_feedback_to_card passes through the cap;
+        # mastery_score and recovery_stage are NOT affected by the cap
+        card = make_card(
+            review_state="mastered",
+            mastery_score=5,
+            recovery_stage=0,
+            review_count=5,
+            first_reviewed_at=NOW - timedelta(days=7),
+            fluent_count=3,
+        )
+        transitions = apply_review_feedback_to_card(
+            card, "fluent", NOW,
+            is_reappear=True,
+            first_failed_result="shaky",
+        )
+        self.assertEqual("reviewing", transitions["review_state_after"])
+        self.assertEqual(5, transitions["mastery_score_after"])
+        self.assertEqual(0, transitions["recovery_stage_after"])
+        self.assertEqual("reviewing", card.review_state)
+        self.assertEqual(5, card.mastery_score)
 
 
 if __name__ == "__main__":
