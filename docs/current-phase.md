@@ -4,7 +4,7 @@
 
 **Status:** Completed (2026-05-26)
 **Type:** Backend hotfix — review_state cap only
-**Backend commit:** (see below)
+**Backend commit:** `edc945b`
 
 ---
 
