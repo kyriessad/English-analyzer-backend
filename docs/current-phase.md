@@ -1,5 +1,29 @@
 # Current Development Phase
 
+## Release P1 — .env.example Environment Variables Documentation
+
+**Status:** Completed (2026-05-26)
+**Type:** Documentation only — no code change, no schema change, no migration
+
+`.env.example` 补充了发布所需的实际环境变量占位说明：
+
+| 变量 | 说明 |
+|---|---|
+| `DATABASE_URL` | PostgreSQL 连接字符串（占位示例） |
+| `HUNYUAN_API_KEY` | TokenHub Hunyuan API 密钥（占位） |
+| `HUNYUAN_BASE_URL` | TokenHub API base URL（占位） |
+| `HUNYUAN_MODEL` | Hunyuan 模型名（占位，当前文档值 `hunyuan-role-latest`） |
+
+原有 `TENCENT_*` / `WECHAT_*` / `JWT_*` 占位保留，未删除。
+
+**未改动：**
+- 业务代码不变
+- `app/core/config.py` 不变
+- 数据库 schema 不变
+- 无新增 Alembic migration
+
+---
+
 ## Phase 8J — Backend Hotfix: Cap Repeat Item from Restoring mastered
 
 **Status:** Completed (2026-05-26)
