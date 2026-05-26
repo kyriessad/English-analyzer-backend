@@ -12,7 +12,7 @@ from app.models.card import Card
 
 
 VALID_LIMITS = {5, 10, 15}
-VALID_DAILY_GOALS = {3, 5, 10}
+VALID_DAILY_GOALS = {3, 5, 10, 15}
 DAILY_GOAL_DEFAULT = 5
 VALID_RESULTS = {"forgot", "shaky", "got_it", "fluent"}
 REVIEW_STATES = {"new", "strengthening", "reviewing", "mastered"}

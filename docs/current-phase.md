@@ -1,5 +1,45 @@
 # Current Development Phase
 
+## extend-batch-size-options — 扩展 daily_goal 允许值至 15
+
+**Status:** Completed (2026-05-27)
+**Type:** Backend config change only — no schema change, no migration
+**Backend commit:** pending
+
+### 修改范围
+
+| 文件 | 改动 |
+|---|---|
+| `app/services/review_rules.py` | `VALID_DAILY_GOALS = {3, 5, 10, 15}` |
+
+### 行为变化
+
+| daily_goal | 旧行为 | 新行为 |
+|---|---|---|
+| 15 | fallback → 5 | 合法，返回 15 |
+| 1 / 7 / 20 | fallback → 5 | 不变，仍 fallback → 5 |
+| 3 / 5 / 10 | 合法 | 不变 |
+
+### 未改动
+
+- 数据库 schema 不变，无新增 Alembic migration
+- `VALID_LIMITS = {5, 10, 15}` 已包含 15，不变
+- `normalize_review_limit` 不变（`limit=15` 本来就合法）
+- `effective_limit = min(remaining, 15)` 的 15 上限不变
+- ReviewSession / ReviewSessionItem / ReviewLog schema 不变
+- 4 档反馈、回炉算法、Phase 8J cap 不变
+- 12 个 pre-existing failures 在 `test_reviews_phase2_api.py` 不属于本次修改（goal_progress/goal_session timezone 问题，确认 pre-existing）
+
+### 验证结果
+
+```
+python -m pytest tests/test_review_rules.py -q → 13 passed
+python -m pytest -q → 262 passed, 12 pre-existing failures (unchanged)
+git diff --check → OK
+```
+
+---
+
 ## Release P1 — .env.example Environment Variables Documentation
 
 **Status:** Completed (2026-05-26)
