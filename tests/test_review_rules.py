@@ -42,6 +42,7 @@ class ReviewRulesTest(unittest.TestCase):
     def test_normalize_review_limit_allows_only_configured_batch_sizes(self):
         self.assertEqual(5, normalize_review_limit(None))
         self.assertEqual(5, normalize_review_limit("bad"))
+        self.assertEqual(5, normalize_review_limit(3))
         self.assertEqual(5, normalize_review_limit(7))
         self.assertEqual(10, normalize_review_limit("10"))
         self.assertEqual(15, normalize_review_limit(15))

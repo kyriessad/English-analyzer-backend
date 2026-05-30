@@ -346,6 +346,40 @@ def sort_new_cards(cards: list[Any]) -> list[Any]:
     )
 
 
+def _fill_state_priority(card: Any, now: datetime) -> int:
+    due_reason = get_due_reason(card, now)
+    review_state = _get_value(card, "review_state", "new") or "new"
+
+    if due_reason in {"strengthening", "recovery_due", "reviewing_due", "mastered_due"}:
+        return 0
+
+    if review_state in {"new", "strengthening", "reviewing"}:
+        return 0
+
+    if review_state == "mastered":
+        return 1
+
+    return 2
+
+
+def sort_fill_cards(
+    cards: list[Any],
+    now: datetime,
+    today_reviewed_card_ids: set[UUID] | None = None,
+) -> list[Any]:
+    today_reviewed_ids = {str(card_id) for card_id in (today_reviewed_card_ids or set())}
+
+    return sorted(
+        cards,
+        key=lambda card: (
+            1 if _card_id(card) in today_reviewed_ids else 0,
+            _fill_state_priority(card, now),
+            _as_sort_datetime(_get_value(card, "created_at"), now),
+            _card_id(card),
+        ),
+    )
+
+
 def _dedupe_cards(cards: list[Card]) -> list[Card]:
     seen_ids: set[str] = set()
     deduped: list[Card] = []
@@ -360,19 +394,9 @@ def _dedupe_cards(cards: list[Card]) -> list[Card]:
     return deduped
 
 
-def select_review_cards(
-    user_id: UUID,
-    limit: int,
-    now: datetime,
-    db: Session,
-    today_reviewed_card_ids: set[UUID] | None = None,
-    goal_mode: bool = False,
-) -> list[Card]:
-    normalized_limit = normalize_review_limit(limit)
-
-    # Phase 6P-later-2: goal_mode — select only today-unreviewed cards in priority order.
-    if goal_mode and today_reviewed_card_ids is not None:
-        all_ready = list(
+def _select_all_review_ready_cards(user_id: UUID, db: Session) -> list[Card]:
+    return _dedupe_cards(
+        list(
             db.scalars(
                 select(Card).where(
                     Card.user_id == user_id,
@@ -383,7 +407,45 @@ def select_review_cards(
                 )
             )
         )
-        all_ready = _dedupe_cards(all_ready)
+    )
+
+
+def _fill_cards_to_target(
+    selected_cards: list[Card],
+    fill_pool: list[Card],
+    target: int,
+    now: datetime,
+    today_reviewed_card_ids: set[UUID] | None,
+) -> list[Card]:
+    selected = _dedupe_cards(selected_cards)
+    if len(selected) >= target:
+        return selected[:target]
+
+    selected_ids = {_card_id(card) for card in selected}
+    fillers = [
+        card
+        for card in fill_pool
+        if _card_id(card) not in selected_ids
+    ]
+    selected.extend(sort_fill_cards(fillers, now, today_reviewed_card_ids))
+    return _dedupe_cards(selected)[:target]
+
+
+def select_review_cards(
+    user_id: UUID,
+    limit: int,
+    now: datetime,
+    db: Session,
+    today_reviewed_card_ids: set[UUID] | None = None,
+    goal_mode: bool = False,
+    fill_target: int | None = None,
+) -> list[Card]:
+    normalized_limit = normalize_review_limit(limit)
+    target_limit = normalize_daily_goal(fill_target) if fill_target is not None else normalized_limit
+
+    # Goal mode prioritizes today-unreviewed cards; Phase 8L may append low-priority fill cards.
+    if goal_mode and today_reviewed_card_ids is not None:
+        all_ready = _select_all_review_ready_cards(user_id, db)
 
         not_reviewed = [card for card in all_ready if card.id not in today_reviewed_card_ids]
 
@@ -436,7 +498,14 @@ def select_review_cards(
             ),
         )
 
-        return _dedupe_cards(p1 + p2 + p3 + p4 + p5)[:int(limit)]
+        selected = _dedupe_cards(p3 + p1 + p2 + p4 + p5)
+        return _fill_cards_to_target(
+            selected,
+            all_ready,
+            target_limit,
+            now,
+            today_reviewed_card_ids,
+        )
 
     candidate_cards = list(
         db.scalars(
@@ -481,18 +550,29 @@ def select_review_cards(
 
     selected_new = new_cards[:effective_new_quota]
     selected_new_ids = {_card_id(card) for card in selected_new}
-    remaining_slots = normalized_limit - len(selected_new)
+    remaining_slots = target_limit - len(selected_new)
 
     selected_old = (strengthening_cards + due_cards)[:remaining_slots]
     selected_old_ids = {_card_id(card) for card in selected_old}
 
-    selected = selected_old + selected_new
+    selected = selected_new + selected_old
 
-    if len(selected) < normalized_limit:
+    if len(selected) < target_limit:
         selected.extend(
             card
             for card in new_cards
             if _card_id(card) not in selected_new_ids and _card_id(card) not in selected_old_ids
         )
 
-    return _dedupe_cards(selected)[:normalized_limit]
+    selected = _dedupe_cards(selected)
+    if len(selected) >= target_limit or fill_target is None:
+        return selected[:target_limit]
+
+    all_ready = _select_all_review_ready_cards(user_id, db)
+    return _fill_cards_to_target(
+        selected,
+        all_ready,
+        target_limit,
+        now,
+        today_reviewed_card_ids,
+    )

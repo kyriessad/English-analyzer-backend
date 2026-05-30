@@ -27,6 +27,7 @@ FastAPI 后端，服务微信小程序 English-study-miniapp。
 
 - 不要修改数据库 schema，除非用户明确要求。
 - 不要改选卡逻辑、回炉逻辑，除非任务明确涉及。
+  - Phase 8L 例外：本阶段明确允许修改 daily_suggested 新建 session 的选卡补位逻辑；不要扩大到 schema、接口、回炉算法、反馈枚举或前端 fallback 链。
 - 不要改接口字段语义，除非用户明确要求。
 - hotfix 默认只改用户指定模块。
 - 不要跨仓库联动大改，除非任务明确要求。

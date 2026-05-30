@@ -444,6 +444,7 @@ def _select_session_cards(
     db: Session,
     today_reviewed_card_ids: set[UUID] | None = None,
     goal_mode: bool = False,
+    fill_target: int | None = None,
 ) -> list[Card]:
     if session_type == "new_only":
         return _select_new_only_cards(user_id, limit, db)
@@ -455,6 +456,7 @@ def _select_session_cards(
         user_id, limit, now, db,
         today_reviewed_card_ids=today_reviewed_card_ids,
         goal_mode=goal_mode,
+        fill_target=fill_target,
     )
 
 
@@ -492,19 +494,19 @@ def _create_or_return_session(
             session.status = "abandoned"
         db.flush()
 
-    # Phase 6P-later-2: goal_mode — only for daily_suggested with explicit daily_goal and remaining > 0.
+    # Phase 8L: batch size is independent from today's remaining goal.
     goal_mode = False
-    effective_limit = normalized_limit
+    session_limit = normalized_limit
     today_reviewed_card_ids: set[UUID] = set()
 
     if session_type == "daily_suggested" and daily_goal is not None:
         target = normalize_daily_goal(daily_goal)
+        session_limit = min(session_limit, target)
         today_date = _local_review_date(now, user.timezone)
         day_start_utc, day_end_utc = _history_date_bounds(today_date, today_date, user.timezone)
 
-        completed_unique_today = db.scalar(
-            select(func.count(func.distinct(ReviewLog.card_id)))
-            .select_from(ReviewLog)
+        rows = db.execute(
+            select(ReviewLog.card_id)
             .join(Card, Card.id == ReviewLog.card_id)
             .where(
                 ReviewLog.user_id == user.id,
@@ -512,35 +514,23 @@ def _create_or_return_session(
                 ReviewLog.reviewed_at < day_end_utc,
                 *_active_card_filters(user.id),
             )
-        ) or 0
+            .distinct()
+        ).all()
+        today_reviewed_card_ids = {row[0] for row in rows}
+        completed_unique_today = len(today_reviewed_card_ids)
 
         remaining = max(target - completed_unique_today, 0)
-
-        if remaining > 0:
-            effective_limit = min(remaining, 15)
-            goal_mode = True
-
-            rows = db.execute(
-                select(ReviewLog.card_id)
-                .join(Card, Card.id == ReviewLog.card_id)
-                .where(
-                    ReviewLog.user_id == user.id,
-                    ReviewLog.reviewed_at >= day_start_utc,
-                    ReviewLog.reviewed_at < day_end_utc,
-                    *_active_card_filters(user.id),
-                )
-                .distinct()
-            ).all()
-            today_reviewed_card_ids = {row[0] for row in rows}
+        goal_mode = remaining > 0
 
     selected_cards = _select_session_cards(
         user_id=user.id,
         session_type=session_type,
-        limit=effective_limit,
+        limit=session_limit,
         now=now,
         db=db,
         today_reviewed_card_ids=today_reviewed_card_ids,
         goal_mode=goal_mode,
+        fill_target=session_limit if session_type == "daily_suggested" and daily_goal is not None else None,
     )
     if not selected_cards:
         return None, []
@@ -549,7 +539,7 @@ def _create_or_return_session(
         db,
         user=user,
         cards=selected_cards,
-        limit=effective_limit,
+        limit=session_limit,
         now=now,
         session_type=session_type,
     )

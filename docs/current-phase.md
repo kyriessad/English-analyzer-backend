@@ -1,5 +1,46 @@
 # Current Development Phase
 
+## Phase 8L-backend-fill-session-to-target-size — 每次看几张按目标批量补位
+
+**Status:** Completed (2026-05-30)
+**Type:** Backend review selection fix + tests; no schema change, no migration, no API schema change
+**Backend commit:** pending
+
+### 行为语义
+
+- “每次看几张”是新建一轮 daily_suggested 查看时的目标数量；卡片库可用卡片数足够时，系统会尽量凑满。
+- 有未完成 session 时，“继续查看”继续原 session，不扩容，也不因设置变化重写已有 items。
+- 新建 session 的高优先级候选仍按既有选卡桶产生；当候选不足目标数量时，追加稳定排序的低优先级补位池。
+- 补位池允许今天已看过的卡、non-due reviewing、mastered / remembered 卡；补位卡永远排在新卡、到期卡、熟悉中/需巩固卡之后。
+- 补位排序稳定：今天没看过优先于今天已看过；due / strengthening / reviewing 优先于 mastered；再按 created_at / id 排序。
+- 同一 session 初始 items 内不重复同一张 card；回炉 item 仍只由反馈后的原有回炉算法追加。
+- “今天看过 N 张”和 goal_progress 仍按当天 ReviewLog 的 distinct card_id 去重；同一张卡当天重复查看不重复增加去重计数。
+- ReviewLog 仍记录每次真实反馈；“今天已达目标”不阻止用户继续查看卡片。
+
+### 范围
+
+| 文件 | 改动 |
+|---|---|
+| `app/services/review_rules.py` | 新增低优先级 fill 排序与补位；`select_review_cards(..., fill_target=...)` 仅在传入 fill_target 时补位到目标数量 |
+| `app/routers/reviews.py` | `_create_or_return_session` 将 batch target 与 daily_goal remaining 解耦；daily_goal 只决定 goal_mode/今日已看集合，不再用 remaining 缩小本轮大小 |
+| `tests/test_reviews_phase2_api.py` | 新增/更新 Phase 8L daily_suggested session 补位、卡片不足、resume 不扩容、去重、mastered 低优先级、3/5/10/15 设置相关测试 |
+| `tests/test_review_rules.py` | 明确 `normalize_review_limit(3)` 仍 fallback 到 5，3 张设置由前端 legacy `dailyGoalToLimit(3) -> 5` + `daily_goal=3` 组合保持 |
+
+### 未改动
+
+- 数据库 schema / Alembic migration / 接口 schema 均不变。
+- `review_state` 枚举、4 档反馈枚举、回炉算法、ReviewLog 结构不变。
+- `new_only` / `free_review` 不新增 endpoint，不改前端 fallback 链。
+- 前端 JS/WXML/WXSS、设置页 UI、`dailyGoal` storage key 不变。
+- roadmap.md 未更新。
+
+### 产品决策反转
+
+- 旧测试 `test_goal_session_do_not_fill_with_reviewed_cards` 已替换为 `test_goal_session_fills_with_reviewed_cards_when_needed`。
+- 旧语义“goal_mode 不用今天已看卡补位”反转为方案 A：“可用卡片总数足够时，新建 session 尽量凑满目标数量，今天已看卡仅作为低优先级补位”。
+
+---
+
 ## extend-batch-size-options — 扩展 daily_goal 允许值至 15
 
 **Status:** Completed (2026-05-27)
