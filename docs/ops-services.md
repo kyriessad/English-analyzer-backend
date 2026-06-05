@@ -13,8 +13,11 @@
 
 阅读约定：
 
-- **「是否从代码确认」= 是**：信息直接来自代码 / 配置 / README / docs。
-- **「是否从代码确认」= 否（待人工补充）**：代码中无法确认，需运维人工填写后再标记。
+- 表格中的「来源确认状态」列取值统一为以下四种：
+  - **代码确认**：信息直接来自代码或配置文件（如 `app/core/config.py`、`utils/apiClient.js`）。
+  - **docs 确认**：信息来自项目部署记录文档（前端 `docs/current-phase.md`、`docs/release-checklist.md`）。
+  - **人工确认**：代码与 docs 无法得出，由运维人工核对后填写。
+  - **待人工补充**：尚未确认，需运维补全后再更新状态。
 - 每条信息尽量标注「信息来源」，例如 `来源：utils/apiClient.js`。
 - 三类对象不要混淆（见各分节）：
   - **外部服务**：微信小程序平台、腾讯云轻量服务器、腾讯机器翻译 TMT、Hunyuan、DNS、域名、HTTPS 证书。
@@ -25,21 +28,21 @@
 
 ## 2. 服务总览表
 
-| 类别 | 名称 | 用途 | 当前状态 | 是否从代码确认 | 到期时间 | 维护入口 | 信息来源 |
+| 类别 | 名称 | 用途 | 当前状态 | 来源确认状态 | 到期时间 | 维护入口 | 信息来源 |
 |---|---|---|---|---|---|---|---|
-| 外部服务 | 微信小程序平台 | 小程序载体、登录（code2session）、request 合法域名、审核发布 | 已配置 | 是 | 不适用 | 微信公众平台 | `utils/apiClient.js`、`app/services/auth_service.py`、`project.config.json` |
-| 外部服务 | 腾讯云轻量应用服务器 | 承载后端、Nginx、PostgreSQL | 运行中 | 是（docs） | 待人工补充（实例续费） | 腾讯云控制台 / SSH | `docs/release-checklist.md`、前端 `docs/current-phase.md` |
-| 外部服务 | 域名 qingyacard.com / api.qingyacard.com | 生产 API 域名 | 已购买、已解析 | 是（docs） | 待人工补充（域名续费） | 域名注册商控制台 | `utils/apiClient.js`、前端 `docs/release-checklist.md` |
-| 外部服务 | DNS（A 记录 api → 49.232.134.229） | 域名解析到服务器 | 已生效 | 是（docs） | 随域名 | DNS 控制台 | 前端 `docs/current-phase.md` |
-| 外部服务 | HTTPS 证书（Certbot / Let's Encrypt） | api.qingyacard.com TLS | 已部署 | 是（docs） | 待人工补充（≈90 天自动续期） | 服务器 `certbot` | 前端 `docs/release-checklist.md` |
-| 外部服务 | 腾讯机器翻译 TMT | 英→中 / 中→英 翻译、例句翻译 fallback | 集成 | 是 | 不适用（按量计费） | 腾讯云控制台 | `app/providers/tencent_translator.py` |
-| 外部服务 | Hunyuan（混元，TokenHub OpenAI 兼容 API） | AI 例句生成 + 例句翻译 | 集成 | 是 | 不适用（按量计费） | 腾讯云 / TokenHub 控制台 | `app/services/hunyuan_example.py`、`.env.example` |
-| 服务器组件 | FastAPI 后端（English Analyzer Backend） | 卡片 CRUD、英文分析、复习调度、登录 | 运行中 | 是 | 不适用 | systemd `english-backend` | `app/main.py` |
-| 服务器组件 | PostgreSQL | 生产数据库 | 运行中 | 是（docs） | 不适用 | SSH / psql | 前端 `docs/current-phase.md`、`app/database.py` |
-| 服务器组件 | Nginx | 反向代理 + HTTPS 终止 | 运行中 | 是（docs） | 不适用 | SSH / `nginx -t` | 前端 `docs/release-checklist.md` |
-| 服务器组件 | systemd（english-backend.service） | 守护后端进程、开机自启 | 启用 | 是（docs） | 不适用 | `systemctl` | 前端 `docs/release-checklist.md` |
-| 服务器组件 | Certbot | 签发 / 续期 HTTPS 证书 | 已安装 | 是（docs） | 不适用 | SSH | 前端 `docs/release-checklist.md` |
-| 配置/密钥 | 环境变量集（见第 9 节） | 后端运行所需密钥与配置 | 生产 `.env` 已配置 | 是 | 见第 10 节 | 服务器 `/opt/english-backend/.env` | `.env.example`、`app/core/config.py` |
+| 外部服务 | 微信小程序平台 | 小程序载体、登录（code2session）、request 合法域名、审核发布 | 已配置 | 代码确认 | 不适用 | 微信公众平台 | `utils/apiClient.js`、`app/services/auth_service.py`、`project.config.json` |
+| 外部服务 | 腾讯云轻量应用服务器 | 承载后端、Nginx、PostgreSQL | 运行中 | docs 确认 | 2027.6.30 | 腾讯云控制台 / TAT 免密登录 | `docs/release-checklist.md`、前端 `docs/current-phase.md` |
+| 外部服务 | 域名 qingyacard.com / api.qingyacard.com | 生产 API 域名 | 已购买、已解析 | docs 确认 | 2027.5.30 | 域名注册商控制台 | `utils/apiClient.js`、前端 `docs/release-checklist.md` |
+| 外部服务 | DNS（A 记录 api → 49.232.134.229） | 域名解析到服务器 | 已生效 | docs 确认 | 随域名状态；DNS 记录本身无固定到期 | DNS 控制台 | 前端 `docs/current-phase.md` |
+| 外部服务 | HTTPS 证书（Certbot / Let's Encrypt） | api.qingyacard.com TLS | 已部署 | docs 确认 | 待人工补充（≈90 天，需确认自动续期） | 服务器 `certbot` | 前端 `docs/release-checklist.md` |
+| 外部服务 | 腾讯机器翻译 TMT | 英→中 / 中→英 翻译、例句翻译 fallback | 集成 | 代码确认 | 按量计费；免费额度 2026.6.30 到期（额度/计费需定期人工核对） | 腾讯云控制台 | `app/providers/tencent_translator.py` |
+| 外部服务 | Hunyuan（混元，TokenHub OpenAI 兼容 API） | AI 例句生成 + 例句翻译 | 集成 | 代码确认 | 按量计费；用量约 40000 / 1000000 tokens（核对 2026-06-05） | 腾讯云 / TokenHub 控制台 | `app/services/hunyuan_example.py`、`.env.example` |
+| 服务器组件 | FastAPI 后端（English Analyzer Backend） | 卡片 CRUD、英文分析、复习调度、登录 | 运行中 | 代码确认 | 不适用 | systemd `english-backend` | `app/main.py` |
+| 服务器组件 | PostgreSQL | 生产数据库 | 运行中 | docs 确认 | 不适用 | TAT 免密登录 / psql | 前端 `docs/current-phase.md`、`app/database.py` |
+| 服务器组件 | Nginx | 反向代理 + HTTPS 终止 | 运行中 | docs 确认 | 不适用 | TAT 免密登录 / nginx -t | 前端 `docs/release-checklist.md` |
+| 服务器组件 | systemd（english-backend.service） | 守护后端进程、开机自启 | 启用 | docs 确认 | 不适用 | `systemctl` | 前端 `docs/release-checklist.md` |
+| 服务器组件 | Certbot | 签发 / 续期 HTTPS 证书 | 已安装 | docs 确认 | 不适用 | TAT 免密登录 / certbot | 前端 `docs/release-checklist.md` |
+| 配置/密钥 | 环境变量集（见第 9 节） | 后端运行所需密钥与配置 | 生产 `.env` 已配置 | 代码确认 | 见第 10 节 | 服务器 `/opt/english-backend/.env`（实际路径待人工确认） | `.env.example`、`app/core/config.py` |
 
 > 注：README 与 `Dockerfile` 中还描述了一条**微信云托管**部署路径（端口 80 / 8000）。生产实际采用的是**腾讯云轻量服务器 + systemd + Nginx（后端监听 127.0.0.1:8001）**路径（来源：前端 `docs/current-phase.md`、`docs/release-checklist.md`）。云托管路径为备选/历史方案，运维时以服务器路径为准。
 
@@ -47,25 +50,25 @@
 
 ## 3. 微信小程序平台
 
-| 项目 | 值 / 说明 | 是否从代码确认 | 信息来源 |
+| 项目 | 值 / 说明 | 来源确认状态 | 信息来源 |
 |---|---|---|---|
-| AppID | `wx30095d8f17b88a8c`（小程序公开 AppID，非密钥） | 是 | `project.config.json` |
-| AppID 环境变量名（后端用） | `WECHAT_APPID` | 是 | `app/core/config.py`、`.env.example` |
-| AppSecret 环境变量名（后端用） | `WECHAT_SECRET`（**敏感，不入文档明文**） | 是 | `app/core/config.py`、`.env.example` |
-| 登录流程 | 前端 `wx.login()` 取 `code` → 调后端 `POST /api/auth/wechat-login`（带 `code` + `timezone`）→ 后端用 `appid`+`secret`+`code` 请求微信 `jscode2session` 换 `openid` → 建/查 user → 签发 JWT | 是 | `utils/apiClient.js`、`app/services/auth_service.py` |
-| 微信 code2session URL | `https://api.weixin.qq.com/sns/jscode2session` | 是 | `app/services/auth_service.py:18` |
-| request 合法域名 | `https://api.qingyacard.com`（只填根域名，不带路径；不使用裸 IP / HTTP） | 是（docs） | 前端 `docs/release-checklist.md` 第二节 |
-| 前端生产后端地址 | `https://api.qingyacard.com`（默认 `BACKEND_BASE_URL`） | 是 | `utils/apiClient.js:5` |
-| 本地调试覆盖 | `utils/localBackendConfig.js`（可选、**不提交**，存在时覆盖默认地址） | 是 | `utils/apiClient.js:7-14` |
-| token / storage key | `backendUserId` / `backendAccessToken` / `backendLoginAt` | 是 | `utils/apiClient.js:16-20` |
-| token 携带方式 | 请求头 `Authorization: Bearer <accessToken>`；401 时自动用 `wx.login` 刷新一次后重试 | 是 | `utils/apiClient.js:139-275` |
-| 隐私保护指引 / 服务类目 / 审核材料 | 待人工补充 | 否 | 前端 `docs/release-checklist.md` 第十八、二十四节（验收项，值需人工填） |
+| AppID | `wx30095d8f17b88a8c`（小程序公开 AppID，非密钥） | 代码确认 | `project.config.json` |
+| AppID 环境变量名（后端用） | `WECHAT_APPID` | 代码确认 | `app/core/config.py`、`.env.example` |
+| AppSecret 环境变量名（后端用） | `WECHAT_SECRET`（**敏感，不入文档明文**） | 代码确认 | `app/core/config.py`、`.env.example` |
+| 登录流程 | 前端 `wx.login()` 取 `code` → 调后端 `POST /api/auth/wechat-login`（带 `code` + `timezone`）→ 后端用 `appid`+`secret`+`code` 请求微信 `jscode2session` 换 `openid` → 建/查 user → 签发 JWT | 代码确认 | `utils/apiClient.js`、`app/services/auth_service.py` |
+| 微信 code2session URL | `https://api.weixin.qq.com/sns/jscode2session` | 代码确认 | `app/services/auth_service.py:18` |
+| request 合法域名 | `https://api.qingyacard.com`（只填根域名，不带路径；不使用裸 IP / HTTP） | docs 确认 | 前端 `docs/release-checklist.md` 第二节 |
+| 前端生产后端地址 | `https://api.qingyacard.com`（默认 `BACKEND_BASE_URL`） | 代码确认 | `utils/apiClient.js:5` |
+| 本地调试覆盖 | `utils/localBackendConfig.js`（可选、**不提交**，存在时覆盖默认地址） | 代码确认 | `utils/apiClient.js:7-14` |
+| token / storage key | `backendUserId` / `backendAccessToken` / `backendLoginAt` | 代码确认 | `utils/apiClient.js:16-20` |
+| token 携带方式 | 请求头 `Authorization: Bearer <accessToken>`；401 时自动用 `wx.login` 刷新一次后重试 | 代码确认 | `utils/apiClient.js:139-275` |
+| 隐私保护指引 / 服务类目 / 审核材料 | 待人工补充 | 待人工补充 | 前端 `docs/release-checklist.md` 第十八、二十四节（验收项，值需人工填） |
 
 ---
 
 ## 4. 腾讯云服务器
 
-> 全部来自部署记录文档（前端 `docs/current-phase.md`、`docs/release-checklist.md`）。代码本身不含服务器信息，因此「从代码确认」标注为「否（docs 确认）」。
+> 全部来自部署记录文档（前端 `docs/current-phase.md`、`docs/release-checklist.md`）或运维人工核对。代码本身不含服务器信息。
 
 | 项目 | 值 / 说明 | 信息来源 |
 |---|---|---|
@@ -75,28 +78,29 @@
 | 已装基础环境 | Python、PostgreSQL、Nginx、Certbot、Git | 前端 `docs/release-checklist.md` 第一节 |
 | 后端部署目录 | `/opt/english-backend` | 前端 `docs/current-phase.md` |
 | Python 虚拟环境 | `/opt/english-backend/.venv` | 前端 `docs/current-phase.md` |
-| 生产 `.env` 路径 | `/opt/english-backend/.env`（推断；运维确认实际路径） | `app/core/config.py:11-12`（读取项目根 `.env`） |
+| 生产 `.env` 路径 | `/opt/english-backend/.env`（实际路径待人工确认） | `app/core/config.py:11-12`（读取项目根 `.env`） |
 | 代码来源 | Gitee（国内访问 GitHub 不稳定，服务器从 Gitee clone/pull） | 前端 `docs/current-phase.md` |
 | 防火墙放行端口 | 80、443 | 前端 `docs/release-checklist.md` 第二节 |
-| SSH 访问方式 / 密钥归属 | 待人工补充 | 否 |
-| 服务器到期 / 续费时间 | 待人工补充 | 否 |
+| 当前主要登录方式 | 腾讯云控制台 TAT 免密登录 | 人工确认 |
+| SSH | 暂未作为主要方式使用，可作为后续备用方式配置 | 人工确认 |
+| 服务器到期 / 续费时间 | 2027.6.30 | 人工确认 |
 
 ---
 
 ## 5. 后端服务
 
-| 项目 | 值 / 说明 | 是否从代码确认 | 信息来源 |
+| 项目 | 值 / 说明 | 来源确认状态 | 信息来源 |
 |---|---|---|---|
-| 框架 | FastAPI（title `English Analyzer Backend`，version `0.1.0`） | 是 | `app/main.py:14-17` |
-| ASGI 服务器 | uvicorn（`uvicorn[standard]`） | 是 | `requirements.txt`、README |
-| 启动入口 | `app.main:app` | 是 | `app/main.py`、`Dockerfile` |
-| 生产监听端口 | `127.0.0.1:8001`（Nginx 反代到此） | 是（docs） | 前端 `docs/current-phase.md`、`docs/release-checklist.md` |
-| 本地开发端口 | 8000（README 示例 `--port 8000`） | 是 | README |
-| 健康检查 | `GET /health` → `{"status":"ok"}` | 是 | `app/main.py:25-27` |
-| systemd 服务名 | `english-backend`（`english-backend.service`，`Restart=on-failure`） | 是（docs） | 前端 `docs/release-checklist.md` 第一、二十节 |
-| Nginx | 反向代理 `→ 127.0.0.1:8001`，含 `Host` / `X-Forwarded-For` / `X-Forwarded-Proto` 头；HTTP 自动 301/302 跳 HTTPS | 是（docs） | 前端 `docs/release-checklist.md` 第一节 |
-| Nginx 站点配置文件路径 | 待人工补充 | 否 | |
-| systemd unit 文件路径 | 待人工补充（通常 `/etc/systemd/system/english-backend.service`） | 否 | |
+| 框架 | FastAPI（title `English Analyzer Backend`，version `0.1.0`） | 代码确认 | `app/main.py:14-17` |
+| ASGI 服务器 | uvicorn（`uvicorn[standard]`） | 代码确认 | `requirements.txt`、README |
+| 启动入口 | `app.main:app` | 代码确认 | `app/main.py`、`Dockerfile` |
+| 生产监听端口 | `127.0.0.1:8001`（Nginx 反代到此） | docs 确认 | 前端 `docs/current-phase.md`、`docs/release-checklist.md` |
+| 本地开发端口 | 8000（README 示例 `--port 8000`） | 代码确认 | README |
+| 健康检查 | `GET /health` → `{"status":"ok"}` | 代码确认 | `app/main.py:25-27` |
+| systemd 服务名 | `english-backend`（`english-backend.service`，`Restart=on-failure`） | docs 确认 | 前端 `docs/release-checklist.md` 第一、二十节 |
+| Nginx | 反向代理 `→ 127.0.0.1:8001`，含 `Host` / `X-Forwarded-For` / `X-Forwarded-Proto` 头；HTTP 自动 301/302 跳 HTTPS | docs 确认 | 前端 `docs/release-checklist.md` 第一节 |
+| Nginx 站点配置文件路径 | 待人工补充 | 待人工补充 | |
+| systemd unit 文件路径 | 待人工补充（通常 `/etc/systemd/system/english-backend.service`） | 待人工补充 | |
 
 ### 主要 API 路由（来源：`app/main.py` + `app/routers/*.py` 的 `APIRouter(prefix=...)`）
 
@@ -115,18 +119,18 @@
 
 ## 6. 数据库 PostgreSQL
 
-| 项目 | 值 / 说明 | 是否从代码确认 | 信息来源 |
+| 项目 | 值 / 说明 | 来源确认状态 | 信息来源 |
 |---|---|---|---|
-| 生产数据库类型 | PostgreSQL（驱动 `psycopg2-binary`） | 是 | `requirements.txt`、前端 `docs/current-phase.md` |
-| 本地开发默认 | SQLite `sqlite:///./english_analyzer.db` | 是 | `app/database.py:11`、`alembic.ini:89` |
-| 连接环境变量 | `DATABASE_URL`（生产形如 `postgresql://english_user:<password>@localhost:5432/english_study`，**密码不入文档**） | 是 | `app/database.py:12`、前端 `docs/current-phase.md` |
-| 生产数据库名 | `english_study` | 是（docs） | 前端 `docs/release-checklist.md` |
-| 生产数据库用户 | `english_user` | 是（docs） | 前端 `docs/release-checklist.md` |
-| 端口 | 5432 | 是（docs） | 前端 `docs/current-phase.md` |
-| ORM | SQLAlchemy 2.0 | 是 | `requirements.txt`、`app/database.py` |
-| 迁移工具 | Alembic（`script_location = alembic`） | 是 | `alembic.ini`、`alembic/` |
-| 迁移命令（生产） | `alembic upgrade heads`（存在多个 head，须用 `heads`），上下文应为 `PostgresqlImpl` | 是（docs） | 前端 `docs/current-phase.md`、`docs/release-checklist.md` |
-| 注意 | `alembic.ini` 内 `sqlalchemy.url` 写的是 SQLite，仅供 env.py 兜底；实际连接由 `DATABASE_URL` 决定 | 是 | `alembic.ini:89`、`app/database.py` |
+| 生产数据库类型 | PostgreSQL（驱动 `psycopg2-binary`） | 代码确认 | `requirements.txt`、前端 `docs/current-phase.md` |
+| 本地开发默认 | SQLite `sqlite:///./english_analyzer.db` | 代码确认 | `app/database.py:11`、`alembic.ini:89` |
+| 连接环境变量 | `DATABASE_URL`（生产形如 `postgresql://english_user:<password>@localhost:5432/english_study`，**密码不入文档**） | 代码确认 | `app/database.py:12`、前端 `docs/current-phase.md` |
+| 生产数据库名 | `english_study` | docs 确认 | 前端 `docs/release-checklist.md` |
+| 生产数据库用户 | `english_user` | docs 确认 | 前端 `docs/release-checklist.md` |
+| 端口 | 5432 | docs 确认 | 前端 `docs/current-phase.md` |
+| ORM | SQLAlchemy 2.0 | 代码确认 | `requirements.txt`、`app/database.py` |
+| 迁移工具 | Alembic（`script_location = alembic`） | 代码确认 | `alembic.ini`、`alembic/` |
+| 迁移命令（生产） | `alembic upgrade heads`（存在多个 head，须用 `heads`），上下文应为 `PostgresqlImpl` | docs 确认 | 前端 `docs/current-phase.md`、`docs/release-checklist.md` |
+| 注意 | `alembic.ini` 内 `sqlalchemy.url` 写的是 SQLite，仅供 env.py 兜底；实际连接由 `DATABASE_URL` 决定 | 代码确认 | `alembic.ini:89`、`app/database.py` |
 
 ### 数据表（来源：`app/models/*.py` 的 `__tablename__`）
 
@@ -151,18 +155,19 @@
 
 ## 7. 域名、DNS、备案、HTTPS
 
-| 项目 | 当前值 / 说明 | 是否从代码确认 | 信息来源 |
+| 项目 | 当前值 / 说明 | 来源确认状态 | 信息来源 |
 |---|---|---|---|
-| 主域名 | `qingyacard.com`（已购买） | 是（docs） | 前端 `docs/release-checklist.md` 第二节 |
-| 生产 API 域名 | `api.qingyacard.com` | 是 | `utils/apiClient.js:5` |
-| DNS A 记录 | `api` → `49.232.134.229` | 是（docs） | 前端 `docs/current-phase.md` |
-| 协议 | 强制 HTTPS（HTTP 自动跳转）；不使用裸 IP / HTTP | 是（docs） | 前端 `docs/release-checklist.md` 第一、二节 |
-| 证书签发 | Certbot：`sudo certbot --nginx -d api.qingyacard.com` | 是（docs） | 前端 `docs/current-phase.md` |
-| 证书有效期 | 待人工补充（Let's Encrypt 默认 ~90 天，需确认自动续期）；用 `certbot certificates` 查看 | 否 | 前端 `docs/release-checklist.md`（验收项未勾选） |
-| 域名注册商 / 控制台 | 待人工补充 | 否 | |
-| 域名到期时间 | 待人工补充 | 否 | |
-| DNS 控制台 | 待人工补充 | 否 | |
-| ICP 备案状态 | 待人工补充（验收项未确认） | 否 | 前端 `docs/release-checklist.md` 第二节 |
+| 主域名 | `qingyacard.com`（已购买） | docs 确认 | 前端 `docs/release-checklist.md` 第二节 |
+| 生产 API 域名 | `api.qingyacard.com` | 代码确认 | `utils/apiClient.js:5` |
+| DNS A 记录 | `api` → `49.232.134.229` | docs 确认 | 前端 `docs/current-phase.md` |
+| DNS 到期 | 随域名状态；DNS 记录本身无固定到期 | docs 确认 | 前端 `docs/current-phase.md` |
+| 协议 | 强制 HTTPS（HTTP 自动跳转）；不使用裸 IP / HTTP | docs 确认 | 前端 `docs/release-checklist.md` 第一、二节 |
+| 证书签发 | Certbot：`sudo certbot --nginx -d api.qingyacard.com` | docs 确认 | 前端 `docs/current-phase.md` |
+| 证书有效期 | 待人工补充（Let's Encrypt 默认 ~90 天，需确认自动续期）；用 `certbot certificates` 查看 | 待人工补充 | 前端 `docs/release-checklist.md`（验收项未勾选） |
+| 域名注册商 / 控制台 | 待人工补充 | 待人工补充 | |
+| 域名到期时间 | 2027.5.30 | 人工确认 | |
+| DNS 控制台 | 待人工补充 | 待人工补充 | |
+| ICP 备案状态 | 待人工补充（验收项未确认） | 待人工补充 | 前端 `docs/release-checklist.md` 第二节 |
 
 ---
 
@@ -178,33 +183,33 @@
 
 ### Hunyuan（混元）
 
-| 项目 | 值 / 说明 | 是否从代码确认 | 信息来源 |
+| 项目 | 值 / 说明 | 来源确认状态 | 信息来源 |
 |---|---|---|---|
-| 接入方式 | TokenHub Hunyuan，OpenAI 兼容 `chat/completions` | 是 | `app/services/hunyuan_example.py` |
-| API key 变量名 | `HUNYUAN_API_KEY`（**敏感**，请求头 `Authorization: Bearer <key>`） | 是 | `app/core/config.py:20`、`.env.example` |
-| Base URL 变量名 | `HUNYUAN_BASE_URL`（默认 `https://api.hunyuan.cloud.tencent.com/v1`，非敏感） | 是 | `app/core/config.py:21`、`.env.example` |
-| 模型变量名 / 当前值 | `HUNYUAN_MODEL`，默认 `hunyuan-role-latest`（非敏感） | 是 | `app/core/config.py:22`、`.env.example` |
-| 超时 | 15s | 是 | `app/services/hunyuan_example.py:215` |
-| 额度 / 计费 / 到期 | 待人工补充 | 否 | |
+| 接入方式 | TokenHub Hunyuan，OpenAI 兼容 `chat/completions` | 代码确认 | `app/services/hunyuan_example.py` |
+| API key 变量名 | `HUNYUAN_API_KEY`（**敏感**，请求头 `Authorization: Bearer <key>`） | 代码确认 | `app/core/config.py:20`、`.env.example` |
+| Base URL 变量名 | `HUNYUAN_BASE_URL`（默认 `https://api.hunyuan.cloud.tencent.com/v1`，非敏感） | 代码确认 | `app/core/config.py:21`、`.env.example` |
+| 模型变量名 / 当前值 | `HUNYUAN_MODEL`，默认 `hunyuan-role-latest`（非敏感） | 代码确认 | `app/core/config.py:22`、`.env.example` |
+| 超时 | 15s | 代码确认 | `app/services/hunyuan_example.py:215` |
+| 额度 / 计费 / 到期 | 当前用量约 40000 / 1000000 tokens（核对时间 2026-06-05）；按量计费，需定期人工核对 | 人工确认 | |
 
 ### 腾讯机器翻译 TMT
 
-| 项目 | 值 / 说明 | 是否从代码确认 | 信息来源 |
+| 项目 | 值 / 说明 | 来源确认状态 | 信息来源 |
 |---|---|---|---|
-| SDK | `tencentcloud-sdk-python`（`tmt.v20180321`） | 是 | `requirements.txt`、`app/providers/tencent_translator.py` |
-| 接口端点 | `tmt.tencentcloudapi.com`，`TextTranslate` | 是 | `app/providers/tencent_translator.py:47` |
-| SecretId 变量名 | `TENCENT_SECRET_ID`（**敏感**） | 是 | `app/core/config.py:17`、`.env.example` |
-| SecretKey 变量名 | `TENCENT_SECRET_KEY`（**敏感**） | 是 | `app/core/config.py:18`、`.env.example` |
-| 区域变量名 / 默认 | `TENCENT_TMT_REGION`，默认 `ap-guangzhou`（非敏感） | 是 | `app/core/config.py:19`、`.env.example` |
-| 未配置时行为 | 不报 500，返回 warning「翻译暂时不可用，已先保存英文内容」 | 是 | README、`app/providers/tencent_translator.py:39-40` |
-| 额度 / 计费 / 到期 | 待人工补充 | 否 | |
+| SDK | `tencentcloud-sdk-python`（`tmt.v20180321`） | 代码确认 | `requirements.txt`、`app/providers/tencent_translator.py` |
+| 接口端点 | `tmt.tencentcloudapi.com`，`TextTranslate` | 代码确认 | `app/providers/tencent_translator.py:47` |
+| SecretId 变量名 | `TENCENT_SECRET_ID`（**敏感**） | 代码确认 | `app/core/config.py:17`、`.env.example` |
+| SecretKey 变量名 | `TENCENT_SECRET_KEY`（**敏感**） | 代码确认 | `app/core/config.py:18`、`.env.example` |
+| 区域变量名 / 默认 | `TENCENT_TMT_REGION`，默认 `ap-guangzhou`（非敏感） | 代码确认 | `app/core/config.py:19`、`.env.example` |
+| 未配置时行为 | 不报 500，返回 warning「翻译暂时不可用，已先保存英文内容」 | 代码确认 | README、`app/providers/tencent_translator.py:39-40` |
+| 额度 / 计费 / 到期 | 免费额度到期 2026.6.30；具体额度 / 计费仍需定期人工核对 | 人工确认 | |
 
 ---
 
 ## 9. 环境变量与密钥变量
 
 > 来源：`.env.example` 与 `app/core/config.py`（后端）、`cloudfunctions/analyzeEnglish/index.js`（云函数）。
-> **敏感变量只记录变量名与用途，真实值一律不入文档。** 生产值存放在服务器 `/opt/english-backend/.env`（已被 `.gitignore` 忽略，未进仓库）。
+> **敏感变量只记录变量名与用途，真实值一律不入文档。** 生产值存放在服务器 `.env`（路径 `/opt/english-backend/.env`，实际路径待人工确认；已被 `.gitignore` 忽略，未进仓库）。
 
 | 变量名 | 用途 | 是否敏感 | 是否允许明文记录 | 建议存放位置 | 信息来源 |
 |---|---|---|---|---|---|
@@ -230,12 +235,12 @@
 
 | 项目 | 当前值 | 到期时间 | 是否自动续费 | 维护入口 | 备注 |
 |---|---|---|---|---|---|
-| 域名 `qingyacard.com` | 已购买 | 待人工补充 | 待人工补充 | 域名注册商控制台 | 过期将导致 API 域名不可用 |
-| 腾讯云轻量服务器 | 运行中（IP 49.232.134.229） | 待人工补充 | 待人工补充 | 腾讯云控制台 | 过期将停机 |
+| 域名 `qingyacard.com` | 已购买 | 2027.5.30 | 待人工补充 | 域名注册商控制台 | 过期将导致 API 域名不可用 |
+| 腾讯云轻量服务器 | 运行中（IP 49.232.134.229） | 2027.6.30 | 待人工补充 | 腾讯云控制台 / TAT 免密登录 | 过期将停机 |
 | HTTPS 证书（api.qingyacard.com） | 已部署 | 待人工补充（≈90 天） | 待人工补充（Certbot 通常自动续期） | 服务器 `certbot certificates` | 需确认自动续期 cron/timer 正常 |
 | ICP 备案 | 待人工补充 | 待人工补充 | — | 云服务商备案系统 | 微信/云商可能要求 |
-| Hunyuan 账户额度 | 待人工补充 | 待人工补充 | 待人工补充 | 腾讯云 / TokenHub 控制台 | 按量计费 |
-| 腾讯云 TMT 额度 | 待人工补充 | 待人工补充 | 待人工补充 | 腾讯云控制台 | 按量计费 |
+| Hunyuan 账户额度 | 用量约 40000 / 1000000 tokens（核对 2026-06-05） | 待人工补充 | 待人工补充 | 腾讯云 / TokenHub 控制台 | 按量计费，需定期人工核对 |
+| 腾讯云 TMT 额度 | 免费额度 | 2026.6.30（免费额度到期） | 待人工补充 | 腾讯云控制台 | 具体额度 / 计费需定期人工核对 |
 | `JWT_SECRET_KEY` 轮换 | 已配置 | 无固定到期 | — | 服务器 `.env` | 轮换会使所有现有 token 失效，需用户重新登录 |
 | 数据库备份 | 待人工补充 | — | 待人工补充 | 服务器 / 对象存储 | 自动备份任务是否已配置待确认 |
 | 负责人 / 值班人 | 待人工补充 | — | — | — | 建议填写主负责人与备份联系人 |
@@ -257,16 +262,16 @@
 - [ ] `sudo certbot certificates` 确认证书有效期 > 30 天且自动续期正常
 - [ ] `pg_dump` 备份成功并验证可恢复；确认备份已存到本机以外位置
 - [ ] 检查 Hunyuan / 腾讯云 TMT 账户额度与账单
-- [ ] 确认域名、服务器距到期 > 30 天（见第 10 节，补全后核对）
+- [ ] 确认域名、服务器距到期 > 30 天（见第 10 节）
 - [ ] 复查 `git status` 无 `.env` / `localBackendConfig.js` / 本地配置被误提交
 - [ ] 服务器系统安全更新（`sudo apt update && sudo apt upgrade`，按变更窗口）
 
 ### 到期前提醒（建议提前 30 天）
 
-- [ ] 域名续费
-- [ ] 服务器续费
+- [ ] 域名续费（2027.5.30 到期）
+- [ ] 服务器续费（2027.6.30 到期）
 - [ ] HTTPS 证书续期确认
-- [ ] AI 服务额度充值
+- [ ] AI 服务额度充值（TMT 免费额度 2026.6.30 到期）
 
 ---
 
@@ -297,6 +302,7 @@ psql -U english_user -d english_study < backup.sql   # 恢复
 
 # HTTPS 证书
 sudo certbot certificates
+sudo certbot renew --dry-run
 ```
 
 > 生产后端不要手动长期运行 `uvicorn`，应由 systemd 托管。
@@ -332,13 +338,20 @@ git status --short
 - AI 调用链路、Hunyuan / TMT 接入与变量（`app/services/hunyuan_example.py`、`app/providers/tencent_translator.py`、README）
 - 服务器、PostgreSQL、Nginx、systemd、Certbot、域名、DNS、HTTPS 部署事实（前端 `docs/current-phase.md`、`docs/release-checklist.md`）
 
+### 已由人工确认的项
+
+- 当前主要登录方式：腾讯云控制台 TAT 免密登录
+- 域名到期：2027.5.30；服务器到期：2027.6.30
+- Hunyuan 用量约 40000 / 1000000 tokens（核对 2026-06-05）
+- 腾讯机器翻译免费额度到期：2026.6.30
+
 ### 待人工补充清单
 
-- 服务器 SSH 接入方式、密钥归属、到期 / 续费时间
-- 域名注册商、域名到期时间、DNS 控制台入口
+- SSH 备用接入方式与密钥归属（当前主要使用 TAT 免密登录，SSH 暂未作为主要方式）
+- 域名注册商、DNS 控制台入口
 - HTTPS 证书具体到期时间、自动续期任务是否正常
 - ICP 备案状态
-- Hunyuan / 腾讯云 TMT 的额度、计费、控制台账户归属
+- Hunyuan / 腾讯云 TMT 的计费、自动续费与额度的定期人工核对
 - 数据库自动备份任务是否已配置（频率 / 保留 / 异地存放）
 - Nginx 站点配置文件路径、systemd unit 文件路径、生产 `.env` 确切路径
 - 微信平台隐私保护指引、服务类目、审核材料状态
@@ -355,6 +368,5 @@ git status --short
 - **未发现真实密钥被提交到仓库。** 暂无密钥泄露风险。
 - 低优先级提醒（非密钥泄露）：前端 `project.private.config.json` 已被 git 跟踪（项目规范建议不提交），但其内容仅为微信开发者工具本地设置，**不含任何密钥**；可按需从跟踪中移除以符合规范。
 
-> 维护本文档时：补全「待人工补充」项后请把对应行的「是否从代码确认 / 到期时间」更新为实际值，并保持不写入任何真实密钥的原则。
+> 维护本文档时：补全「待人工补充」项后请把对应行的「来源确认状态 / 到期时间」更新为实际值，并保持不写入任何真实密钥的原则。
 </content>
-</invoke>
