@@ -4,6 +4,7 @@ pydantic
 python-dotenv
 cachetools
 pyspellchecker
+argostranslate
 tencentcloud-sdk-python
 requests
 httpx

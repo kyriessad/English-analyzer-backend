@@ -30,3 +30,6 @@ def get_cache(key: str) -> dict[str, Any] | None:
 def set_cache(key: str, value: dict[str, Any]) -> None:
     _cache[key] = dict(value)
 
+
+def delete_cache(key: str) -> None:
+    _cache.pop(key, None)

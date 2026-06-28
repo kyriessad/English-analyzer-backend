@@ -1,5 +1,44 @@
 # Current Development Phase
 
+## 2026-06-28 Local-Only AI Development Mode
+
+**Status:** Active local development mode; former public production stack is offline.
+
+Current facts:
+
+- Tencent Cloud Lighthouse server: returned and destroyed.
+- Production FastAPI/Nginx/PostgreSQL/systemd/Certbot stack: stopped and no longer exists.
+- DNSPod `api.qingyacard.com` A record: deleted.
+- `https://api.qingyacard.com`: invalid and not used by current code defaults.
+- WeChat request legal domain: deleted or treated as unused.
+- Tencent Cloud ICP filing subject: cancellation submitted.
+- Public security network filing: no longer being handled.
+- `qingyacard.com`: retained, not resolved, not used for the current app.
+- Mini Program: remains paused, used only through WeChat DevTools for local development.
+
+Current local backend:
+
+- FastAPI: `http://127.0.0.1:8000`
+- Database: SQLite `sqlite:///./english_analyzer.db`
+- Translation provider: Argos Translate en -> zh
+- Example generator: Ollama API `http://127.0.0.1:11434`, model `qwen3:8b`
+- Startup command: `uvicorn app.main:app --reload --host 127.0.0.1 --port 8000`
+
+AI provider status:
+
+- `app/providers/tencent_translator.py` remains as a legacy optional provider.
+- `app/services/hunyuan_example.py` remains as a legacy optional provider.
+- Default `.env.example` sets `ENABLE_TENCENT_TMT=false` and `ENABLE_HUNYUAN=false`.
+- Normal analysis requests must not call Tencent TMT or Hunyuan.
+
+Validation performed in this phase:
+
+- Argos Translate installed in `.venv` and en -> zh model installed.
+- Unit tests added for Argos provider, Ollama generator, and analyzer local AI integration.
+- Word/phrase cache entries without `exampleSentence` are not written and stale empty entries are ignored.
+
+Historical deployment notes below are retained for reference only and do not describe the current running environment.
+
 ## Phase 8L-backend-fill-session-to-target-size — 每次看几张按目标批量补位
 
 **Status:** Completed (2026-05-30)

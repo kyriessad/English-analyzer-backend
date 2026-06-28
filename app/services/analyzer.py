@@ -1,27 +1,14 @@
 """
-最核心的主流程文件
-用户输入英文
-↓
-validator.py 检测
-↓
-如果 error，直接返回
-↓
-查 cache.py
-↓
-没有缓存，调用 translator.py 翻译
-↓
-调用 understanding.py 生成理解
-↓
-（word/phrase）调用 Hunyuan 生成 AI 例句，失败则 TMT 兜底
-↓
-返回统一结构
+Main analysis flow for /api/analyze-english.
 """
 import logging
 from typing import Any
 
+from app.core.config import settings
 from app.schemas import Category, Level
-from app.services.cache import get_cache, make_cache_key, set_cache
+from app.services.cache import delete_cache, get_cache, make_cache_key, set_cache
 from app.services.hunyuan_example import generate_example_with_hunyuan
+from app.services.ollama_example import generate_example_with_ollama
 from app.services.translator import translate_to_zh
 from app.services.understanding import generate_understanding
 from app.services.validator import validate_english
@@ -32,62 +19,97 @@ logger = logging.getLogger(__name__)
 TRANSLATION_UNAVAILABLE_WARNING = "翻译暂时不可用，已先保存英文内容。"
 
 
+def _is_word_or_phrase(category: str | None) -> bool:
+    return category in ("word", "phrase")
+
+
+def _has_example(response: dict[str, Any]) -> bool:
+    return bool(str(response.get("exampleSentence") or "").strip())
+
+
 def _generate_example_with_tmt(
     word: str,
     translation: str,
     category: str,
 ) -> tuple[str | None, str | None]:
     """
-    Fallback example generation using TMT bidirectional translation.
-    Builds Chinese sentence templates using the Chinese translation, translates
-    zh→en, and returns the first result whose English contains the original word.
+    Legacy optional TMT fallback.
+
+    The file and function are kept for rollback, but the default local mode never
+    reaches this unless ENABLE_TENCENT_TMT=true and the Hunyuan legacy provider is
+    explicitly selected.
     """
-    _trans_hint = translation[:40] if translation else ""
     logger.info(
         "[tmt][diag] start | text=%r | category=%s | translation_hint=%r",
-        word, category, _trans_hint,
+        word,
+        category,
+        (translation or "")[:40],
     )
     try:
-        from app.providers.tencent_translator import TencentTranslator
-        translator = TencentTranslator()
+        if not settings.enable_tencent_tmt:
+            logger.info("[tmt][diag] skipped | ENABLE_TENCENT_TMT=false")
+            return None, None
 
+        from app.providers.tencent_translator import TencentTranslator
+
+        translator = TencentTranslator()
         word_lower = word.lower().strip()
-        # Use only the primary segment of the translation (handles "渴望；渴求" → "渴望")
-        t = translation.split("；")[0].split(";")[0].split("，")[0].split(",")[0].strip()
-        if not t:
-            logger.warning(
-                "[tmt][diag] fail_reason=tmt_fallback_failed | text=%r | empty primary segment",
-                word,
-            )
+        primary_translation = (
+            translation.split("；")[0].split(";")[0].split("，")[0].split(",")[0].strip()
+        )
+        if not primary_translation:
+            logger.warning("[tmt][diag] fail_reason=tmt_fallback_failed | empty translation")
             return None, None
 
         for zh in [
-            f"他非常{t}，每天都如此。",
-            f"这让她感到{t}。",
-            f"她{t}这件事。",
+            f"他非常{primary_translation}，每天都如此。",
+            f"这让她感到{primary_translation}。",
+            f"她把{primary_translation}这件事记在心里。",
         ]:
             try:
                 en = translator.translate_to_en(zh)
-                logger.info(
-                    "[tmt][diag] attempt | text=%r | zh=%r | en=%r | match=%s",
-                    word, zh, (en or "")[:80], bool(en and word_lower in en.lower()),
-                )
                 if en and word_lower in en.lower():
                     return en.strip(), zh
             except Exception:
                 continue
 
-        logger.warning(
-            "[tmt][diag] fail_reason=tmt_fallback_failed | text=%r | all templates failed",
-            word,
-        )
+        logger.warning("[tmt][diag] fail_reason=tmt_fallback_failed | all templates failed")
         return None, None
     except Exception:
-        logger.warning(
-            "[tmt][diag] fail_reason=tmt_fallback_failed | text=%r | exception in TMT setup",
-            word,
-        )
+        logger.exception("[tmt][diag] fail_reason=tmt_fallback_failed | setup failed")
         return None, None
+
+
+def _generate_example(
+    normalized_text: str,
+    category: str,
+    translation: str | None,
+) -> tuple[str | None, str | None]:
+    if not _is_word_or_phrase(category):
+        return None, None
+
+    provider = settings.example_generator_provider
+    if provider == "ollama":
+        return generate_example_with_ollama(normalized_text, translation)
+
+    if provider == "hunyuan":
+        if not settings.enable_hunyuan:
+            logger.info("[hunyuan][diag] skipped | ENABLE_HUNYUAN=false")
+            return None, None
+
+        example_sentence, example_translation = generate_example_with_hunyuan(
+            normalized_text,
+            translation,
+        )
+        if example_sentence:
+            return example_sentence, example_translation
+
+        if translation and settings.enable_tencent_tmt:
+            return _generate_example_with_tmt(normalized_text, translation, category)
+        return None, None
+
+    logger.warning("[analyzer] unsupported example generator provider: %s", provider)
+    return None, None
 
 
 def _build_response(
@@ -147,8 +169,11 @@ def analyze_text(
         cache_key = make_cache_key(normalized_text, target_lang)
         cached = get_cache(cache_key)
         if cached:
-            cached["cacheHit"] = True
-            return cached
+            if _is_word_or_phrase(cached.get("category")) and not _has_example(cached):
+                delete_cache(cache_key)
+            else:
+                cached["cacheHit"] = True
+                return cached
 
         translation_result = translate_to_zh(normalized_text)
         provider = translation_result.get("provider")
@@ -164,33 +189,15 @@ def analyze_text(
             translation,
         )
 
-        # 对单词和短语用 TokenHub Hunyuan 生成 AI 例句
-        # translation 用作 Hunyuan prompt 的中文提示，为 None 时 Hunyuan 仍可尝试生成
-        example_sentence: str | None = None
-        example_translation: str | None = None
-        if category in ("word", "phrase"):
-            example_sentence, example_translation = generate_example_with_hunyuan(
-                normalized_text, translation
-            )
-            if example_sentence:
-                logger.info("[analyzer] Hunyuan SUCCESS for '%s'", normalized_text)
-            elif translation:
-                # TMT builds Chinese template sentences from translation — skip when unavailable
-                logger.info("[analyzer] Hunyuan failed, trying TMT fallback for '%s'", normalized_text)
-                example_sentence, example_translation = _generate_example_with_tmt(
-                    normalized_text, translation, category
-                )
-                if example_sentence:
-                    logger.info("[analyzer] TMT fallback SUCCESS for '%s'", normalized_text)
-                else:
-                    logger.info("[analyzer] TMT fallback also failed for '%s'", normalized_text)
-            else:
-                logger.info("[analyzer] Hunyuan failed, TMT skipped (no translation) for '%s'", normalized_text)
+        example_sentence, example_translation = _generate_example(
+            normalized_text,
+            category,
+            translation,
+        )
 
-        level: Level = validation_level
         response = _build_response(
             ok=True,
-            level=level,
+            level=validation_level,
             category=category,
             normalized_text=normalized_text,
             translation=translation,
@@ -203,18 +210,20 @@ def analyze_text(
             example_translation=example_translation,
         )
 
-        if translation_result.get("ok") and translation:
+        cacheable = bool(translation_result.get("ok") and translation)
+        if cacheable and not (_is_word_or_phrase(category) and not example_sentence):
             set_cache(cache_key, response)
 
         return response
-    except Exception as exc:
+    except Exception:
+        logger.exception("[analyzer] unexpected failure")
         return _build_response(
             ok=False,
             level="failed",
             category="unknown",
             normalized_text=str(text or "").strip(),
             warnings=[],
-            errors=[f"分析服务暂时不可用：{exc}"],
+            errors=["分析服务暂时不可用，请稍后重试"],
             provider=None,
             cache_hit=False,
         )

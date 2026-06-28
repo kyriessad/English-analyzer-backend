@@ -10,6 +10,7 @@ __pycache__/
 *.db
 *.sqlite
 *.sqlite3
+*.argosmodel
 
 .DS_Store
 .vscode/

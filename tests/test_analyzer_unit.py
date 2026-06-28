@@ -27,7 +27,7 @@ class AnalyzerExampleGateTest(unittest.TestCase):
             patch("app.services.analyzer.set_cache"),
             patch("app.services.analyzer.translate_to_zh", return_value=translation_result),
             patch("app.services.analyzer.generate_understanding", return_value="mocked understanding"),
-            patch("app.services.analyzer.generate_example_with_hunyuan") as mock_hunyuan,
+            patch("app.services.analyzer.generate_example_with_ollama") as mock_hunyuan,
             patch("app.services.analyzer._generate_example_with_tmt") as mock_tmt,
         ):
             mock_hunyuan.return_value = (None, None)
@@ -44,9 +44,9 @@ class AnalyzerExampleGateTest(unittest.TestCase):
         self.assertEqual(result["category"], "word")
         mock_hunyuan.assert_called_once_with("apply", "测试中文")
 
-    def test_word_with_translation_calls_tmt_on_hunyuan_failure(self):
+    def test_word_with_translation_does_not_call_tmt_by_default(self):
         result, mock_hunyuan, mock_tmt = self._call("apply", translation_ok=True)
-        mock_tmt.assert_called_once()
+        mock_tmt.assert_not_called()
 
     # ------------------------------------------------------------------
     # Word + translation unavailable (the new gate-removal behavior)
@@ -107,7 +107,7 @@ class AnalyzerExampleGateTest(unittest.TestCase):
             patch("app.services.analyzer.translate_to_zh",
                   return_value={"ok": False, "translation": None, "provider": None}),
             patch("app.services.analyzer.generate_understanding", return_value="u"),
-            patch("app.services.analyzer.generate_example_with_hunyuan",
+            patch("app.services.analyzer.generate_example_with_ollama",
                   return_value=("She craves success.", "她渴望成功。")),
             patch("app.services.analyzer._generate_example_with_tmt",
                   return_value=(None, None)),
@@ -217,7 +217,7 @@ class HyphenatedWordExampleChainTest(unittest.TestCase):
             patch("app.services.analyzer.translate_to_zh",
                   return_value={"ok": True, "translation": "测试", "provider": "tencent"}),
             patch("app.services.analyzer.generate_understanding", return_value="u"),
-            patch("app.services.analyzer.generate_example_with_hunyuan") as mock_hunyuan,
+            patch("app.services.analyzer.generate_example_with_ollama") as mock_hunyuan,
             patch("app.services.analyzer._generate_example_with_tmt") as mock_tmt,
         ):
             mock_hunyuan.return_value = (None, None)
@@ -255,7 +255,7 @@ class HyphenatedWordExampleChainTest(unittest.TestCase):
             patch("app.services.analyzer.translate_to_zh",
                   return_value={"ok": True, "translation": "全职", "provider": "tencent"}),
             patch("app.services.analyzer.generate_understanding", return_value="u"),
-            patch("app.services.analyzer.generate_example_with_hunyuan",
+            patch("app.services.analyzer.generate_example_with_ollama",
                   return_value=("She works full-time.", "她全职工作。")),
             patch("app.services.analyzer._generate_example_with_tmt",
                   return_value=(None, None)),
@@ -353,7 +353,7 @@ class AlphanumericExampleChainTest(unittest.TestCase):
             patch("app.services.analyzer.translate_to_zh",
                   return_value={"ok": True, "translation": "测试", "provider": "tencent"}),
             patch("app.services.analyzer.generate_understanding", return_value="u"),
-            patch("app.services.analyzer.generate_example_with_hunyuan") as mock_h,
+            patch("app.services.analyzer.generate_example_with_ollama") as mock_h,
             patch("app.services.analyzer._generate_example_with_tmt") as mock_t,
         ):
             mock_h.return_value = (None, None)
@@ -407,7 +407,7 @@ class AlphanumericExampleChainTest(unittest.TestCase):
             patch("app.services.analyzer.translate_to_zh",
                   return_value={"ok": True, "translation": "新冠", "provider": "tencent"}),
             patch("app.services.analyzer.generate_understanding", return_value="u"),
-            patch("app.services.analyzer.generate_example_with_hunyuan",
+            patch("app.services.analyzer.generate_example_with_ollama",
                   return_value=("COVID-19 changed the world.", "新冠疫情改变了世界。")),
             patch("app.services.analyzer._generate_example_with_tmt", return_value=(None, None)),
         ):

@@ -1,3 +1,7 @@
+# 2026-06-28 Current Status: Local-Only
+
+This project is now local-only. Tencent Cloud server, production PostgreSQL, Nginx, systemd, Certbot, DNS `api.qingyacard.com`, and `https://api.qingyacard.com` are no longer active runtime dependencies. Older cloud deployment tables in this document are retained as historical records only; see the "2026-06-28 Current Service Status Override" section at the end for the full local-mode status.
+
 # 上线服务与运维维护文档
 
 > 适用项目：英语学习小程序（前端 `English-study-miniapp` + 后端 `English-analyzer-backend`）
@@ -388,3 +392,39 @@ git status --short
 
 > 维护本文档时：补全「待人工补充」项后请把对应行的「来源确认状态 / 到期时间」更新为实际值，并保持不写入任何真实密钥的原则。
 </content>
+## 2026-06-28 Current Service Status Override
+
+The project is currently local-only. Any older rows below that describe Tencent Cloud server, production PostgreSQL, Nginx, systemd, Certbot, DNS A records, HTTPS certificate, or `https://api.qingyacard.com` as running are historical deployment records only.
+
+Current status:
+
+- Tencent Cloud Lighthouse server has been returned and destroyed.
+- Production backend, Nginx, PostgreSQL, systemd, and Certbot no longer exist.
+- DNSPod `api.qingyacard.com` A record has been deleted.
+- WeChat request legal domain `https://api.qingyacard.com` has been deleted or is no longer used.
+- ICP filing subject cancellation has been submitted.
+- Public security network filing is not continuing.
+- Domain `qingyacard.com` is retained but has no active resolution for this project.
+- Mini Program remains paused; current development is Windows local development through WeChat DevTools.
+
+Current local stack:
+
+- WeChat DevTools -> `http://127.0.0.1:8000`
+- FastAPI -> SQLite `sqlite:///./english_analyzer.db`
+- Argos Translate en -> zh
+- Ollama local API `http://127.0.0.1:11434`
+- `qwen3:8b`
+
+Stopped cloud services:
+
+- Tencent TMT: code retained in `app/providers/tencent_translator.py`, default disabled.
+- Hunyuan: code retained in `app/services/hunyuan_example.py`, default disabled.
+- Tencent Cloud server, production PostgreSQL, Nginx, systemd, Certbot: historical only.
+
+Local operation commands:
+
+```powershell
+.\scripts\setup-local-ai.ps1
+.\scripts\start-local-backend.ps1
+Invoke-RestMethod http://127.0.0.1:8000/health
+```
