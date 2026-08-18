@@ -23,3 +23,10 @@ tests/**/__pycache__/
 # Runtime logs
 *.log
 uvicorn-*.log
+logs/
+.runtime/
+
+# Local language assets
+data/ecdict/
+data/piper/
+data/audio-cache/

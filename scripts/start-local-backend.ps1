@@ -25,6 +25,7 @@ function Get-OllamaPath {
 Set-Location $RepoRoot
 
 & $Python --version
+& $Python scripts\check_database_target.py
 
 & $Python -c "from argostranslate import translate; langs=translate.get_installed_languages(); en=next((l for l in langs if l.code=='en'), None); zh=next((l for l in langs if l.code=='zh'), None); assert en and zh and en.get_translation(zh), 'Argos en->zh model missing. Run scripts\\setup-local-ai.ps1 first.'; print('Argos en->zh model OK')"
 

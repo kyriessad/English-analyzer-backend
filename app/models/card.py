@@ -47,6 +47,7 @@ class Card(Base):
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     user_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("users.id"), nullable=False)
     legacy_cloud_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     local_temp_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -58,6 +59,10 @@ class Card(Base):
     understanding: Mapped[str | None] = mapped_column(Text, nullable=True)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
     where_encountered: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_context: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    example_sentence: Mapped[str | None] = mapped_column(Text, nullable=True)
+    example_translation: Mapped[str | None] = mapped_column(Text, nullable=True)
     translation: Mapped[str | None] = mapped_column(Text, nullable=True)
     analysis_status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     is_review_ready: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -90,6 +95,8 @@ class Card(Base):
         onupdate=utc_now,
     )
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __mapper_args__ = {"version_id_col": version}
 
     user: Mapped["User"] = relationship(back_populates="cards")
     review_session_items: Mapped[list["ReviewSessionItem"]] = relationship(back_populates="card")

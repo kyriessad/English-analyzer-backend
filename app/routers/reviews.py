@@ -10,6 +10,7 @@ from app.database import get_db
 from app.models.card import Card
 from app.models.review import ReviewLog, ReviewSession, ReviewSessionItem
 from app.models.user import User, utc_now
+from app.observability.operations import observed_operation
 from app.schemas.reviews import (
     GoalProgressResponse,
     ReviewFeedbackRequest,
@@ -125,9 +126,14 @@ def _item_response(item: ReviewSessionItem, now: datetime) -> ReviewItemResponse
         session_item_id=item.id,
         card_id=item.card_id,
         content=card.content,
+        translation=card.translation,
         understanding=card.understanding or "",
         note=card.note or "",
         where_encountered=card.where_encountered,
+        source_context=card.source_context,
+        source_url=card.source_url,
+        example_sentence=card.example_sentence,
+        example_translation=card.example_translation,
         card_type=card.card_type,
         review_state=card.review_state,
         mastery_score=card.mastery_score,
@@ -218,12 +224,17 @@ def _build_card_snapshot(card: Card) -> dict:
     return {
         "card_id": str(card.id),
         "content": card.content,
+        "translation": card.translation,
         "understanding": card.understanding,
         "note": card.note,
         "card_type": card.card_type,
         "exam_scene": card.exam_scene,
         "exam_module": card.exam_module,
         "where_encountered": card.where_encountered,
+        "source_context": card.source_context,
+        "source_url": card.source_url,
+        "example_sentence": card.example_sentence,
+        "example_translation": card.example_translation,
         "analysis_status": card.analysis_status,
         "analysis_level": card.analysis_level,
     }
@@ -234,23 +245,35 @@ def _review_history_item_response(row) -> ReviewHistoryItemResponse:
     card_source = "snapshot" if snapshot else ("current_card" if row.content else "missing")
 
     content = snapshot.get("content") or row.content or ""
+    translation = snapshot.get("translation") if snapshot else row.translation
     understanding = snapshot.get("understanding") or row.understanding
     note = snapshot.get("note") or row.note
     card_type = snapshot.get("card_type") or row.card_type
     exam_scene = snapshot.get("exam_scene") or row.exam_scene
     exam_module = snapshot.get("exam_module") or row.exam_module
     where_encountered = snapshot.get("where_encountered") or row.where_encountered
+    source_context = snapshot.get("source_context") if snapshot else row.source_context
+    source_url = snapshot.get("source_url") if snapshot else row.source_url
+    example_sentence = snapshot.get("example_sentence") if snapshot else row.example_sentence
+    example_translation = (
+        snapshot.get("example_translation") if snapshot else row.example_translation
+    )
 
     return ReviewHistoryItemResponse(
         review_log_id=row.review_log_id,
         card_id=row.card_id,
         content=content,
+        translation=translation,
         understanding=understanding,
         note=note,
         card_type=card_type,
         exam_scene=exam_scene,
         exam_module=exam_module,
         where_encountered=where_encountered,
+        source_context=source_context,
+        source_url=source_url,
+        example_sentence=example_sentence,
+        example_translation=example_translation,
         review_count_in_range=row.review_count_in_range,
         last_result=row.last_result,
         last_result_label=REVIEW_RESULT_LABELS[row.last_result],
@@ -345,7 +368,7 @@ def _build_summary(db: Session, session_id: UUID) -> ReviewSummaryResponse:
             .options(selectinload(ReviewSessionItem.card))
             .where(
                 ReviewSessionItem.session_id == session_id,
-                ReviewSessionItem.status == "reviewed",
+                ReviewSessionItem.status.in_(("reviewed", "done")),
             )
             .order_by(ReviewSessionItem.position)
         )
@@ -582,6 +605,15 @@ def get_review_overview(
     daily_goal: int = Query(default=5),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+) -> ReviewOverviewResponse:
+    with observed_operation("database", "review_overview"):
+        return _get_review_overview_observed(daily_goal, db, current_user)
+
+
+def _get_review_overview_observed(
+    daily_goal: int,
+    db: Session,
+    current_user: User,
 ) -> ReviewOverviewResponse:
     now = utc_now()
     base_filters = _review_ready_card_filters(current_user.id)
@@ -836,6 +868,29 @@ def get_review_history(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> ReviewHistoryResponse:
+    with observed_operation("database", "review_history"):
+        return _get_review_history_observed(
+            limit,
+            offset,
+            date_from,
+            date_to,
+            result,
+            search,
+            db,
+            current_user,
+        )
+
+
+def _get_review_history_observed(
+    limit: int,
+    offset: int,
+    date_from: date | None,
+    date_to: date | None,
+    result: list[ReviewResult] | None,
+    search: str | None,
+    db: Session,
+    current_user: User,
+) -> ReviewHistoryResponse:
     if date_from is not None and date_to is not None and date_from > date_to:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -905,11 +960,16 @@ def get_review_history(
         history_filters.append(
             or_(
                 Card.content.ilike(pattern),
+                Card.translation.ilike(pattern),
                 Card.understanding.ilike(pattern),
                 Card.note.ilike(pattern),
                 Card.exam_scene.ilike(pattern),
                 Card.exam_module.ilike(pattern),
                 Card.where_encountered.ilike(pattern),
+                Card.source_context.ilike(pattern),
+                Card.source_url.ilike(pattern),
+                Card.example_sentence.ilike(pattern),
+                Card.example_translation.ilike(pattern),
             )
         )
 
@@ -918,12 +978,17 @@ def get_review_history(
             latest_logs.c.review_log_id,
             latest_logs.c.card_id,
             Card.content,
+            Card.translation,
             Card.understanding,
             Card.note,
             Card.card_type,
             Card.exam_scene,
             Card.exam_module,
             Card.where_encountered,
+            Card.source_context,
+            Card.source_url,
+            Card.example_sentence,
+            Card.example_translation,
             latest_logs.c.review_count_in_range,
             latest_logs.c.last_result,
             latest_logs.c.last_reviewed_at,
@@ -957,6 +1022,17 @@ def get_review_history_summary(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> ReviewHistorySummaryResponse:
+    with observed_operation("database", "review_history_summary"):
+        return _get_review_history_summary_observed(date_from, date_to, search, db, current_user)
+
+
+def _get_review_history_summary_observed(
+    date_from: date | None,
+    date_to: date | None,
+    search: str | None,
+    db: Session,
+    current_user: User,
+) -> ReviewHistorySummaryResponse:
     if date_from is not None and date_to is not None and date_from > date_to:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -977,10 +1053,16 @@ def get_review_history_summary(
             Card.user_id == current_user.id,
             or_(
                 Card.content.ilike(pattern),
+                Card.translation.ilike(pattern),
                 Card.understanding.ilike(pattern),
                 Card.note.ilike(pattern),
                 Card.exam_scene.ilike(pattern),
                 Card.exam_module.ilike(pattern),
+                Card.where_encountered.ilike(pattern),
+                Card.source_context.ilike(pattern),
+                Card.source_url.ilike(pattern),
+                Card.example_sentence.ilike(pattern),
+                Card.example_translation.ilike(pattern),
             )
         )
         log_filters.append(ReviewLog.card_id.in_(matching_card_ids))
@@ -1040,6 +1122,15 @@ def get_review_history_detail(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> ReviewHistoryDetailResponse:
+    with observed_operation("database", "review_history_detail"):
+        return _get_review_history_detail_observed(log_id, db, current_user)
+
+
+def _get_review_history_detail_observed(
+    log_id: UUID,
+    db: Session,
+    current_user: User,
+) -> ReviewHistoryDetailResponse:
     log = db.scalar(
         select(ReviewLog).where(
             ReviewLog.id == log_id,
@@ -1062,12 +1153,17 @@ def get_review_history_detail(
             id=log.card_id,
             card_id=log.card_id,
             content=s.get("content", ""),
+            translation=s.get("translation"),
             understanding=s.get("understanding"),
             note=s.get("note"),
             card_type=s.get("card_type"),
             exam_scene=s.get("exam_scene"),
             exam_module=s.get("exam_module"),
             where_encountered=s.get("where_encountered"),
+            source_context=s.get("source_context"),
+            source_url=s.get("source_url"),
+            example_sentence=s.get("example_sentence"),
+            example_translation=s.get("example_translation"),
             review_state=None,
             next_review_at=None,
             card_source="snapshot",
@@ -1088,12 +1184,17 @@ def get_review_history_detail(
                 id=card_obj.id,
                 card_id=card_obj.id,
                 content=card_obj.content,
+                translation=card_obj.translation,
                 understanding=card_obj.understanding,
                 note=card_obj.note,
                 card_type=card_obj.card_type,
                 exam_scene=card_obj.exam_scene,
                 exam_module=card_obj.exam_module,
                 where_encountered=card_obj.where_encountered,
+                source_context=card_obj.source_context,
+                source_url=card_obj.source_url,
+                example_sentence=card_obj.example_sentence,
+                example_translation=card_obj.example_translation,
                 review_state=card_obj.review_state,
                 next_review_at=card_obj.next_review_at,
                 card_source="current_card",
@@ -1122,22 +1223,23 @@ def get_today_reviews(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> TodayReviewsResponse:
-    normalized_limit = normalize_review_limit(limit)
-    now = utc_now()
+    with observed_operation("database", "review_today"):
+        normalized_limit = normalize_review_limit(limit)
+        now = utc_now()
 
-    session, pending_items = _create_or_return_session(
-        db,
-        user=current_user,
-        session_type=session_type,
-        now=now,
-        limit=normalized_limit,
-        restart=restart,
-    )
-    db.commit()
-    if session is None:
-        return _today_response(None, normalized_limit, now, [])
-    db.refresh(session)
-    return _today_response(session, normalized_limit, now, pending_items)
+        session, pending_items = _create_or_return_session(
+            db,
+            user=current_user,
+            session_type=session_type,
+            now=now,
+            limit=normalized_limit,
+            restart=restart,
+        )
+        db.commit()
+        if session is None:
+            return _today_response(None, normalized_limit, now, [])
+        db.refresh(session)
+        return _today_response(session, normalized_limit, now, pending_items)
 
 
 @review_sessions_router.post("", response_model=ReviewSessionCreateResponse)
@@ -1146,27 +1248,28 @@ def create_review_session_endpoint(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> ReviewSessionCreateResponse:
-    normalized_limit = normalize_review_limit(payload.limit)
-    now = utc_now()
-    session, pending_items = _create_or_return_session(
-        db,
-        user=current_user,
-        session_type=payload.session_type,
-        limit=normalized_limit,
-        restart=payload.restart,
-        now=now,
-        daily_goal=payload.daily_goal,
-    )
-    db.commit()
-    if session is not None:
-        db.refresh(session)
-    return _session_create_response(
-        session,
-        session_type=payload.session_type,
-        limit=normalized_limit,
-        now=now,
-        items=pending_items,
-    )
+    with observed_operation("database", "review_session_create"):
+        normalized_limit = normalize_review_limit(payload.limit)
+        now = utc_now()
+        session, pending_items = _create_or_return_session(
+            db,
+            user=current_user,
+            session_type=payload.session_type,
+            limit=normalized_limit,
+            restart=payload.restart,
+            now=now,
+            daily_goal=payload.daily_goal,
+        )
+        db.commit()
+        if session is not None:
+            db.refresh(session)
+        return _session_create_response(
+            session,
+            session_type=payload.session_type,
+            limit=normalized_limit,
+            now=now,
+            items=pending_items,
+        )
 
 
 @router.post("/feedback", response_model=ReviewFeedbackResponse)
@@ -1174,6 +1277,15 @@ def submit_review_feedback(
     payload: ReviewFeedbackRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+) -> ReviewFeedbackResponse:
+    with observed_operation("database", "review_feedback"):
+        return _submit_review_feedback_observed(payload, db, current_user)
+
+
+def _submit_review_feedback_observed(
+    payload: ReviewFeedbackRequest,
+    db: Session,
+    current_user: User,
 ) -> ReviewFeedbackResponse:
     now = utc_now()
 
@@ -1347,8 +1459,10 @@ def submit_review_feedback(
         )
         db.add(log)
 
-        # Step 9: Mark session_item reviewed
-        item.status = "reviewed"
+        # The original production SQLite constraint accepts "done" but not the
+        # newer "reviewed" spelling. Keep reads backward-compatible and write
+        # the production-safe value.
+        item.status = "done"
         item.result = payload.result
         item.reviewed_at = payload.reviewed_at or now
         item.final_result = payload.result
@@ -1414,30 +1528,39 @@ def get_session_summary(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> SessionSummaryResponse:
-    session = db.scalar(
-        select(ReviewSession).where(
-            ReviewSession.id == session_id,
-            ReviewSession.user_id == current_user.id,
+    with observed_operation("database", "review_session_summary"):
+        session = db.scalar(
+            select(ReviewSession).where(
+                ReviewSession.id == session_id,
+                ReviewSession.user_id == current_user.id,
+            )
         )
-    )
-    if session is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+        if session is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
 
-    progress = _progress_response(session)
-    summary = _build_summary(db, session.id)
+        progress = _progress_response(session)
+        summary = _build_summary(db, session.id)
 
-    return SessionSummaryResponse(
-        session_id=session.id,
-        status=session.status,
-        progress=progress,
-        summary=summary,
-    )
+        return SessionSummaryResponse(
+            session_id=session.id,
+            status=session.status,
+            progress=progress,
+            summary=summary,
+        )
 
 
 @router.get("/today-reviewed", response_model=TodayReviewedResponse)
 def get_today_reviewed(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
+) -> TodayReviewedResponse:
+    with observed_operation("database", "review_today_reviewed"):
+        return _get_today_reviewed_observed(db, current_user)
+
+
+def _get_today_reviewed_observed(
+    db: Session,
+    current_user: User,
 ) -> TodayReviewedResponse:
     now = utc_now()
     today = _local_review_date(now, current_user.timezone)
@@ -1484,12 +1607,17 @@ def get_today_reviewed(
         select(
             Card.id.label("card_id"),
             Card.content,
+            Card.translation,
             Card.understanding,
             Card.note,
             Card.card_type,
             Card.exam_scene,
             Card.exam_module,
             Card.where_encountered,
+            Card.source_context,
+            Card.source_url,
+            Card.example_sentence,
+            Card.example_translation,
             today_logs.c.today_review_count,
             latest_log.c.result.label("last_result"),
             latest_log.c.reviewed_at.label("last_reviewed_at"),
@@ -1507,12 +1635,17 @@ def get_today_reviewed(
         TodayReviewedItem(
             card_id=row.card_id,
             content=row.content,
+            translation=row.translation,
             understanding=row.understanding or "",
             note=row.note or "",
             card_type=row.card_type,
             exam_scene=row.exam_scene,
             exam_module=row.exam_module,
             where_encountered=row.where_encountered,
+            source_context=row.source_context,
+            source_url=row.source_url,
+            example_sentence=row.example_sentence,
+            example_translation=row.example_translation,
             today_review_count=row.today_review_count,
             last_result=row.last_result,
             last_result_label=REVIEW_RESULT_LABELS[row.last_result],

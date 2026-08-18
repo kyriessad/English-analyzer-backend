@@ -72,9 +72,14 @@ class ReviewItemResponse(BaseModel):
     session_item_id: UUID
     card_id: UUID
     content: str
+    translation: str | None = None
     understanding: str | None = ""
     note: str | None = ""
     where_encountered: str | None = None
+    source_context: str | None = None
+    source_url: str | None = None
+    example_sentence: str | None = None
+    example_translation: str | None = None
     card_type: str
     review_state: ReviewState
     mastery_score: int
@@ -147,12 +152,17 @@ class ReviewHistoryItemResponse(BaseModel):
     review_log_id: UUID
     card_id: UUID
     content: str = ""
+    translation: str | None = None
     understanding: str | None = None
     note: str | None = None
     card_type: str | None = None
     exam_scene: str | None = None
     exam_module: str | None = None
     where_encountered: str | None = None
+    source_context: str | None = None
+    source_url: str | None = None
+    example_sentence: str | None = None
+    example_translation: str | None = None
     review_count_in_range: int
     last_result: ReviewResult
     last_result_label: str
@@ -208,12 +218,17 @@ class ReviewHistoryDetailCardResponse(BaseModel):
     id: UUID
     card_id: UUID
     content: str
+    translation: str | None = None
     understanding: str | None = None
     note: str | None = None
     card_type: str | None = None
     exam_scene: str | None = None
     exam_module: str | None = None
     where_encountered: str | None = None
+    source_context: str | None = None
+    source_url: str | None = None
+    example_sentence: str | None = None
+    example_translation: str | None = None
     review_state: str | None = None
     next_review_at: datetime | None = None
     card_source: str = "current_card"
@@ -233,12 +248,17 @@ class ReviewHistoryDetailResponse(BaseModel):
 class TodayReviewedItem(BaseModel):
     card_id: UUID
     content: str
+    translation: str | None = None
     understanding: str | None = ""
     note: str | None = ""
     card_type: str
     exam_scene: str | None = None
     exam_module: str | None = None
     where_encountered: str | None = None
+    source_context: str | None = None
+    source_url: str | None = None
+    example_sentence: str | None = None
+    example_translation: str | None = None
     today_review_count: int
     last_result: ReviewResult
     last_result_label: str

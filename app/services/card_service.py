@@ -1,3 +1,4 @@
+from datetime import datetime
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -7,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.models.card import Card
 from app.models.user import User, utc_now
-from app.schemas.card import CardCreate, CardUpdate
+from app.schemas.card import CardCreate, CardResponse, CardUpdate
 
 
 MAIN_REVIEW_STATES = ("new", "reviewing", "strengthening", "mastered")
@@ -27,18 +28,28 @@ def recompute_card_readiness(card: Card) -> Card:
     return card
 
 
-def get_card_or_404(db: Session, card_id: UUID, user_id: UUID | None = None) -> Card:
+def get_card_or_404(
+    db: Session,
+    card_id: UUID,
+    user_id: UUID | None = None,
+    *,
+    include_deleted: bool = False,
+    for_update: bool = False,
+) -> Card:
     filters = [Card.id == card_id]
     if user_id is not None:
         filters.append(Card.user_id == user_id)
 
-    card = db.scalar(select(Card).where(*filters))
-    if card is None or card.deleted_at is not None:
+    statement = select(Card).where(*filters)
+    if for_update:
+        statement = statement.with_for_update()
+    card = db.scalar(statement)
+    if card is None or (card.deleted_at is not None and not include_deleted):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Card not found")
     return card
 
 
-def create_card(db: Session, payload: CardCreate) -> Card:
+def create_card_in_transaction(db: Session, payload: CardCreate) -> Card:
     if db.get(User, payload.user_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
@@ -47,7 +58,6 @@ def create_card(db: Session, payload: CardCreate) -> Card:
             select(Card).where(
                 Card.user_id == payload.user_id,
                 Card.local_temp_id == payload.local_temp_id,
-                Card.deleted_at.is_(None),
             )
         )
         if existing_card is not None:
@@ -66,6 +76,10 @@ def create_card(db: Session, payload: CardCreate) -> Card:
         understanding=payload.understanding,
         note=payload.note,
         where_encountered=payload.where_encountered,
+        source_context=payload.source_context,
+        source_url=payload.source_url,
+        example_sentence=payload.example_sentence,
+        example_translation=payload.example_translation,
         translation=payload.translation,
         analysis_status=payload.analysis_status,
         analysis_level=payload.analysis_level,
@@ -81,8 +95,13 @@ def create_card(db: Session, payload: CardCreate) -> Card:
     )
     recompute_card_readiness(card)
     db.add(card)
+    db.flush()
+    return card
 
+
+def create_card(db: Session, payload: CardCreate) -> Card:
     try:
+        card = create_card_in_transaction(db, payload)
         db.commit()
     except IntegrityError as exc:
         db.rollback()
@@ -91,7 +110,6 @@ def create_card(db: Session, payload: CardCreate) -> Card:
                 select(Card).where(
                     Card.user_id == payload.user_id,
                     Card.local_temp_id == payload.local_temp_id,
-                    Card.deleted_at.is_(None),
                 )
             )
             if existing_card is not None:
@@ -106,41 +124,22 @@ def create_card(db: Session, payload: CardCreate) -> Card:
     return card
 
 
-def list_cards(
-    db: Session,
-    *,
-    user_id: UUID | None = None,
-    keyword: str | None = None,
-    limit: int = 20,
-    offset: int = 0,
-    status_filter: str = "active",
-) -> tuple[list[Card], int]:
-    filters = [Card.deleted_at.is_(None)]
-    if status_filter:
-        filters.append(Card.status == status_filter)
-    if user_id is not None:
-        filters.append(Card.user_id == user_id)
-
-    keyword_normalized = normalize_card_content(keyword) if keyword else None
-    if keyword_normalized:
-        filters.append(Card.content_normalized.contains(keyword_normalized))
-
-    total = db.scalar(select(func.count()).select_from(Card).where(*filters)) or 0
-    cards = list(
-        db.scalars(
-            select(Card)
-            .where(*filters)
-            .order_by(Card.created_at.desc(), Card.id)
-            .offset(offset)
-            .limit(limit)
-        )
+def raise_card_version_conflict(card: Card) -> None:
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "card_version_conflict",
+            "message": "Card was changed on another device.",
+            "server_card": CardResponse.model_validate(card).model_dump(mode="json"),
+        },
     )
-    return cards, total
 
 
-def update_card(db: Session, card_id: UUID, user_id: UUID, payload: CardUpdate) -> Card:
-    card = get_card_or_404(db, card_id, user_id)
+def apply_card_update(card: Card, payload: CardUpdate) -> Card:
     update_data = payload.model_dump(exclude_unset=True)
+    expected_version = update_data.pop("base_version", None)
+    if expected_version is not None and card.version != expected_version:
+        raise_card_version_conflict(card)
 
     if update_data.get("content") is not None and update_data["content"] != card.content:
         card.content = update_data["content"]
@@ -152,7 +151,14 @@ def update_card(db: Session, card_id: UUID, user_id: UUID, payload: CardUpdate) 
         "translation",
         "note",
         "where_encountered",
+        "source_context",
+        "source_url",
+        "example_sentence",
+        "example_translation",
         "analysis_status",
+        "analysis_level",
+        "analysis_messages",
+        "understanding_source",
         "card_type",
         "exam_scene",
         "exam_module",
@@ -161,6 +167,60 @@ def update_card(db: Session, card_id: UUID, user_id: UUID, payload: CardUpdate) 
             setattr(card, field, update_data[field])
 
     recompute_card_readiness(card)
+    return card
+
+
+def list_cards(
+    db: Session,
+    *,
+    user_id: UUID | None = None,
+    keyword: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+    status_filter: str = "active",
+    review_state: str | None = None,
+    include_deleted: bool = False,
+    updated_since: datetime | None = None,
+) -> tuple[list[Card], int]:
+    # Incremental sync: return every card whose updated_at is after the cursor,
+    # including soft-deleted tombstones (updated_at bumps on delete via status change).
+    incremental = updated_since is not None
+
+    filters = []
+    if incremental:
+        filters.append(Card.updated_at > updated_since)
+    else:
+        if not include_deleted:
+            filters.append(Card.deleted_at.is_(None))
+        if status_filter and not include_deleted:
+            filters.append(Card.status == status_filter)
+    if user_id is not None:
+        filters.append(Card.user_id == user_id)
+    if review_state and not incremental:
+        filters.append(Card.review_state == review_state)
+
+    keyword_normalized = normalize_card_content(keyword) if keyword else None
+    if keyword_normalized:
+        filters.append(Card.content_normalized.contains(keyword_normalized))
+
+    total = db.scalar(select(func.count()).select_from(Card).where(*filters)) or 0
+
+    order_by = (Card.updated_at.asc(), Card.id) if incremental else (Card.created_at.desc(), Card.id)
+    cards = list(
+        db.scalars(
+            select(Card)
+            .where(*filters)
+            .order_by(*order_by)
+            .offset(offset)
+            .limit(limit)
+        )
+    )
+    return cards, total
+
+
+def update_card(db: Session, card_id: UUID, user_id: UUID, payload: CardUpdate) -> Card:
+    card = get_card_or_404(db, card_id, user_id, for_update=True)
+    apply_card_update(card, payload)
 
     try:
         db.commit()
@@ -210,10 +270,22 @@ def get_cards_stats(db: Session, user_id: UUID) -> dict[str, int]:
     }
 
 
-def delete_card(db: Session, card_id: UUID, user_id: UUID) -> Card:
-    card = get_card_or_404(db, card_id, user_id)
+def soft_delete_card(card: Card, base_version: int | None = None) -> Card:
+    if base_version is not None and card.version != base_version:
+        raise_card_version_conflict(card)
     card.status = "deleted"
     card.deleted_at = utc_now()
+    return card
+
+
+def delete_card(
+    db: Session,
+    card_id: UUID,
+    user_id: UUID,
+    base_version: int | None = None,
+) -> Card:
+    card = get_card_or_404(db, card_id, user_id, for_update=True)
+    soft_delete_card(card, base_version)
     db.commit()
     db.refresh(card)
     return card

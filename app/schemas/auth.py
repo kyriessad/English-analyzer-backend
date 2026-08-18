@@ -39,5 +39,12 @@ class WechatLoginResponse(BaseModel):
 
 
 class CurrentUserResponse(AuthUserResponse):
+    email: str | None = None
+    username: str | None = None
+    role: str = "user"
+    account_status: str = "active"
+    email_verified: bool = False
+    daily_goal: int = 5
+    pronunciation_voice: str = "male"
     created_at: str
     last_login_at: str | None = None

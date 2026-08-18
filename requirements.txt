@@ -11,5 +11,9 @@ httpx
 PyJWT
 sqlalchemy>=2.0
 alembic>=1.13
-psycopg2-binary>=2.9
+psycopg[binary]>=3.1,<4
 tzdata>=2024.1
+piper-tts==1.4.2
+prometheus-client>=0.20,<1
+opentelemetry-api>=1.26,<2
+opentelemetry-sdk>=1.26,<2

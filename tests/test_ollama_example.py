@@ -63,7 +63,7 @@ class OllamaExampleTest(unittest.TestCase):
         self.assertFalse(payload["stream"])
         self.assertFalse(payload["think"])
         self.assertEqual(payload["options"]["temperature"], 0.3)
-        self.assertEqual(payload["options"]["num_predict"], 220)
+        self.assertEqual(payload["options"]["num_predict"], 512)
         self.assertIsInstance(payload["format"], dict)
         timeout_val = post.call_args.kwargs["timeout"]
         self.assertGreater(timeout_val, 0)
@@ -414,6 +414,114 @@ class OllamaChineseTranslationTest(unittest.TestCase):
             result = generate_example_with_ollama("crave")
             self.assertEqual(result, ("She craves quiet mornings.", None))
             argos.assert_called_once_with("She craves quiet mornings.")
+
+
+class OllamaExpressionAnalysisTest(unittest.TestCase):
+    """Expression analysis: expressionType + alternativeMeanings parsing."""
+
+    def setUp(self):
+        self.settings = SimpleNamespace(
+            ollama_base_url="http://127.0.0.1:11434",
+            ollama_model="qwen3:8b",
+            ollama_timeout_seconds=60,
+            ollama_temperature=0.3,
+            ollama_think=False,
+        )
+        self.settings_patch = patch("app.services.ollama_example.settings", self.settings)
+        self.settings_patch.start()
+
+    def tearDown(self):
+        self.settings_patch.stop()
+
+    def _body(self, extra):
+        payload = {
+            "meaning": "渴望",
+            "exampleSentence": "She craves quiet mornings.",
+            "exampleTranslation": "她渴望安静的早晨。",
+        }
+        payload.update(extra)
+        return FakeResponse(200, {"response": json.dumps(payload)})
+
+    def test_expression_type_and_alternatives_parsed(self):
+        from app.services.ollama_example import generate_analysis_with_ollama
+
+        body = self._body({
+            "expressionType": "idiom",
+            "alternativeMeanings": [
+                {"meaning": "祝你好运", "type": "literal", "note": "字面意思是摔断腿"},
+            ],
+        })
+        with patch("app.services.ollama_example.requests.post", return_value=body):
+            result = generate_analysis_with_ollama("crave")
+
+        self.assertEqual(result["expressionType"], "idiom")
+        self.assertEqual(len(result["alternativeMeanings"]), 1)
+        self.assertEqual(result["alternativeMeanings"][0]["meaning"], "祝你好运")
+        self.assertEqual(result["alternativeMeanings"][0]["type"], "literal")
+
+    def test_alternatives_truncated_to_two(self):
+        from app.services.ollama_example import generate_analysis_with_ollama
+
+        body = self._body({
+            "alternativeMeanings": [
+                {"meaning": "含义一"},
+                {"meaning": "含义二"},
+                {"meaning": "含义三"},
+            ],
+        })
+        with patch("app.services.ollama_example.requests.post", return_value=body):
+            result = generate_analysis_with_ollama("crave")
+
+        self.assertEqual(len(result["alternativeMeanings"]), 2)
+
+    def test_non_chinese_alternative_meaning_is_dropped(self):
+        from app.services.ollama_example import generate_analysis_with_ollama
+
+        body = self._body({
+            "alternativeMeanings": [
+                {"meaning": "That's cold", "type": "literal", "note": "physical cold"},
+                {"meaning": "太狠了", "type": "colloquial", "note": "形容无情"},
+            ],
+        })
+        with patch("app.services.ollama_example.requests.post", return_value=body):
+            result = generate_analysis_with_ollama("crave")
+
+        self.assertEqual(len(result["alternativeMeanings"]), 1)
+        self.assertEqual(result["alternativeMeanings"][0]["meaning"], "太狠了")
+
+    def test_unknown_expression_type_normalized_to_literal(self):
+        from app.services.ollama_example import generate_analysis_with_ollama
+
+        body = self._body({"expressionType": "weird_category"})
+        with patch("app.services.ollama_example.requests.post", return_value=body):
+            result = generate_analysis_with_ollama("crave")
+
+        self.assertEqual(result["expressionType"], "literal")
+
+    def test_missing_expression_fields_default_to_literal_empty(self):
+        from app.services.ollama_example import generate_analysis_with_ollama
+
+        body = self._body({})  # old shape: no expressionType / alternativeMeanings
+        with patch("app.services.ollama_example.requests.post", return_value=body):
+            result = generate_analysis_with_ollama("crave")
+
+        self.assertEqual(result["expressionType"], "literal")
+        self.assertEqual(result["alternativeMeanings"], [])
+
+    def test_old_fields_still_present(self):
+        from app.services.ollama_example import generate_analysis_with_ollama
+
+        body = self._body({
+            "synonyms": [{"english": "long for", "chinese": "渴望"}],
+            "similarPhrases": [{"english": "hunger for", "chinese": "渴望"}],
+        })
+        with patch("app.services.ollama_example.requests.post", return_value=body):
+            result = generate_analysis_with_ollama("crave")
+
+        self.assertEqual(result["meaning"], "渴望")
+        self.assertEqual(result["exampleSentence"], "She craves quiet mornings.")
+        self.assertEqual(result["synonyms"], [{"english": "long for", "chinese": "渴望"}])
+        self.assertEqual(result["similarPhrases"], [{"english": "hunger for", "chinese": "渴望"}])
 
 
 if __name__ == "__main__":

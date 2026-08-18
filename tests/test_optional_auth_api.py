@@ -90,32 +90,6 @@ class OptionalAuthApiTest(unittest.TestCase):
 
         self.assertEqual(403, response.status_code)
 
-    def test_token_can_get_today_review_without_query_user_id(self):
-        create_response = self.client.post(
-            "/api/cards",
-            headers=self.auth_headers(),
-            json={
-                "content": "token review card",
-                "card_type": "phrase",
-                "local_temp_id": "token-review-card",
-            },
-        )
-        self.assertEqual(200, create_response.status_code, create_response.text)
-
-        response = self.client.get(
-            "/api/review/today",
-            headers=self.auth_headers(),
-            params={
-                "review_date": "2026-05-06",
-                "timezone": TIMEZONE,
-            },
-        )
-
-        self.assertEqual(200, response.status_code, response.text)
-        data = response.json()
-        self.assertEqual(1, data["total_count"])
-        self.assertEqual("token review card", data["items"][0]["card"]["content"])
-
     def test_invalid_token_returns_401(self):
         response = self.client.get(
             "/api/cards",

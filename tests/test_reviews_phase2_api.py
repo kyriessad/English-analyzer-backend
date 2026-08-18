@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 from uuid import UUID, uuid4
 import unittest
+from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, select, update
@@ -1633,11 +1634,16 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
         card_id = self.create_card(
             content="snapshot test content",
             content_normalized="snapshot test content",
+            translation="快照参考释义",
             understanding="my understanding",
             note="my note",
             card_type="sentence",
             exam_scene="exam scene",
             exam_module="exam module",
+            source_context="The full sentence that originally contained the expression.",
+            source_url="https://example.com/source?t=30",
+            example_sentence="This is a structured example sentence.",
+            example_translation="这是一个结构化例句。",
             analysis_status="done",
             analysis_level="pass",
         )
@@ -1645,6 +1651,7 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
             "/api/reviews/today?limit=5&restart=true", headers=self.auth_headers()
         ).json()
         item = today["items"][0]
+        self.assertEqual("快照参考释义", item["translation"])
 
         client_action_id = str(uuid4())
         resp = self.client.post(
@@ -1666,11 +1673,22 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
             self.assertIsNotNone(log.card_snapshot)
             s = log.card_snapshot
             self.assertEqual("snapshot test content", s.get("content"))
+            self.assertEqual("快照参考释义", s.get("translation"))
             self.assertEqual("my understanding", s.get("understanding"))
             self.assertEqual("my note", s.get("note"))
             self.assertEqual("sentence", s.get("card_type"))
             self.assertEqual("exam scene", s.get("exam_scene"))
             self.assertEqual("exam module", s.get("exam_module"))
+            self.assertEqual(
+                "The full sentence that originally contained the expression.",
+                s.get("source_context"),
+            )
+            self.assertEqual("https://example.com/source?t=30", s.get("source_url"))
+            self.assertEqual(
+                "This is a structured example sentence.",
+                s.get("example_sentence"),
+            )
+            self.assertEqual("这是一个结构化例句。", s.get("example_translation"))
             self.assertEqual("done", s.get("analysis_status"))
             self.assertEqual("pass", s.get("analysis_level"))
             self.assertEqual(str(card_id), s.get("card_id"))
@@ -1683,11 +1701,16 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
         card_id = self.create_card(
             content="original content",
             content_normalized="original content",
+            translation="original translation",
             understanding="original understanding",
             note="original note",
             card_type="word",
             exam_scene="original scene",
             exam_module="original module",
+            source_context="original source context",
+            source_url="https://example.com/original",
+            example_sentence="original example sentence",
+            example_translation="原始例句翻译",
             analysis_status="done",
             analysis_level="pass",
         )
@@ -1714,11 +1737,16 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
         with TestingSessionLocal() as db:
             card = db.get(Card, card_id)
             card.content = "edited content"
+            card.translation = "edited translation"
             card.understanding = "edited understanding"
             card.note = "edited note"
             card.card_type = "phrase"
             card.exam_scene = "edited scene"
             card.exam_module = "edited module"
+            card.source_context = "edited source context"
+            card.source_url = "https://example.com/edited"
+            card.example_sentence = "edited example sentence"
+            card.example_translation = "编辑后的例句翻译"
             db.commit()
 
         # Query history list
@@ -1733,11 +1761,16 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
         self.assertEqual(1, len(found))
         item_data = found[0]
         self.assertEqual("original content", item_data["content"])
+        self.assertEqual("original translation", item_data["translation"])
         self.assertEqual("original understanding", item_data["understanding"])
         self.assertEqual("original note", item_data["note"])
         self.assertEqual("word", item_data["card_type"])
         self.assertEqual("original scene", item_data["exam_scene"])
         self.assertEqual("original module", item_data["exam_module"])
+        self.assertEqual("original source context", item_data["source_context"])
+        self.assertEqual("https://example.com/original", item_data["source_url"])
+        self.assertEqual("original example sentence", item_data["example_sentence"])
+        self.assertEqual("原始例句翻译", item_data["example_translation"])
         self.assertEqual("snapshot", item_data["card_source"])
 
     def test_history_detail_returns_snapshot_after_card_edit(self):
@@ -1745,11 +1778,16 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
         card_id = self.create_card(
             content="detail original",
             content_normalized="detail original",
+            translation="detail original translation",
             understanding="detail understanding",
             note="detail note",
             card_type="word",
             exam_scene="detail scene",
             exam_module="detail module",
+            source_context="detail source context",
+            source_url="https://example.com/detail",
+            example_sentence="detail example sentence",
+            example_translation="详情例句翻译",
             analysis_status="done",
             analysis_level="pass",
         )
@@ -1781,8 +1819,13 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
         with TestingSessionLocal() as db:
             card = db.get(Card, card_id)
             card.content = "edited detail"
+            card.translation = "edited detail translation"
             card.understanding = "edited understanding"
             card.note = "edited note"
+            card.source_context = "edited detail source context"
+            card.source_url = "https://example.com/detail-edited"
+            card.example_sentence = "edited detail example sentence"
+            card.example_translation = "编辑后的详情例句翻译"
             db.commit()
 
         # Query history detail
@@ -1794,8 +1837,13 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
         data = detail.json()
         self.assertIsNotNone(data["card"])
         self.assertEqual("detail original", data["card"]["content"])
+        self.assertEqual("detail original translation", data["card"]["translation"])
         self.assertEqual("detail understanding", data["card"]["understanding"])
         self.assertEqual("detail note", data["card"]["note"])
+        self.assertEqual("detail source context", data["card"]["source_context"])
+        self.assertEqual("https://example.com/detail", data["card"]["source_url"])
+        self.assertEqual("detail example sentence", data["card"]["example_sentence"])
+        self.assertEqual("详情例句翻译", data["card"]["example_translation"])
         self.assertEqual("snapshot", data["card"]["card_source"])
         # Scheduling fields should be null for snapshot
         self.assertIsNone(data["card"]["review_state"])
@@ -2017,6 +2065,10 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
         card_id = self.create_card(
             content="no source",
             content_normalized="no source",
+            source_context="current context must not leak into an old snapshot",
+            source_url="https://example.com/current",
+            example_sentence="Current example must not leak.",
+            example_translation="当前例句不能泄漏到旧快照。",
         )
         now = datetime(2026, 5, 10, 12, 0, tzinfo=timezone.utc)
 
@@ -2088,6 +2140,23 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
         d = detail.json()
         self.assertIsNotNone(d["card"])
         self.assertIsNone(d["card"]["where_encountered"])
+        self.assertIsNone(d["card"]["source_context"])
+        self.assertIsNone(d["card"]["source_url"])
+        self.assertIsNone(d["card"]["example_sentence"])
+        self.assertIsNone(d["card"]["example_translation"])
+
+        history = self.client.get(
+            "/api/reviews/history?limit=20",
+            headers=self.auth_headers(),
+        )
+        self.assertEqual(200, history.status_code, history.text)
+        history_item = next(
+            item for item in history.json()["items"] if item["card_id"] == str(card_id)
+        )
+        self.assertIsNone(history_item["source_context"])
+        self.assertIsNone(history_item["source_url"])
+        self.assertIsNone(history_item["example_sentence"])
+        self.assertIsNone(history_item["example_translation"])
 
     def test_history_detail_card_where_encountered_null_when_not_set(self):
         """History detail returns null when Card.where_encountered is not set."""
@@ -2339,7 +2408,15 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
     # ===== Phase 6P-later-1: goal_progress tests =====
 
     def _today_noon_utc(self):
-        return datetime.now(timezone.utc).replace(hour=12, minute=0, second=0, microsecond=0)
+        local_zone = ZoneInfo("Asia/Shanghai")
+        local_now = datetime.now(local_zone)
+        local_noon = local_now.replace(
+            hour=12,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        return local_noon.astimezone(timezone.utc)
 
     def test_goal_progress_default_daily_goal(self):
         self.create_card(content="gp default", content_normalized="gp default")
@@ -3232,6 +3309,10 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
             content="look forward to",
             content_normalized="look forward to",
             where_encountered="NBA 解说",
+            source_context="Fans look forward to the playoffs every year.",
+            source_url="https://example.com/nba",
+            example_sentence="I look forward to hearing from you.",
+            example_translation="我期待收到你的回复。",
         )
 
         response = self.client.post(
@@ -3244,6 +3325,13 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
         items = response.json()["items"]
         self.assertEqual(1, len(items))
         self.assertEqual("NBA 解说", items[0]["where_encountered"])
+        self.assertEqual(
+            "Fans look forward to the playoffs every year.",
+            items[0]["source_context"],
+        )
+        self.assertEqual("https://example.com/nba", items[0]["source_url"])
+        self.assertEqual("I look forward to hearing from you.", items[0]["example_sentence"])
+        self.assertEqual("我期待收到你的回复。", items[0]["example_translation"])
 
     def test_review_session_item_where_encountered_is_null_when_not_set(self):
         self.create_card(content="look up", content_normalized="look up")
@@ -3524,6 +3612,10 @@ class TodayReviewedApiTest(unittest.TestCase):
             content="clutch",
             understanding="关键时刻顶得住",
             where_encountered="NBA解说",
+            source_context="He made a clutch shot with two seconds left.",
+            source_url="https://example.com/highlights?t=118",
+            example_sentence="She delivered a clutch performance in the final.",
+            example_translation="她在决赛中上演了关键表现。",
         )
         self.create_review_log(card, "got_it", now)
 
@@ -3531,6 +3623,16 @@ class TodayReviewedApiTest(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         item = response.json()["items"][0]
         self.assertEqual("NBA解说", item["where_encountered"])
+        self.assertEqual(
+            "He made a clutch shot with two seconds left.",
+            item["source_context"],
+        )
+        self.assertEqual("https://example.com/highlights?t=118", item["source_url"])
+        self.assertEqual(
+            "She delivered a clutch performance in the final.",
+            item["example_sentence"],
+        )
+        self.assertEqual("她在决赛中上演了关键表现。", item["example_translation"])
 
     def test_where_encountered_null_when_not_set(self):
         now = self._now()

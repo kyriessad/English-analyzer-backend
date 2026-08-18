@@ -4,7 +4,7 @@ from uuid import UUID
 
 import httpx
 import jwt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -140,17 +140,32 @@ def login_with_wechat_code(db: Session, code: str, timezone_name: str = DEFAULT_
     )
 
 
+def _ensure_user_can_authenticate(user: User) -> User:
+    if user.account_status != "active" or user.deleted_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is not active",
+        )
+    return user
+
+
 def get_current_user(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     db: Session = Depends(get_db),
 ) -> User:
-    if credentials is None or credentials.scheme.lower() != "bearer":
+    if credentials is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing bearer token",
             headers={"WWW-Authenticate": "Bearer"},
         )
-
+    if credentials.scheme.lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unsupported authorization scheme",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     user_id = decode_access_token(credentials.credentials)
     user = db.get(User, user_id)
     if user is None:
@@ -159,13 +174,5 @@ def get_current_user(
             detail="User not found",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return user
-
-
-def get_current_user_optional(
-    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
-    db: Session = Depends(get_db),
-) -> User | None:
-    if credentials is None:
-        return None
-    return get_current_user(credentials, db)
+    request.state.auth_scheme = "bearer"
+    return _ensure_user_can_authenticate(user)

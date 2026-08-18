@@ -18,10 +18,14 @@ Current local stack:
 
 - WeChat DevTools
 - FastAPI at `http://127.0.0.1:8000`
-- SQLite at `sqlite:///./english_analyzer.db`
+- PostgreSQL at the password-redacted target selected by `DATABASE_URL`
 - Argos Translate for English to Simplified Chinese translation
 - Ollama local API at `http://127.0.0.1:11434`
 - `qwen3:8b` for word/phrase example sentence generation
+
+PostgreSQL is the formal runtime database. MySQL is not planned. SQLite is
+retained only inside explicitly isolated tests and must not be used as evidence
+that the PostgreSQL schema is current.
 
 Tencent TMT and Hunyuan implementation files are retained as legacy optional providers, but the default local flow does not call them. Rollback requires explicit configuration:
 
@@ -65,9 +69,15 @@ Start the backend:
 .\scripts\start-local-backend.ps1
 ```
 
+The start script first runs a password-free database preflight. It prints the
+dialect, host, port, database, schema, current user, configuration source and
+Alembic revision. Startup stops if the target is not the approved PostgreSQL
+database or is not at the required revision.
+
 Equivalent manual command:
 
 ```powershell
+.\.venv\Scripts\python.exe scripts\check_database_target.py
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
@@ -109,8 +119,25 @@ Common faults:
 - Frontend still requests production: remove or update ignored `utils/localBackendConfig.js` and confirm `utils/apiClient.js`.
 - Analyze request timeout: only the Mini Program analyze endpoint timeout is 60s; other API timeouts are unchanged.
 - WeChat login fails: check `WECHAT_APPID`, `WECHAT_SECRET`, and `JWT_SECRET_KEY`; do not commit them.
-- SQLite file location: `English-analyzer-backend\english_analyzer.db`.
+- Database preflight rejects an accidental SQLite target outside explicit test mode.
 - Confirm no Tencent calls: default `.env.example` has `ENABLE_TENCENT_TMT=false`, `ENABLE_HUNYUAN=false`; tests patch and assert legacy providers are not called.
+
+## Level 1 observability
+
+This backend exposes minimal single-node observability without Grafana, Jaeger,
+Loki, Redis or Docker:
+
+- Logs: stdout JSON lines. Each request has `request_id`; a valid incoming
+  `X-Request-ID` is preserved, otherwise the server generates one.
+- Metrics: open `http://127.0.0.1:8000/metrics` for Prometheus text metrics.
+  Core series include `http_request_duration_seconds`,
+  `http_requests_total`, `ai_requests_total`, `ai_cache_events_total`,
+  `tts_cache_events_total`, `db_operations_total` and
+  `component_operations_total`.
+- Traces: OpenTelemetry spans are printed to stdout by the console exporter
+  when `TRACING_ENABLED=true` and `opentelemetry-api` /
+  `opentelemetry-sdk` are installed. Spans include `request_id` so they can be
+  matched with logs and metrics labels.
 
 这是微信英语学习小程序后续用于英文内容检测、腾讯云机器翻译 TMT 翻译和“我的理解”生成的 Python FastAPI 后端。当前版本是最小可运行框架，后续可由微信云函数转发调用。
 

@@ -4,6 +4,9 @@ from sqlalchemy import engine_from_config
 from sqlalchemy import pool
 
 from alembic import context
+# Importing settings first loads the repository .env using the same precedence
+# rules as FastAPI. app.database then validates and exposes that exact URL.
+from app.core.config import settings  # noqa: F401
 from app.database import Base, DATABASE_URL
 import app.models  # noqa: F401
 

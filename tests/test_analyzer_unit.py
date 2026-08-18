@@ -13,7 +13,7 @@ class AnalyzerExampleGateTest(unittest.TestCase):
     """
 
     def _call(self, text, translation_ok=True, translation_value="测试中文"):
-        """Run analyze_text with controlled translator and Hunyuan mocks."""
+        """Run analyze_text with controlled translator and Ollama mocks."""
         from app.services.analyzer import analyze_text
 
         translation_result = (
@@ -27,79 +27,78 @@ class AnalyzerExampleGateTest(unittest.TestCase):
             patch("app.services.analyzer.set_cache"),
             patch("app.services.analyzer.translate_to_zh", return_value=translation_result),
             patch("app.services.analyzer.generate_understanding", return_value="mocked understanding"),
-            patch("app.services.analyzer.generate_example_with_ollama") as mock_hunyuan,
+            patch("app.services.analyzer.generate_analysis_with_ollama", return_value=None) as mock_ollama,
             patch("app.services.analyzer._generate_example_with_tmt") as mock_tmt,
         ):
-            mock_hunyuan.return_value = (None, None)
             mock_tmt.return_value = (None, None)
             result = analyze_text(text)
-            return result, mock_hunyuan, mock_tmt
+            return result, mock_ollama, mock_tmt
 
     # ------------------------------------------------------------------
     # Word + translation available
     # ------------------------------------------------------------------
 
-    def test_word_with_translation_calls_hunyuan(self):
-        result, mock_hunyuan, mock_tmt = self._call("apply", translation_ok=True)
+    def test_word_with_translation_calls_ollama(self):
+        result, mock_ollama, mock_tmt = self._call("apply", translation_ok=True)
         self.assertEqual(result["category"], "word")
-        mock_hunyuan.assert_called_once_with("apply", "测试中文")
+        mock_ollama.assert_called_once_with("apply", "word")
 
     def test_word_with_translation_does_not_call_tmt_by_default(self):
-        result, mock_hunyuan, mock_tmt = self._call("apply", translation_ok=True)
+        result, mock_ollama, mock_tmt = self._call("apply", translation_ok=True)
         mock_tmt.assert_not_called()
 
     # ------------------------------------------------------------------
     # Word + translation unavailable (the new gate-removal behavior)
     # ------------------------------------------------------------------
 
-    def test_word_without_translation_still_calls_hunyuan(self):
-        """Hunyuan must be attempted even when translation failed."""
-        result, mock_hunyuan, mock_tmt = self._call("apply", translation_ok=False)
+    def test_word_without_translation_still_calls_ollama(self):
+        """Ollama must be attempted even when translation failed."""
+        result, mock_ollama, mock_tmt = self._call("apply", translation_ok=False)
         self.assertEqual(result["category"], "word")
-        mock_hunyuan.assert_called_once_with("apply", None)
+        mock_ollama.assert_called_once_with("apply", "word")
 
     def test_word_without_translation_skips_tmt(self):
         """TMT needs a translation to build template sentences — must be skipped."""
-        result, mock_hunyuan, mock_tmt = self._call("apply", translation_ok=False)
+        result, mock_ollama, mock_tmt = self._call("apply", translation_ok=False)
         mock_tmt.assert_not_called()
 
     # ------------------------------------------------------------------
     # Phrase
     # ------------------------------------------------------------------
 
-    def test_phrase_without_translation_calls_hunyuan(self):
-        result, mock_hunyuan, mock_tmt = self._call("give up", translation_ok=False)
+    def test_phrase_without_translation_calls_ollama(self):
+        result, mock_ollama, mock_tmt = self._call("give up", translation_ok=False)
         self.assertEqual(result["category"], "phrase")
-        mock_hunyuan.assert_called_once_with("give up", None)
+        mock_ollama.assert_called_once_with("give up", "phrase")
 
     def test_phrase_without_translation_skips_tmt(self):
-        result, mock_hunyuan, mock_tmt = self._call("give up", translation_ok=False)
+        result, mock_ollama, mock_tmt = self._call("give up", translation_ok=False)
         mock_tmt.assert_not_called()
 
     # ------------------------------------------------------------------
-    # Sentence — must NOT generate examples (product semantic preserved)
+    # Sentence — now prefers Ollama (word/phrase/sentence unified)
     # ------------------------------------------------------------------
 
-    def test_sentence_never_calls_hunyuan(self):
-        result, mock_hunyuan, mock_tmt = self._call(
+    def test_sentence_calls_ollama(self):
+        result, mock_ollama, mock_tmt = self._call(
             "I love English.", translation_ok=True
         )
         self.assertEqual(result["category"], "sentence")
-        mock_hunyuan.assert_not_called()
+        mock_ollama.assert_called_once_with("I love English.", "sentence")
         mock_tmt.assert_not_called()
 
-    def test_sentence_without_translation_never_calls_hunyuan(self):
-        result, mock_hunyuan, mock_tmt = self._call(
+    def test_sentence_without_translation_calls_ollama(self):
+        result, mock_ollama, mock_tmt = self._call(
             "I love English.", translation_ok=False
         )
         self.assertEqual(result["category"], "sentence")
-        mock_hunyuan.assert_not_called()
+        mock_ollama.assert_called_once_with("I love English.", "sentence")
 
     # ------------------------------------------------------------------
     # Hunyuan success propagates to response
     # ------------------------------------------------------------------
 
-    def test_hunyuan_result_returned_in_response(self):
+    def test_ollama_result_returned_in_response(self):
         from app.services.analyzer import analyze_text
         with (
             patch("app.services.analyzer.get_cache", return_value=None),
@@ -107,8 +106,14 @@ class AnalyzerExampleGateTest(unittest.TestCase):
             patch("app.services.analyzer.translate_to_zh",
                   return_value={"ok": False, "translation": None, "provider": None}),
             patch("app.services.analyzer.generate_understanding", return_value="u"),
-            patch("app.services.analyzer.generate_example_with_ollama",
-                  return_value=("She craves success.", "她渴望成功。")),
+            patch("app.services.analyzer.generate_analysis_with_ollama",
+                  return_value={
+                      "meaning": None,
+                      "exampleSentence": "She craves success.",
+                      "exampleTranslation": "她渴望成功。",
+                      "synonyms": [],
+                      "similarPhrases": [],
+                  }),
             patch("app.services.analyzer._generate_example_with_tmt",
                   return_value=(None, None)),
         ):
@@ -217,36 +222,35 @@ class HyphenatedWordExampleChainTest(unittest.TestCase):
             patch("app.services.analyzer.translate_to_zh",
                   return_value={"ok": True, "translation": "测试", "provider": "tencent"}),
             patch("app.services.analyzer.generate_understanding", return_value="u"),
-            patch("app.services.analyzer.generate_example_with_ollama") as mock_hunyuan,
+            patch("app.services.analyzer.generate_analysis_with_ollama", return_value=None) as mock_ollama,
             patch("app.services.analyzer._generate_example_with_tmt") as mock_tmt,
         ):
-            mock_hunyuan.return_value = (None, None)
             mock_tmt.return_value = (None, None)
             result = analyze_text(text)
-            return result, mock_hunyuan, mock_tmt
+            return result, mock_ollama, mock_tmt
 
-    def test_well_known_calls_hunyuan(self):
-        result, mock_hunyuan, _ = self._call_with_mocks("well-known")
+    def test_well_known_calls_ollama(self):
+        result, mock_ollama, _ = self._call_with_mocks("well-known")
         self.assertEqual(result["category"], "word")
-        mock_hunyuan.assert_called_once_with("well-known", "测试")
+        mock_ollama.assert_called_once_with("well-known", "word")
 
-    def test_full_time_calls_hunyuan(self):
-        result, mock_hunyuan, _ = self._call_with_mocks("full-time")
+    def test_full_time_calls_ollama(self):
+        result, mock_ollama, _ = self._call_with_mocks("full-time")
         self.assertEqual(result["category"], "word")
-        mock_hunyuan.assert_called_once()
+        mock_ollama.assert_called_once()
 
-    def test_follow_up_calls_hunyuan(self):
-        result, mock_hunyuan, _ = self._call_with_mocks("follow-up")
+    def test_follow_up_calls_ollama(self):
+        result, mock_ollama, _ = self._call_with_mocks("follow-up")
         self.assertEqual(result["category"], "word")
-        mock_hunyuan.assert_called_once()
+        mock_ollama.assert_called_once()
 
-    def test_covid19_calls_hunyuan(self):
-        """Phase 8I: COVID-19 is now classified as word and enters Hunyuan."""
-        result, mock_hunyuan, _ = self._call_with_mocks("COVID-19")
+    def test_covid19_calls_ollama(self):
+        """Phase 8I: COVID-19 is now classified as word and enters Ollama."""
+        result, mock_ollama, _ = self._call_with_mocks("COVID-19")
         self.assertEqual(result["category"], "word")
-        mock_hunyuan.assert_called_once()
+        mock_ollama.assert_called_once()
 
-    def test_hyphenated_word_hunyuan_result_propagated(self):
+    def test_hyphenated_word_ollama_result_propagated(self):
         from app.services.analyzer import analyze_text
 
         with (
@@ -255,8 +259,14 @@ class HyphenatedWordExampleChainTest(unittest.TestCase):
             patch("app.services.analyzer.translate_to_zh",
                   return_value={"ok": True, "translation": "全职", "provider": "tencent"}),
             patch("app.services.analyzer.generate_understanding", return_value="u"),
-            patch("app.services.analyzer.generate_example_with_ollama",
-                  return_value=("She works full-time.", "她全职工作。")),
+            patch("app.services.analyzer.generate_analysis_with_ollama",
+                  return_value={
+                      "meaning": None,
+                      "exampleSentence": "She works full-time.",
+                      "exampleTranslation": "她全职工作。",
+                      "synonyms": [],
+                      "similarPhrases": [],
+                  }),
             patch("app.services.analyzer._generate_example_with_tmt",
                   return_value=(None, None)),
         ):
@@ -343,7 +353,7 @@ class AlphanumericClassificationTest(unittest.TestCase):
 
 
 class AlphanumericExampleChainTest(unittest.TestCase):
-    """Phase 8I: alphanumeric / abbreviation words enter Hunyuan generation."""
+    """Phase 8I: alphanumeric / abbreviation words enter Ollama generation."""
 
     def _call_with_mocks(self, text):
         from app.services.analyzer import analyze_text
@@ -353,51 +363,50 @@ class AlphanumericExampleChainTest(unittest.TestCase):
             patch("app.services.analyzer.translate_to_zh",
                   return_value={"ok": True, "translation": "测试", "provider": "tencent"}),
             patch("app.services.analyzer.generate_understanding", return_value="u"),
-            patch("app.services.analyzer.generate_example_with_ollama") as mock_h,
-            patch("app.services.analyzer._generate_example_with_tmt") as mock_t,
+            patch("app.services.analyzer.generate_analysis_with_ollama", return_value=None) as mock_ollama,
+            patch("app.services.analyzer._generate_example_with_tmt") as mock_tmt,
         ):
-            mock_h.return_value = (None, None)
-            mock_t.return_value = (None, None)
+            mock_tmt.return_value = (None, None)
             result = analyze_text(text)
-            return result, mock_h, mock_t
+            return result, mock_ollama, mock_tmt
 
-    def test_5g_calls_hunyuan(self):
-        result, mock_h, _ = self._call_with_mocks("5G")
+    def test_5g_calls_ollama(self):
+        result, mock_ollama, _ = self._call_with_mocks("5G")
         self.assertEqual(result["category"], "word")
-        mock_h.assert_called_once()
+        mock_ollama.assert_called_once()
 
-    def test_b2b_calls_hunyuan(self):
-        result, mock_h, _ = self._call_with_mocks("B2B")
+    def test_b2b_calls_ollama(self):
+        result, mock_ollama, _ = self._call_with_mocks("B2B")
         self.assertEqual(result["category"], "word")
-        mock_h.assert_called_once()
+        mock_ollama.assert_called_once()
 
-    def test_gpt4_calls_hunyuan(self):
-        result, mock_h, _ = self._call_with_mocks("GPT-4")
+    def test_gpt4_calls_ollama(self):
+        result, mock_ollama, _ = self._call_with_mocks("GPT-4")
         self.assertEqual(result["category"], "word")
-        mock_h.assert_called_once()
+        mock_ollama.assert_called_once()
 
-    def test_us_abbreviation_calls_hunyuan(self):
-        result, mock_h, _ = self._call_with_mocks("U.S.")
+    def test_us_abbreviation_calls_ollama(self):
+        result, mock_ollama, _ = self._call_with_mocks("U.S.")
         self.assertEqual(result["category"], "word")
-        mock_h.assert_called_once()
+        mock_ollama.assert_called_once()
 
-    def test_eg_abbreviation_calls_hunyuan(self):
-        result, mock_h, _ = self._call_with_mocks("e.g.")
+    def test_eg_abbreviation_calls_ollama(self):
+        result, mock_ollama, _ = self._call_with_mocks("e.g.")
         self.assertEqual(result["category"], "word")
-        mock_h.assert_called_once()
+        mock_ollama.assert_called_once()
 
-    def test_pure_number_skips_hunyuan(self):
-        result, mock_h, mock_t = self._call_with_mocks("2024")
+    def test_pure_number_skips_ollama(self):
+        result, mock_ollama, mock_tmt = self._call_with_mocks("2024")
         self.assertEqual(result["ok"], False)
-        mock_h.assert_not_called()
-        mock_t.assert_not_called()
+        mock_ollama.assert_not_called()
+        mock_tmt.assert_not_called()
 
-    def test_hash_na_skips_hunyuan(self):
+    def test_hash_na_skips_ollama(self):
         # #N/A has no validation error (N/A are letters) but category=unknown → no example
-        result, mock_h, mock_t = self._call_with_mocks("#N/A")
+        result, mock_ollama, mock_tmt = self._call_with_mocks("#N/A")
         self.assertEqual(result["category"], "unknown")
-        mock_h.assert_not_called()
-        mock_t.assert_not_called()
+        mock_ollama.assert_not_called()
+        mock_tmt.assert_not_called()
 
     def test_alphanumeric_example_propagated(self):
         from app.services.analyzer import analyze_text
@@ -407,8 +416,14 @@ class AlphanumericExampleChainTest(unittest.TestCase):
             patch("app.services.analyzer.translate_to_zh",
                   return_value={"ok": True, "translation": "新冠", "provider": "tencent"}),
             patch("app.services.analyzer.generate_understanding", return_value="u"),
-            patch("app.services.analyzer.generate_example_with_ollama",
-                  return_value=("COVID-19 changed the world.", "新冠疫情改变了世界。")),
+            patch("app.services.analyzer.generate_analysis_with_ollama",
+                  return_value={
+                      "meaning": None,
+                      "exampleSentence": "COVID-19 changed the world.",
+                      "exampleTranslation": "新冠疫情改变了世界。",
+                      "synonyms": [],
+                      "similarPhrases": [],
+                  }),
             patch("app.services.analyzer._generate_example_with_tmt", return_value=(None, None)),
         ):
             result = analyze_text("COVID-19")
