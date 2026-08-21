@@ -7,7 +7,7 @@ from typing import Any
 
 from app.core.config import settings
 from app.observability.logging import log_event
-from app.observability.metrics import AI_CACHE_EVENTS_TOTAL
+from app.observability.metrics import AI_CACHE_EVENTS_TOTAL, AI_REQUEST_EVENTS_TOTAL
 from app.observability.operations import observed_operation, record_operation_result
 from app.schemas import Category, Level
 from app.services.cache import delete_cache, get_cache, make_cache_key, set_cache
@@ -18,6 +18,11 @@ from app.services.ollama_example import (
     generate_analysis_with_ollama_stream,
     generate_example_with_ollama,
 )
+from app.services.request_reliability import (
+    StreamCancelController,
+    touch_generation_attempt,
+    user_message_for,
+)
 from app.services.translator import translate_to_zh
 from app.services.understanding import generate_understanding
 from app.services.validator import validate_english
@@ -26,6 +31,32 @@ logger = logging.getLogger(__name__)
 
 
 TRANSLATION_UNAVAILABLE_WARNING = "翻译暂时不可用，已先保存英文内容。"
+
+
+def _ai_event(event: str, result: str, **extra: Any) -> None:
+    """Emit one reliability event into both the Prometheus counter and the log stream."""
+    AI_REQUEST_EVENTS_TOTAL.labels(operation="ai", event=event, result=result).inc()
+    log_event(
+        logger,
+        logging.INFO,
+        "ai_request_event",
+        operation="ai",
+        ai_event=event,
+        result=result,
+        **extra,
+    )
+
+
+def _make_attempt_recorder(record: Any) -> Any:
+    """Build the per-Qwen-request attempt recorder bound to a reliability record."""
+    if record is None:
+        return None
+
+    def record_attempt() -> None:
+        attempt = touch_generation_attempt(record)
+        _ai_event("generation_attempt", "started", attempt=attempt)
+
+    return record_attempt
 
 
 def _is_word_or_phrase(category: str | None) -> bool:
@@ -346,9 +377,20 @@ def analyze_text(
     card_type: str = "auto",
     target_lang: str = "zh",
     force_refresh: bool = False,
+    *,
+    deadline_at: float | None = None,
+    record: Any | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     result_label = "success"
+    if deadline_at is None:
+        deadline_at = time.monotonic() + settings.ai_total_timeout_seconds
+    _ai_event(
+        "deadline_set",
+        "started",
+        total_timeout_seconds=settings.ai_total_timeout_seconds,
+        deadline_at=round(deadline_at, 3),
+    )
     try:
         with observed_operation("ai", "validate_english"):
             validation, category, validation_level, normalized_text, warnings, errors = _validation_context(text)
@@ -423,13 +465,37 @@ def analyze_text(
             category in ("word", "phrase", "sentence")
             and settings.example_generator_provider == "ollama"
         ):
+            if time.monotonic() >= deadline_at:
+                result_label = "timeout"
+                _ai_event("failure", "AI_TOTAL_TIMEOUT", category=category, stage="before_generate")
+                return _build_response(
+                    ok=False,
+                    level="failed",
+                    category=category,
+                    normalized_text=normalized_text,
+                    warnings=[],
+                    errors=[user_message_for("AI_TOTAL_TIMEOUT")],
+                    provider=None,
+                )
+            # One shared monotonic budget across the whole chain: cap the Qwen layer by
+            # both its own per-call timeout and the total deadline so queue + generation
+            # + parsing + retry together never exceed ai_total_timeout_seconds.
+            effective_deadline = min(
+                time.monotonic() + settings.ollama_timeout_seconds,
+                deadline_at,
+            )
             try:
                 with observed_operation(
                     "ollama",
                     "qwen_analysis",
                     attributes={"model": settings.ollama_model, "category": category},
                 ):
-                    ollama = generate_analysis_with_ollama(normalized_text, category)
+                    ollama = generate_analysis_with_ollama(
+                        normalized_text,
+                        category,
+                        deadline=effective_deadline,
+                        attempt_recorder=_make_attempt_recorder(record),
+                    )
             except Exception as exc:
                 logger.warning("[analyzer] ollama analysis error: %s", _short_error(exc))
                 ollama = None
@@ -441,14 +507,20 @@ def analyze_text(
             and settings.example_generator_provider == "ollama"
             and ollama is None
         ):
-            result_label = "error"
+            if time.monotonic() >= deadline_at:
+                code = "AI_TOTAL_TIMEOUT"
+                result_label = "timeout"
+            else:
+                code = "AI_LLM_FAILED"
+                result_label = "error"
+            _ai_event("failure", code, category=category)
             return _build_response(
                 ok=False,
                 level="failed",
                 category=category,
                 normalized_text=normalized_text,
                 warnings=[],
-                errors=["分析服务暂时不可用，请稍后重试"],
+                errors=[user_message_for(code)],
                 provider=None,
             )
 
@@ -464,6 +536,7 @@ def analyze_text(
             )
     except Exception:
         result_label = "exception"
+        _ai_event("failure", "AI_INTERNAL_ERROR")
         logger.exception("[analyzer] unexpected failure")
         return _build_response(
             ok=False,
@@ -471,7 +544,7 @@ def analyze_text(
             category="unknown",
             normalized_text=str(text or "").strip(),
             warnings=[],
-            errors=["分析服务暂时不可用，请稍后重试"],
+            errors=[user_message_for("AI_INTERNAL_ERROR")],
             provider=None,
             cache_hit=False,
         )
@@ -489,6 +562,10 @@ def analyze_text_streaming(
     card_type: str = "auto",
     target_lang: str = "zh",
     force_refresh: bool = False,
+    *,
+    deadline_at: float | None = None,
+    record: Any | None = None,
+    cancel_controller: StreamCancelController | None = None,
 ):
     """Like ``analyze_text``, but streams Ollama field events as they complete.
 
@@ -496,9 +573,20 @@ def analyze_text_streaming(
     single Ollama stream, then a final ``("final", dict)`` carrying the full
     ``AnalyzeResponse`` dict (ok True or False). The ``final`` payload is built
     by the exact same ``_finalize_analysis`` path as the non-streaming endpoint.
+
+    The stream path starts Qwen exactly once and never falls back to a second
+    (non-streaming) Qwen call, even if the stream is interrupted.
     """
     started = time.perf_counter()
     result_label = "success"
+    if deadline_at is None:
+        deadline_at = time.monotonic() + settings.ai_total_timeout_seconds
+    _ai_event(
+        "deadline_set",
+        "started",
+        total_timeout_seconds=settings.ai_total_timeout_seconds,
+        deadline_at=round(deadline_at, 3),
+    )
     try:
         with observed_operation("ai", "validate_english"):
             validation, category, validation_level, normalized_text, warnings, errors = _validation_context(text)
@@ -574,15 +662,47 @@ def analyze_text_streaming(
             category in ("word", "phrase", "sentence")
             and settings.example_generator_provider == "ollama"
         ):
+            if time.monotonic() >= deadline_at:
+                result_label = "timeout"
+                _ai_event("failure", "AI_TOTAL_TIMEOUT", category=category, stage="before_generate")
+                yield (
+                    "final",
+                    _build_response(
+                        ok=False,
+                        level="failed",
+                        category=category,
+                        normalized_text=normalized_text,
+                        warnings=[],
+                        errors=[user_message_for("AI_TOTAL_TIMEOUT")],
+                        provider=None,
+                    ),
+                )
+                return
+            effective_deadline = min(
+                time.monotonic() + settings.ollama_timeout_seconds,
+                deadline_at,
+            )
             try:
                 with observed_operation(
                     "ollama",
                     "qwen_analysis_stream",
                     attributes={"model": settings.ollama_model, "category": category},
                 ):
-                    for event in generate_analysis_with_ollama_stream(normalized_text, category):
+                    for event in generate_analysis_with_ollama_stream(
+                        normalized_text,
+                        category,
+                        deadline=effective_deadline,
+                        attempt_recorder=_make_attempt_recorder(record),
+                        cancel_controller=cancel_controller,
+                    ):
                         if event[0] == "field":
                             yield event
+                        elif event[0] == "cancelled":
+                            # The Ollama stream aborted because the client went
+                            # away. Propagate a GeneratorExit so the caller (and
+                            # the reliability record) classifies this as a
+                            # cancellation, never as a 500.
+                            raise GeneratorExit
                         else:  # ("result", dict | None)
                             ollama = event[1]
             except Exception as exc:
@@ -596,7 +716,13 @@ def analyze_text_streaming(
             and settings.example_generator_provider == "ollama"
             and ollama is None
         ):
-            result_label = "error"
+            if time.monotonic() >= deadline_at:
+                code = "AI_TOTAL_TIMEOUT"
+                result_label = "timeout"
+            else:
+                code = "AI_LLM_FAILED"
+                result_label = "error"
+            _ai_event("failure", code, category=category)
             yield (
                 "final",
                 _build_response(
@@ -605,7 +731,7 @@ def analyze_text_streaming(
                     category=category,
                     normalized_text=normalized_text,
                     warnings=[],
-                    errors=["分析服务暂时不可用，请稍后重试"],
+                    errors=[user_message_for(code)],
                     provider=None,
                 ),
             )
@@ -627,9 +753,11 @@ def analyze_text_streaming(
         )
     except GeneratorExit:
         result_label = "cancelled"
+        _ai_event("cancelled", "cancelled", stage="client_disconnect")
         raise
     except Exception:
         result_label = "exception"
+        _ai_event("failure", "AI_INTERNAL_ERROR")
         logger.exception("[analyzer] unexpected failure")
         yield (
             "final",

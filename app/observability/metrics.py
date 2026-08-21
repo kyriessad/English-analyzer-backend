@@ -29,6 +29,11 @@ AI_REQUEST_DURATION_SECONDS = Histogram(
     "AI analysis duration in seconds.",
     ("operation", "result"),
 )
+AI_REQUEST_EVENTS_TOTAL = Counter(
+    "ai_request_events_total",
+    "AI request reliability events.",
+    ("operation", "event", "result"),
+)
 AI_CACHE_EVENTS_TOTAL = Counter(
     "ai_cache_events_total",
     "AI cache hit/miss events.",

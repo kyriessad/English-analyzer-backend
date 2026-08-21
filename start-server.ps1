@@ -47,6 +47,11 @@ $FallbackNgrokDomain = 'https://detergent-starry-oboe.ngrok-free.dev'
 $script:StepNumber = 0
 $script:StepLabel = ''
 $script:NgrokPid = $null
+$script:DotEnvCache = $null
+$script:LocalHealthLastFailure = ''
+$script:PublicHealthLastFailure = ''
+$script:StartupStartedAt = Get-Date
+$script:StartupDeadline = $script:StartupStartedAt.AddMinutes(15)
 
 # ---------------------------------------------------------------- output
 function Write-Step {
@@ -70,6 +75,10 @@ function Fail {
   Write-Host 'SERVER NOT READY' -ForegroundColor Red
   Write-Host ("Failed step: {0}" -f $script:StepLabel) -ForegroundColor Red
   Write-Host ("Reason: {0}" -f $Message) -ForegroundColor Red
+  if ($script:StartupStartedAt) {
+    $elapsed = [int]((Get-Date) - $script:StartupStartedAt).TotalSeconds
+    Write-Host ("Elapsed: {0}s" -f $elapsed) -ForegroundColor Red
+  }
   exit 1
 }
 
@@ -86,7 +95,9 @@ function Wait-For {
     [string]$What,
     [int]$TimeoutSec = 60
   )
-  $deadline = (Get-Date).AddSeconds($TimeoutSec)
+  $remaining = Get-RemainingStartupSeconds
+  if ($remaining -le 0) { return $false }
+  $deadline = (Get-Date).AddSeconds([Math]::Min($TimeoutSec, $remaining))
   while ((Get-Date) -lt $deadline) {
     try {
       if (& $Test) { return $true }
@@ -96,11 +107,34 @@ function Wait-For {
   return $false
 }
 
+function Get-RemainingStartupSeconds {
+  return [Math]::Max(0, [int][Math]::Floor(($script:StartupDeadline - (Get-Date)).TotalSeconds))
+}
+
+function Get-StageTimeoutSec {
+  param([int]$Preferred)
+
+  $remaining = Get-RemainingStartupSeconds
+  if ($remaining -le 0) { return 0 }
+  return [Math]::Max(1, [Math]::Min($Preferred, $remaining))
+}
+
 function Test-LocalHealth {
+  $script:LocalHealthLastFailure = 'no response'
   try {
     $resp = Invoke-WebRequest -Uri $FastApiHealthUrl -TimeoutSec 3 -UseBasicParsing
-    return ($resp.StatusCode -eq 200)
+    if ($resp.StatusCode -eq 200) { return $true }
+    $script:LocalHealthLastFailure = "HTTP $($resp.StatusCode)"
+    return $false
   } catch {
+    $details = Get-HealthResponseDetails -ErrorRecord $_
+    if ($details.status) {
+      $script:LocalHealthLastFailure = "HTTP $($details.status)" + $(if ($details.body) { "`n$($details.body)" } else { '' })
+    } elseif ($details.body) {
+      $script:LocalHealthLastFailure = $details.body
+    } else {
+      $script:LocalHealthLastFailure = $details.message
+    }
     return $false
   }
 }
@@ -111,6 +145,28 @@ function Test-OllamaUp {
     return $true
   } catch {
     return $false
+  }
+}
+
+function Test-PostgresHealth {
+  param([string]$DatabaseUrl)
+
+  if (-not $DatabaseUrl) { return $false }
+
+  $code = "import os; from sqlalchemy import create_engine, text; e=create_engine(os.environ['DATABASE_URL'], pool_pre_ping=True); c=e.connect(); c.execute(text('select 1')); c.close()"
+  $oldDatabaseUrl = $env:DATABASE_URL
+  $env:DATABASE_URL = $DatabaseUrl
+  try {
+    & $PythonExe -c $code 2>$null | Out-Null
+    return ($LASTEXITCODE -eq 0)
+  } catch {
+    return $false
+  } finally {
+    if ($null -ne $oldDatabaseUrl) {
+      $env:DATABASE_URL = $oldDatabaseUrl
+    } else {
+      Remove-Item Env:DATABASE_URL -ErrorAction SilentlyContinue
+    }
   }
 }
 
@@ -127,6 +183,92 @@ function Get-ListenerProcess {
   $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
   if (-not $conn) { return $null }
   return Get-CimInstance Win32_Process -Filter "ProcessId=$($conn.OwningProcess)" -ErrorAction SilentlyContinue
+}
+
+function Get-ProcessById {
+  param([int]$Id)
+  if (-not $Id) { return $null }
+  return Get-CimInstance Win32_Process -Filter "ProcessId=$Id" -ErrorAction SilentlyContinue
+}
+
+function Get-ProcessChildren {
+  param([int]$ParentId)
+  return @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$ParentId" -ErrorAction SilentlyContinue)
+}
+
+function Get-ProcessDescendantIds {
+  param([int]$RootId)
+  $result = New-Object 'System.Collections.Generic.List[int]'
+  $visited = New-Object 'System.Collections.Generic.HashSet[int]'
+  $queue = New-Object 'System.Collections.Generic.Queue[int]'
+  foreach ($child in (Get-ProcessChildren -ParentId $RootId)) {
+    $childId = [int]$child.ProcessId
+    if ($visited.Add($childId)) { $queue.Enqueue($childId) }
+  }
+  while ($queue.Count -gt 0) {
+    $id = $queue.Dequeue()
+    if ($result.Contains($id)) { continue }
+    $result.Add($id)
+    foreach ($grand in (Get-ProcessChildren -ParentId $id)) {
+      $grandId = [int]$grand.ProcessId
+      if ($visited.Add($grandId)) { $queue.Enqueue($grandId) }
+    }
+  }
+  return @($result)
+}
+
+function Get-CommandLineHash {
+  param([string]$CommandLine)
+
+  if (-not $CommandLine) { return '' }
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($CommandLine)
+    return ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
+  } finally {
+    $sha.Dispose()
+  }
+}
+
+function Get-ProcessCreationDateString {
+  param($Proc)
+
+  try { return ([datetime]$Proc.CreationDate).ToString('o') } catch { return '' }
+}
+
+function Get-ProcessIdentity {
+  param($Proc)
+
+  if (-not $Proc) { return $null }
+  return [ordered]@{
+    pid               = [int]$Proc.ProcessId
+    parent_pid        = [int]$Proc.ParentProcessId
+    creation_date     = Get-ProcessCreationDateString -Proc $Proc
+    executable_path   = [string]$Proc.ExecutablePath
+    command_line_hash = Get-CommandLineHash -CommandLine ([string]$Proc.CommandLine)
+  }
+}
+
+function Test-ProcessIdentityMatches {
+  param(
+    $Proc,
+    $Identity
+  )
+
+  if (-not $Proc -or -not $Identity) { return $false }
+  $props = $Identity.PSObject.Properties.Name
+  if ($props -contains 'pid' -and $Identity.pid -and [int]$Identity.pid -ne [int]$Proc.ProcessId) { return $false }
+  if ($props -contains 'creation_date' -and $Identity.creation_date) {
+    $liveCreated = Get-ProcessCreationDateString -Proc $Proc
+    if ($liveCreated -and $liveCreated -ne [string]$Identity.creation_date) { return $false }
+  }
+  if ($props -contains 'executable_path' -and $Identity.executable_path -and
+      [string]$Proc.ExecutablePath -ine [string]$Identity.executable_path) { return $false }
+  if ($props -contains 'command_line_hash' -and $Identity.command_line_hash) {
+    $liveHash = Get-CommandLineHash -CommandLine ([string]$Proc.CommandLine)
+    if ($liveHash -ne [string]$Identity.command_line_hash) { return $false }
+  }
+  return $true
 }
 
 function Get-NgrokDomainFromConfig {
@@ -153,13 +295,248 @@ function Get-ProjectNgrokProcess {
   return $null
 }
 
+function Get-DotEnvValues {
+  if ($null -ne $script:DotEnvCache) { return $script:DotEnvCache }
+
+  $values = @{}
+  $envPath = Join-Path $BackendDir '.env'
+  if (Test-Path -LiteralPath $envPath) {
+    foreach ($line in Get-Content -LiteralPath $envPath -ErrorAction SilentlyContinue) {
+      $trimmed = $line.Trim()
+      if (-not $trimmed -or $trimmed.StartsWith('#')) { continue }
+      if ($trimmed -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$') {
+        $name = $Matches[1]
+        $value = $Matches[2].Trim()
+        if (($value.StartsWith('"') -and $value.EndsWith('"')) -or
+            ($value.StartsWith("'") -and $value.EndsWith("'"))) {
+          $value = $value.Substring(1, $value.Length - 2)
+        }
+        $values[$name] = $value
+      }
+    }
+  }
+
+  $script:DotEnvCache = $values
+  return $values
+}
+
+function Get-EffectiveEnvValue {
+  param(
+    [string]$Name,
+    [string]$Default = ''
+  )
+
+  $envValue = [System.Environment]::GetEnvironmentVariable($Name, 'Process')
+  if ($envValue -and $envValue.Trim()) {
+    return $envValue.Trim()
+  }
+
+  $dotEnv = Get-DotEnvValues
+  if ($dotEnv.ContainsKey($Name) -and [string]$dotEnv[$Name].Trim()) {
+    return [string]$dotEnv[$Name]
+  }
+
+  return $Default
+}
+
+function Get-DotEnvValue {
+  param(
+    [string]$Name,
+    [string]$Default = ''
+  )
+
+  $dotEnv = Get-DotEnvValues
+  if ($dotEnv.ContainsKey($Name) -and [string]$dotEnv[$Name].Trim()) {
+    return [string]$dotEnv[$Name]
+  }
+  return $Default
+}
+
+function Get-EffectiveBoolValue {
+  param(
+    [string]$Name,
+    [bool]$Default = $false
+  )
+
+  $raw = Get-EffectiveEnvValue -Name $Name -Default ''
+  if (-not $raw) { return $Default }
+  return $raw.Trim().ToLowerInvariant() -in @('1', 'true', 'yes', 'on')
+}
+
+function Get-EffectiveIntValue {
+  param(
+    [string]$Name,
+    [int]$Default
+  )
+
+  $raw = Get-EffectiveEnvValue -Name $Name -Default ''
+  if (-not $raw) { return $Default }
+  try { return [int]$raw } catch { return $Default }
+}
+
+function Get-SettingHash {
+  param([object]$Value)
+
+  $json = $Value | ConvertTo-Json -Depth 6 -Compress
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+    return ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
+  } finally {
+    $sha.Dispose()
+  }
+}
+
+function Get-ManagedConfig {
+  $configuredHosts = @()
+  $allowedHostsRaw = Get-DotEnvValue -Name 'ALLOWED_HOSTS' -Default (Get-EffectiveEnvValue -Name 'ALLOWED_HOSTS' -Default '127.0.0.1,localhost,testserver')
+  foreach ($hostName in ($allowedHostsRaw -split ',')) {
+    $trimmed = $hostName.Trim()
+    if ($trimmed) { $configuredHosts += $trimmed }
+  }
+
+  $allowedHosts = @()
+  foreach ($hostName in @($configuredHosts + @('127.0.0.1', 'localhost'))) {
+    if ($hostName -and ($allowedHosts -notcontains $hostName)) {
+      $allowedHosts += $hostName
+    }
+  }
+  if ($script:NgrokHost -and ($allowedHosts -notcontains $script:NgrokHost)) {
+    $allowedHosts += $script:NgrokHost
+  }
+
+  $fastapi = [ordered]@{
+    app_env = (Get-EffectiveEnvValue -Name 'APP_ENV' -Default 'development').ToLowerInvariant()
+    log_level = (Get-EffectiveEnvValue -Name 'LOG_LEVEL' -Default 'INFO')
+    tracing_enabled = (Get-EffectiveBoolValue -Name 'TRACING_ENABLED' -Default $true)
+    database_url_hash = (Get-SettingHash -Value (Get-EffectiveEnvValue -Name 'DATABASE_URL' -Default ''))
+    expected_database_dialect = (Get-EffectiveEnvValue -Name 'EXPECTED_DATABASE_DIALECT' -Default 'postgresql').ToLowerInvariant()
+    expected_database_name = Get-EffectiveEnvValue -Name 'EXPECTED_DATABASE_NAME' -Default 'english_analyzer'
+    expected_database_schema = Get-EffectiveEnvValue -Name 'EXPECTED_DATABASE_SCHEMA' -Default 'public'
+    required_alembic_revision = Get-EffectiveEnvValue -Name 'REQUIRED_ALEMBIC_REVISION' -Default 'd3e4f5a6b7c8'
+    allow_sqlite_for_tests = (Get-EffectiveBoolValue -Name 'ALLOW_SQLITE_FOR_TESTS' -Default $false)
+    allowed_hosts = ($allowedHosts -join ',')
+    max_request_body_bytes = (Get-EffectiveIntValue -Name 'MAX_REQUEST_BODY_BYTES' -Default 1048576)
+    translation_provider = (Get-EffectiveEnvValue -Name 'TRANSLATION_PROVIDER' -Default 'argos').ToLowerInvariant()
+    example_generator_provider = (Get-EffectiveEnvValue -Name 'EXAMPLE_GENERATOR_PROVIDER' -Default 'ollama').ToLowerInvariant()
+    ollama_base_url = (Get-EffectiveEnvValue -Name 'OLLAMA_BASE_URL' -Default 'http://127.0.0.1:11434').TrimEnd('/')
+    ollama_model = Get-EffectiveEnvValue -Name 'OLLAMA_MODEL' -Default 'qwen3:8b'
+    ollama_timeout_seconds = (Get-EffectiveIntValue -Name 'OLLAMA_TIMEOUT_SECONDS' -Default 50)
+    ollama_temperature = (Get-EffectiveEnvValue -Name 'OLLAMA_TEMPERATURE' -Default '0.3')
+    ollama_think = (Get-EffectiveBoolValue -Name 'OLLAMA_THINK' -Default $false)
+    ecdict_db_path = Get-EffectiveEnvValue -Name 'ECDICT_DB_PATH' -Default (Join-Path $BackendDir 'data\ecdict\ecdict.db')
+    piper_voice = Get-EffectiveEnvValue -Name 'PIPER_VOICE' -Default 'en_US-lessac-medium'
+    piper_male_voice = Get-EffectiveEnvValue -Name 'PIPER_MALE_VOICE' -Default 'en_US-hfc_male-medium'
+    piper_female_voice = Get-EffectiveEnvValue -Name 'PIPER_FEMALE_VOICE' -Default 'en_US-lessac-medium'
+    piper_default_voice = Get-EffectiveEnvValue -Name 'PIPER_DEFAULT_VOICE' -Default 'male'
+    piper_data_dir = Get-EffectiveEnvValue -Name 'PIPER_DATA_DIR' -Default (Join-Path $BackendDir 'data\piper')
+    piper_audio_cache_dir = Get-EffectiveEnvValue -Name 'PIPER_AUDIO_CACHE_DIR' -Default (Join-Path $BackendDir 'data\audio-cache')
+    piper_max_text_chars = (Get-EffectiveIntValue -Name 'PIPER_MAX_TEXT_CHARS' -Default 300)
+    piper_cache_max_bytes = (Get-EffectiveIntValue -Name 'PIPER_CACHE_MAX_BYTES' -Default (512 * 1024 * 1024))
+    piper_cache_max_age_days = (Get-EffectiveIntValue -Name 'PIPER_CACHE_MAX_AGE_DAYS' -Default 30)
+    enable_tencent_tmt = (Get-EffectiveBoolValue -Name 'ENABLE_TENCENT_TMT' -Default $false)
+    enable_hunyuan = (Get-EffectiveBoolValue -Name 'ENABLE_HUNYUAN' -Default $false)
+    tencent_tmt_region = Get-EffectiveEnvValue -Name 'TENCENT_TMT_REGION' -Default 'ap-guangzhou'
+    hunyuan_base_url = (Get-EffectiveEnvValue -Name 'HUNYUAN_BASE_URL' -Default 'https://api.hunyuan.cloud.tencent.com/v1').TrimEnd('/')
+    hunyuan_model = Get-EffectiveEnvValue -Name 'HUNYUAN_MODEL' -Default 'hunyuan-role-latest'
+    ai_daily_quota = (Get-EffectiveIntValue -Name 'AI_DAILY_QUOTA' -Default 30)
+    tts_daily_quota = (Get-EffectiveIntValue -Name 'TTS_DAILY_QUOTA' -Default 100)
+    lexical_daily_quota = (Get-EffectiveIntValue -Name 'LEXICAL_DAILY_QUOTA' -Default 500)
+    ai_global_concurrency = (Get-EffectiveIntValue -Name 'AI_GLOBAL_CONCURRENCY' -Default 1)
+    tts_global_concurrency = (Get-EffectiveIntValue -Name 'TTS_GLOBAL_CONCURRENCY' -Default 2)
+    resource_queue_timeout_seconds = (Get-EffectiveIntValue -Name 'RESOURCE_QUEUE_TIMEOUT_SECONDS' -Default 3)
+    ai_queue_timeout_seconds = (Get-EffectiveIntValue -Name 'AI_QUEUE_TIMEOUT_SECONDS' -Default 30)
+    ai_total_timeout_seconds = (Get-EffectiveIntValue -Name 'AI_TOTAL_TIMEOUT_SECONDS' -Default 90)
+  }
+
+  return [ordered]@{
+    fastapi = $fastapi
+    fastapi_hash = Get-SettingHash -Value $fastapi
+    ngrok = [ordered]@{
+      base = $script:NgrokBase
+      host = $script:NgrokHost
+      port = $FastApiPort
+    }
+    ngrok_hash = Get-SettingHash -Value ([ordered]@{
+      base = $script:NgrokBase
+      host = $script:NgrokHost
+      port = $FastApiPort
+      allowed_hosts = ($allowedHosts -join ',')
+    })
+    allowed_hosts = $allowedHosts
+  }
+}
+
+function Get-HealthResponseDetails {
+  param([Parameter(Mandatory)]$ErrorRecord)
+
+  $status = $null
+  $body = ''
+  try { $status = [int]$ErrorRecord.Exception.Response.StatusCode.value__ } catch { }
+  try {
+    $stream = $ErrorRecord.Exception.Response.GetResponseStream()
+    if ($stream) {
+      $reader = New-Object System.IO.StreamReader($stream)
+      try { $body = $reader.ReadToEnd() } finally { $reader.Dispose(); $stream.Dispose() }
+    }
+  } catch { }
+  if (-not $body) {
+    try { $body = $ErrorRecord.ErrorDetails.Message } catch { }
+  }
+
+  return [ordered]@{
+    status = $status
+    body = ($body | Out-String).Trim()
+    message = $ErrorRecord.Exception.Message
+  }
+}
+
+function Stop-OneProcess {
+  param([int]$Id)
+
+  $proc = Get-Process -Id $Id -ErrorAction SilentlyContinue
+  if (-not $proc) { return $true }
+  try { Stop-Process -Id $Id -ErrorAction Stop } catch { }
+
+  $deadline = (Get-Date).AddSeconds(5)
+  while ((Get-Date) -lt $deadline) {
+    if (-not (Get-Process -Id $Id -ErrorAction SilentlyContinue)) { return $true }
+    Start-Sleep -Milliseconds 300
+  }
+
+  $still = Get-Process -Id $Id -ErrorAction SilentlyContinue
+  if ($still) {
+    try { Stop-Process -Id $Id -Force -ErrorAction Stop } catch { return $false }
+    if (Get-Process -Id $Id -ErrorAction SilentlyContinue) { return $false }
+  }
+
+  return $true
+}
+
+function Normalize-ProcessEnvironment {
+  $vars = [System.Environment]::GetEnvironmentVariables()
+  $merged = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::OrdinalIgnoreCase)
+  foreach ($entry in $vars.GetEnumerator()) {
+    $merged[[string]$entry.Key] = [string]$entry.Value
+  }
+
+  foreach ($key in @($vars.Keys)) {
+    [System.Environment]::SetEnvironmentVariable([string]$key, $null, 'Process')
+  }
+
+  foreach ($entry in $merged.GetEnumerator()) {
+    [System.Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, 'Process')
+  }
+}
+
 # ---------------------------------------------------------------- preflight
 if (-not (Test-Path -LiteralPath $PythonExe -PathType Leaf)) {
   Fail "Project virtual environment not found: $PythonExe"
 }
 
-if (-not $env:DATABASE_URL) {
-  Fail "DATABASE_URL is not set in the environment. Set it as a User environment variable (password must not be committed). See .env.example."
+$effectiveDatabaseUrl = Get-EffectiveEnvValue -Name 'DATABASE_URL' -Default ''
+if (-not $effectiveDatabaseUrl) {
+  Fail "DATABASE_URL is not set in the environment or .env. Set it as a User environment variable (password must not be committed). See .env.example."
 }
 
 $script:NgrokBase = $NgrokDomain
@@ -169,29 +546,31 @@ $script:NgrokBase = $script:NgrokBase.TrimEnd('/')
 $script:NgrokHost = $null
 try { $script:NgrokHost = ([System.Uri]$script:NgrokBase).Host } catch { }
 
+$runtimeConfig = Get-ManagedConfig
+$allowedHosts = @($runtimeConfig.allowed_hosts)
+
 # ALLOWED_HOSTS must include the ngrok host or TrustedHostMiddleware rejects
 # public requests. This env var is set before uvicorn launches.
-$allowedHosts = @('127.0.0.1', 'localhost')
-if ($script:NgrokHost) { $allowedHosts += $script:NgrokHost }
 $env:ALLOWED_HOSTS = ($allowedHosts -join ',')
+Normalize-ProcessEnvironment
 
 # ================================================================ 1. PostgreSQL
-$pgListening = Test-PortListening -Port $PgPort
-if (-not $pgListening) {
+$pgHealth = Test-PostgresHealth -DatabaseUrl $effectiveDatabaseUrl
+if (-not $pgHealth) {
   $pgSvc = Get-Service -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -like 'postgresql-*' } | Select-Object -First 1
   if ($pgSvc) {
     if ($pgSvc.Status -ne 'Running') {
       try { Start-Service -Name $pgSvc.Name -ErrorAction Stop } catch { }
     }
-    if (-not (Wait-For { Test-PortListening -Port $PgPort } "PostgreSQL port $PgPort" 30)) {
-      Fail "PostgreSQL service '$($pgSvc.Name)' did not start listening on port $PgPort within 30s."
+    if (-not (Wait-For { Test-PostgresHealth -DatabaseUrl $effectiveDatabaseUrl } "PostgreSQL connection" 60)) {
+      Fail "PostgreSQL service '$($pgSvc.Name)' did not become healthy within 60s."
     }
-    $pgListening = $true
+    $pgHealth = $true
   }
 }
-if (-not $pgListening) {
-  Fail "PostgreSQL is not listening on port $PgPort and no postgresql-* Windows service was found."
+if (-not $pgHealth) {
+  Fail "PostgreSQL health check failed: could not connect with DATABASE_URL."
 }
 Write-Step -Label 'PostgreSQL' -Status 'OK'
 
@@ -210,7 +589,9 @@ Write-Step -Label 'Ollama' -Status 'OK'
 
 # ================================================================ 3. qwen3:8b confirm + warm
 try {
-  $tags = Invoke-RestMethod -Uri "$OllamaUrl/api/tags" -TimeoutSec 10
+  $tagsTimeout = Get-StageTimeoutSec -Preferred 10
+  if ($tagsTimeout -le 0) { Fail 'Startup deadline exceeded before Ollama tag check.' }
+  $tags = Invoke-RestMethod -Uri "$OllamaUrl/api/tags" -TimeoutSec $tagsTimeout
 } catch {
   Fail "Could not list Ollama models."
 }
@@ -225,84 +606,273 @@ if (-not $hasModel) {
 # Warm up: a minimal generate loads the model into GPU/RAM and keep_alive=30m
 # keeps it resident, matching the app's own keep_alive for qwen3:8b.
 try {
+  $warmTimeout = Get-StageTimeoutSec -Preferred 180
+  if ($warmTimeout -le 0) { Fail 'Startup deadline exceeded before qwen3:8b warmup.' }
   $warmBody = @{
     model = $OllamaModel
     prompt = "Hi"
     keep_alive = "30m"
     stream = $false
   } | ConvertTo-Json
-  Invoke-RestMethod -Method Post -Uri "$OllamaUrl/api/generate" -Body $warmBody -ContentType 'application/json' -TimeoutSec 180 | Out-Null
+  Invoke-RestMethod -Method Post -Uri "$OllamaUrl/api/generate" -Body $warmBody -ContentType 'application/json' -TimeoutSec $warmTimeout | Out-Null
 } catch {
   Fail "qwen3:8b warmup request failed: $($_.Exception.Message)"
 }
 
-$processor = 'CPU'
+$processor = 'not loaded'
 $ollamaExeForPs = Get-OllamaExe
 if ($ollamaExeForPs) {
   try {
     $psText = (& $ollamaExeForPs ps) -join "`n"
-    if ($psText -match 'qwen3:8b') {
-      if ($psText -match 'GPU') { $processor = 'GPU' } else { $processor = 'CPU' }
+    $modelLine = @($psText -split "`r?`n" | Where-Object { $_ -match [regex]::Escape($OllamaModel) } | Select-Object -First 1)
+    if ($modelLine.Count -gt 0) {
+      if ($modelLine[0] -match '(\d+%\s+GPU|GPU)') { $processor = $Matches[1] } else { $processor = 'CPU' }
     }
   } catch { }
+}
+if ($processor -notmatch 'GPU') {
+  Fail "qwen3:8b warmup completed, but ollama ps did not show the model loaded on GPU. Processor: $processor"
 }
 Write-Step -Label 'qwen3:8b' -Status 'WARM'
 Write-Sub -Text ("Processor: {0}" -f $processor)
 
 # ================================================================ 4. FastAPI
-$existing = Get-ListenerProcess -Port $FastApiPort
+$script:StepLabel = 'FastAPI'
+$state = $null
+if (Test-Path -LiteralPath $StateFile) {
+  try {
+    $state = Get-Content -LiteralPath $StateFile -Raw | ConvertFrom-Json
+  } catch {
+    $state = $null
+  }
+}
+
+$stateFastApiPid = $null
+$stateFastApiLauncherPid = $null
+$stateFastApiListenerPid = $null
+$stateFastApiListenerIdentity = $null
+$stateFastApiHash = $null
+$stateNgrokPid = $null
+$stateNgrokHash = $null
+if ($state) {
+  $stateProps = $state.PSObject.Properties.Name
+  if ($stateProps -contains 'fastapi_launcher_pid' -and $state.fastapi_launcher_pid) { $stateFastApiLauncherPid = [int]$state.fastapi_launcher_pid }
+  if ($stateProps -contains 'fastapi_listener_pid' -and $state.fastapi_listener_pid) { $stateFastApiListenerPid = [int]$state.fastapi_listener_pid }
+  if ($stateProps -contains 'fastapi_listener_identity') { $stateFastApiListenerIdentity = $state.fastapi_listener_identity }
+  if ($stateProps -contains 'fastapi_pid' -and $state.fastapi_pid) { $stateFastApiPid = [int]$state.fastapi_pid }
+  if ($stateProps -contains 'fastapi_hash' -and $state.fastapi_hash) { $stateFastApiHash = [string]$state.fastapi_hash }
+  if ($stateProps -contains 'ngrok_pid' -and $state.ngrok_pid) { $stateNgrokPid = [int]$state.ngrok_pid }
+  if ($stateProps -contains 'ngrok_hash' -and $state.ngrok_hash) { $stateNgrokHash = [string]$state.ngrok_hash }
+}
+
+$desiredFastapiHash = $runtimeConfig.fastapi_hash
+$desiredNgrokHash = $runtimeConfig.ngrok_hash
+
+function Test-ManagedUvicorn {
+  param($Proc)
+  if (-not $Proc -or -not $Proc.CommandLine) { return $false }
+  return ($Proc.CommandLine -match 'uvicorn' -and
+          $Proc.CommandLine -match 'app\.main:app' -and
+          $Proc.CommandLine -match ('\b{0}\b' -f $FastApiPort) -and
+          $Proc.CommandLine -notmatch '--reload')
+}
+
+function Test-IsAncestorProcess {
+  param(
+    [int]$AncestorId,
+    [int]$ProcessId
+  )
+  if ($AncestorId -le 0 -or $ProcessId -le 0) { return $false }
+  $visited = New-Object 'System.Collections.Generic.HashSet[int]'
+  $cursor = Get-ProcessById -Id $ProcessId
+  while ($cursor) {
+    $cursorId = [int]$cursor.ProcessId
+    if (-not $visited.Add($cursorId)) { return $false }
+    if ($cursorId -eq $AncestorId) { return $true }
+    $parentId = $null
+    try { $parentId = [int]$cursor.ParentProcessId } catch { }
+    if (-not $parentId -or $parentId -le 0) { return $false }
+    $cursor = Get-ProcessById -Id $parentId
+  }
+  return $false
+}
+
+function Stop-FastApiProcessTree {
+  param(
+    [int]$LauncherPid,
+    [int]$ListenerPid
+  )
+  $ids = New-Object 'System.Collections.Generic.List[int]'
+  if ($ListenerPid -and -not $ids.Contains($ListenerPid)) { $ids.Add($ListenerPid) }
+  if ($LauncherPid -and -not $ids.Contains($LauncherPid)) { $ids.Add($LauncherPid) }
+  if ($LauncherPid) {
+    foreach ($descId in (Get-ProcessDescendantIds -RootId $LauncherPid)) {
+      $dp = Get-ProcessById -Id $descId
+      if ($dp -and (Test-ManagedUvicorn -Proc $dp) -and -not $ids.Contains($descId)) { $ids.Add($descId) }
+    }
+  }
+  foreach ($id in $ids) {
+    if (-not (Stop-OneProcess -Id $id)) { return $false }
+  }
+
+  $deadline = (Get-Date).AddSeconds(10)
+  while ((Get-Date) -lt $deadline) {
+    if (-not (Test-PortListening -Port $FastApiPort)) { return $true }
+    Start-Sleep -Milliseconds 300
+  }
+  return (-not (Test-PortListening -Port $FastApiPort))
+}
+
+$trackedLauncherPid = $stateFastApiLauncherPid
+$trackedListenerPid = $stateFastApiListenerPid
+if ($stateFastApiPid) {
+  # Legacy state only had fastapi_pid. Older versions wrote the port listener
+  # after resolving it, but tolerate a launcher PID if such a file exists.
+  $legacyProc = Get-ProcessById -Id $stateFastApiPid
+  if (-not $trackedListenerPid -and $legacyProc -and (Test-ManagedUvicorn -Proc $legacyProc)) {
+    $trackedListenerPid = $stateFastApiPid
+  } elseif (-not $trackedLauncherPid) {
+    $trackedLauncherPid = $stateFastApiPid
+  }
+}
+
+$fastapiProc = $null
 $fastapiReused = $false
 $fastapiPid = $null
+$fastapiLauncherPid = $trackedLauncherPid
 
-if ($existing) {
-  # The project .venv is built on Anaconda (pyvenv.cfg home = anaconda3), so the
-  # port-8000 listener shows up as anaconda python even when launched via the
-  # venv. Detect correctness by command line, not interpreter path.
-  $isOurCommand = ($existing.CommandLine -match 'uvicorn' -and $existing.CommandLine -match 'app\.main:app')
-  $usesReload = ($existing.CommandLine -match '--reload')
+$listener = Get-ListenerProcess -Port $FastApiPort
 
-  if ($isOurCommand -and -not $usesReload) {
+if ($listener) {
+  $listenerIsManaged = Test-ManagedUvicorn -Proc $listener
+  if (-not $listenerIsManaged) {
+    Fail "Port $FastApiPort is occupied by an unrecognized process (PID $($listener.ProcessId), CommandLine: $($listener.CommandLine))."
+  }
+
+  # Primary: the recorded listener PID is still the process LISTENING on the
+  # port. Secondary: the live listener belongs to the recorded launcher's
+  # process tree (covers legacy states that only stored the launcher PID).
+  $matchesTrackedListener = ($trackedListenerPid -and $listener.ProcessId -eq $trackedListenerPid)
+  $belongsToTrackedLauncher = ($trackedLauncherPid -and
+    (Test-IsAncestorProcess -AncestorId $trackedLauncherPid -ProcessId $listener.ProcessId))
+
+  if (-not ($matchesTrackedListener -or $belongsToTrackedLauncher)) {
+    Fail "Port $FastApiPort is occupied by a uvicorn process that is not tracked by the current state file (PID $($listener.ProcessId))."
+  }
+
+  if ($stateFastApiHash -and $stateFastApiHash -eq $desiredFastapiHash) {
+    if (-not (Test-LocalHealth)) {
+      Write-Sub -Text 'FastAPI local: FAILED'
+      Write-Sub -Text $script:LocalHealthLastFailure
+      Fail "FastAPI listener PID $($listener.ProcessId) is listening but $FastApiHealthUrl is not healthy."
+    }
+    $fastapiProc = $listener
+    $fastapiPid = $listener.ProcessId
+    $fastapiLauncherPid = $trackedLauncherPid
     $fastapiReused = $true
-    $fastapiPid = $existing.ProcessId
   } else {
-    $why = ''
-    if (-not $isOurCommand) { $why = "unrecognized command: $($existing.CommandLine)" }
-    else { $why = "running with --reload" }
-    Fail "Port $FastApiPort is occupied by an unexpected uvicorn (PID $($existing.ProcessId), $why). Stop it first, then re-run."
+    # Config changed: stop THIS project's tree before restarting. An
+    # unrelated listener on the port is never stopped here.
+    if ($stateFastApiListenerIdentity -and
+        -not (Test-ProcessIdentityMatches -Proc $listener -Identity $stateFastApiListenerIdentity)) {
+      Fail "Tracked FastAPI listener PID $($listener.ProcessId) failed identity validation before restart; leaving it running."
+    }
+    if (-not (Stop-FastApiProcessTree -LauncherPid $trackedLauncherPid -ListenerPid $listener.ProcessId)) {
+      Fail "Managed FastAPI process tree (launcher $trackedLauncherPid, listener $($listener.ProcessId)) could not be stopped before restart."
+    }
+    $fastapiProc = $null
+    $fastapiPid = $null
+    $listener = $null
   }
 }
 
 if (-not $fastapiReused) {
-  New-Item -ItemType Directory -Force -Path $LogsDir | Out-Null
-  $uvicornArgs = @('-m', 'uvicorn', 'app.main:app', '--host', $FastApiHost, '--port', [string]$FastApiPort)
-  $proc = Start-Process `
-    -FilePath $PythonExe `
-    -ArgumentList $uvicornArgs `
-    -WorkingDirectory $BackendDir `
-    -RedirectStandardOutput $StdoutLog `
-    -RedirectStandardError $StderrLog `
-    -WindowStyle Hidden `
-    -PassThru
-  $fastapiPid = $proc.Id
-
-  if (-not (Wait-For { Test-LocalHealth } "FastAPI $FastApiHealthUrl" 90)) {
-    $errTail = ''
-    if (Test-Path -LiteralPath $StderrLog) {
-      $errTail = (Get-Content -LiteralPath $StderrLog -Tail 20) -join "`n"
+  if (-not $listener) {
+    # Recorded launcher alive but nothing listening: if the config changed,
+    # stop the stale tree first; the new instance will bind the free port.
+    if ($stateFastApiHash -and $trackedLauncherPid) {
+      $launcherProc = Get-ProcessById -Id $trackedLauncherPid
+      if ($launcherProc -and (Test-ManagedUvicorn -Proc $launcherProc) -and
+          $stateFastApiHash -ne $desiredFastapiHash) {
+        if (-not (Stop-FastApiProcessTree -LauncherPid $trackedLauncherPid -ListenerPid $trackedListenerPid)) {
+          Fail "Managed FastAPI process tree (launcher $trackedLauncherPid) could not be stopped before restart."
+        }
+      }
     }
-    Fail "FastAPI did not become healthy within 90s.`n$errTail"
+
+    New-Item -ItemType Directory -Force -Path $LogsDir | Out-Null
+    $uvicornArgs = @('-m', 'uvicorn', 'app.main:app', '--host', $FastApiHost, '--port', [string]$FastApiPort)
+    $proc = Start-Process `
+      -FilePath $PythonExe `
+      -ArgumentList $uvicornArgs `
+      -WorkingDirectory $BackendDir `
+      -RedirectStandardOutput $StdoutLog `
+      -RedirectStandardError $StderrLog `
+      -WindowStyle Hidden `
+      -PassThru
+    $startedLauncherPid = $proc.Id
+
+    if (-not (Wait-For { Test-LocalHealth } "FastAPI $FastApiHealthUrl" 90)) {
+      Write-Sub -Text 'FastAPI local: FAILED'
+      Write-Sub -Text $script:LocalHealthLastFailure
+      $errTail = ''
+      if (Test-Path -LiteralPath $StderrLog) {
+        $errTail = (Get-Content -LiteralPath $StderrLog -Tail 20) -join "`n"
+      }
+      Fail "FastAPI did not become healthy within 90s.`n$errTail"
+    }
+
+    # The venv python.exe is usually a launcher that spawns the base
+    # interpreter, so the Start-Process PID is NOT the process that binds the
+    # port. Resolve the real LISTENING process and confirm it belongs to the
+    # launched process tree before trusting it.
+    $resolvedListener = $null
+    $resolveDeadline = (Get-Date).AddSeconds(10)
+    while (-not $resolvedListener -and (Get-Date) -lt $resolveDeadline) {
+      $candidate = Get-ListenerProcess -Port $FastApiPort
+      if ($candidate -and (Test-ManagedUvicorn -Proc $candidate) -and
+          (Test-IsAncestorProcess -AncestorId $startedLauncherPid -ProcessId $candidate.ProcessId)) {
+        $resolvedListener = $candidate
+      }
+      if (-not $resolvedListener) { Start-Sleep -Milliseconds 500 }
+    }
+
+    if (-not $resolvedListener) {
+      $candidate = Get-ListenerProcess -Port $FastApiPort
+      $detail = if ($candidate) {
+        "found listener PID $($candidate.ProcessId) (CommandLine: $($candidate.CommandLine))"
+      } else {
+        'no listener found on the port'
+      }
+      Fail "Could not confirm the launched FastAPI process tree: launcher PID $startedLauncherPid, $detail."
+    }
+
+    $fastapiProc = $resolvedListener
+    $fastapiPid = $resolvedListener.ProcessId
+    $fastapiLauncherPid = $startedLauncherPid
   }
 }
 
-$listener = Get-ListenerProcess -Port $FastApiPort
-if ($listener) { $fastapiPid = $listener.ProcessId }
+if (-not (Test-LocalHealth)) {
+  Write-Sub -Text 'FastAPI local: FAILED'
+  Write-Sub -Text $script:LocalHealthLastFailure
+  Fail "FastAPI is listening on port $FastApiPort but $FastApiHealthUrl is not healthy."
+}
+Write-Sub -Text 'FastAPI local: READY'
+
+if (-not $fastapiProc) {
+  $fastapiProc = Get-ListenerProcess -Port $FastApiPort
+}
+if ($fastapiProc) { $fastapiPid = $fastapiProc.ProcessId }
 
 Write-Step -Label 'FastAPI' -Status ('OK' + $(if ($fastapiReused) { ' (reused)' } else { '' }))
 Write-Sub -Text ("Python: {0}" -f $PythonExe)
 Write-Sub -Text ("Port: {0}" -f $FastApiPort)
-Write-Sub -Text ("PID: {0}" -f $fastapiPid)
-if ($listener -and $listener.ExecutablePath -ine $PythonExe) {
-  Write-Sub -Text ("Base interpreter: {0}" -f $listener.ExecutablePath)
+Write-Sub -Text ("Launcher PID: {0}" -f $fastapiLauncherPid)
+Write-Sub -Text ("Listener PID: {0}" -f $fastapiPid)
+Write-Sub -Text ("Config hash: {0}" -f $desiredFastapiHash)
+if ($fastapiProc -and $fastapiProc.ExecutablePath -ine $PythonExe) {
+  Write-Sub -Text ("Base interpreter: {0}" -f $fastapiProc.ExecutablePath)
 }
 
 # ================================================================ 5/6. Piper warmup (from FastAPI startup log)
@@ -311,9 +881,43 @@ function Get-PiperStatus {
   $ok = $false
   $failed = $null
   $text = ''
-  if (Test-Path -LiteralPath $StderrLog) { $text = Get-Content -LiteralPath $StderrLog -Raw -ErrorAction SilentlyContinue }
-  if ($text -match ("\[STARTUP\] Piper {0} warmup OK" -f $Voice)) { $ok = $true }
-  elseif ($text -match ("\[STARTUP\] Piper {0} warmup FAILED: (.+)" -f $Voice)) { $failed = $Matches[1].Trim() }
+  foreach ($logPath in @($StdoutLog, $StderrLog)) {
+    if (Test-Path -LiteralPath $logPath) {
+      $text += "`n" + (Get-Content -LiteralPath $logPath -Raw -ErrorAction SilentlyContinue)
+    }
+  }
+
+  # The startup logger now wraps the message in JSON. Parse the JSON lines
+  # first, while retaining the old plain-text match for older log entries.
+  foreach ($line in ($text -split "`r?`n")) {
+    if (-not $line.Trim()) { continue }
+    try {
+      $entry = $line | ConvertFrom-Json
+      if ($entry.message -eq "[STARTUP] Piper $Voice warmup OK") { $ok = $true }
+      elseif ($entry.message -match ("^\[STARTUP\] Piper {0} warmup FAILED: (.+)$" -f [regex]::Escape($Voice))) {
+        $failed = $Matches[1].Trim()
+      }
+    } catch { }
+  }
+  if (-not $ok -and $text -match ("\[STARTUP\] Piper {0} warmup OK" -f [regex]::Escape($Voice))) {
+    $ok = $true
+  }
+  if (-not $ok -and -not $failed -and
+      $text -match ("\[STARTUP\] Piper {0} warmup FAILED: (.+)" -f [regex]::Escape($Voice))) {
+    $failed = $Matches[1].Trim()
+  }
+
+  # Prefer the structured piper_load_voice success record. The voice name is
+  # present in the OpenTelemetry attributes block emitted for that operation.
+  $voiceName = if ($Voice -eq 'female') { $env:PIPER_FEMALE_VOICE } else { $env:PIPER_MALE_VOICE }
+  if (-not $voiceName) {
+    $voiceName = if ($Voice -eq 'female') { 'en_US-lessac-medium' } else { 'en_US-hfc_male-medium' }
+  }
+  $voicePattern = [regex]::Escape($voiceName)
+  $structuredSuccess = '(?s)"operation"\s*:\s*"piper_load_voice".{0,1600}"voice"\s*:\s*"' +
+    $voicePattern + '".{0,1600}"result"\s*:\s*"success"'
+  if ($text -match $structuredSuccess) { $ok = $true }
+
   if ($fastapiReused -and -not $ok -and -not $failed) { return @{ Status = 'WARM'; Reason = 'reused' } }
   if ($ok) { return @{ Status = 'WARM'; Reason = '' } }
   if ($failed) { return @{ Status = 'FAILED'; Reason = $failed } }
@@ -336,48 +940,137 @@ if ($piperMale.Status -eq 'WARM') {
 $piperDegraded = ($piperFemale.Status -ne 'WARM') -or ($piperMale.Status -ne 'WARM')
 
 # ================================================================ 7. ngrok
+$script:StepLabel = 'ngrok / public health'
 $publicHealthUrl = "$($script:NgrokBase)/health"
 function Test-PublicHealth {
+  $script:PublicHealthLastFailure = 'no response'
+  $headers = @{ 'ngrok-skip-browser-warning' = '1' }
   try {
-    $resp = Invoke-WebRequest -Uri $publicHealthUrl -TimeoutSec 8 -UseBasicParsing
-    return ($resp.StatusCode -eq 200)
+    $timeout = Get-StageTimeoutSec -Preferred 8
+    if ($timeout -le 0) { return $false }
+    $resp = Invoke-WebRequest -Uri $publicHealthUrl -Headers $headers -TimeoutSec $timeout -UseBasicParsing
+    return Test-PublicHealthResponse -Response $resp
   } catch {
+    $details = Get-HealthResponseDetails -ErrorRecord $_
+    if ($details.status) {
+      $script:PublicHealthLastFailure = "HTTP $($details.status)" + $(if ($details.body) { "`n$($details.body)" } else { '' })
+    } elseif ($details.body) {
+      $script:PublicHealthLastFailure = $details.body
+    } else {
+      $script:PublicHealthLastFailure = $details.message
+    }
     return $false
   }
 }
 
-$ngrokOk = Test-PublicHealth
-if (-not $ngrokOk) {
-  $ngrokProc = Get-Process ngrok -ErrorAction SilentlyContinue
-  if ($ngrokProc) {
-    Fail "An ngrok process is already running but $publicHealthUrl is not responding."
+function Test-PublicHealthResponse {
+  param([Parameter(Mandatory)]$Response)
+
+  $status = 0
+  try { $status = [int]$Response.StatusCode } catch { }
+  $body = ''
+  try { $body = [string]$Response.Content } catch { }
+  $errorCode = $null
+  try { $errorCode = $Response.Headers['Ngrok-Error-Code'] } catch { }
+
+  if ($status -ne 200) {
+    $script:PublicHealthLastFailure = "HTTP $status" + $(if ($body) { "`n$body" } else { '' })
+    return $false
   }
-  $ngrokExe = (Get-Command ngrok -ErrorAction SilentlyContinue).Source
-  if (-not $ngrokExe) { Fail "ngrok executable not found on PATH." }
-  Start-Process -FilePath $ngrokExe -ArgumentList @('http', [string]$FastApiPort, '--url', $script:NgrokBase) -WindowStyle Hidden
-  if (-not (Wait-For { Test-PublicHealth } "ngrok public health $publicHealthUrl" 45)) {
-    Fail "ngrok started but $publicHealthUrl did not become healthy within 45s."
+  if ($errorCode) {
+    $script:PublicHealthLastFailure = "HTTP 200 with Ngrok-Error-Code $errorCode"
+    return $false
   }
-  $ngrokOk = $true
+  if ($body -match 'ERR_NGROK_\d+') {
+    $script:PublicHealthLastFailure = $body.Trim()
+    return $false
+  }
+
+  try {
+    $json = $body | ConvertFrom-Json
+    if ($json.status -eq 'ok') { return $true }
+    $script:PublicHealthLastFailure = "HTTP 200 but health payload was not status=ok: $body"
+    return $false
+  } catch {
+    $script:PublicHealthLastFailure = "HTTP 200 but response was not backend health: $body"
+    return $false
+  }
 }
 
-# Resolve the ngrok process that serves this project's fixed domain so that
-# stop-server.ps1 can target it precisely (never a blanket "Stop-Process ngrok").
-$ngrokProcObj = Get-ProjectNgrokProcess
-if ($ngrokProcObj) { $script:NgrokPid = $ngrokProcObj.ProcessId }
+$ngrokProc = $null
+$ngrokReused = $false
+if ($stateNgrokPid) {
+  $ngrokProc = Get-CimInstance Win32_Process -Filter "ProcessId=$stateNgrokPid" -ErrorAction SilentlyContinue
+  if ($ngrokProc -and $ngrokProc.Name -eq 'ngrok.exe' -and
+      $ngrokProc.CommandLine -match [regex]::Escape($script:NgrokHost) -and
+      $ngrokProc.CommandLine -match ('\b{0}\b' -f $FastApiPort)) {
+    if ($stateNgrokHash -and $stateNgrokHash -eq $desiredNgrokHash) {
+      $ngrokReused = $true
+    } else {
+      if (-not (Stop-OneProcess -Id $stateNgrokPid)) {
+        Fail "Managed ngrok PID $stateNgrokPid could not be stopped before restart."
+      }
+      $ngrokProc = $null
+    }
+  }
+}
 
-Write-Step -Label 'ngrok' -Status ('OK' + $(if ($ngrokOk -and (Get-Process ngrok -ErrorAction SilentlyContinue)) { '' } else { '' }))
+if (-not (Test-PublicHealth)) {
+  if (-not $ngrokReused) {
+    $existingNgrok = Get-ProjectNgrokProcess
+    if (-not $existingNgrok) {
+      $ngrokExeCommand = Get-Command ngrok -ErrorAction SilentlyContinue
+      $ngrokExe = if ($ngrokExeCommand) { $ngrokExeCommand.Source } else { $null }
+      if (-not $ngrokExe) { Fail "ngrok executable not found on PATH." }
+      Start-Process -FilePath $ngrokExe -ArgumentList @('http', [string]$FastApiPort, '--url', $script:NgrokBase) -WindowStyle Hidden
+    } else {
+      Write-Sub -Text 'ngrok process already exists; waiting for the fixed tunnel to become healthy.'
+      $ngrokProc = $existingNgrok
+    }
+  }
+
+  $deadline = (Get-Date).AddSeconds([Math]::Min(45, [Math]::Max(5, (Get-RemainingStartupSeconds))))
+  while ((Get-Date) -lt $deadline) {
+    Start-Sleep -Seconds 2
+    if (Get-RemainingStartupSeconds -le 0) { break }
+    if (Test-PublicHealth) {
+      break
+    }
+    Write-Sub -Text ("ngrok health retry failed: {0}" -f $script:PublicHealthLastFailure)
+  }
+  if (-not (Test-PublicHealth)) {
+    Write-Sub -Text 'ngrok public health: FAILED'
+    Write-Sub -Text $script:PublicHealthLastFailure
+    Fail "ngrok public health check failed after 45s: $publicHealthUrl ($($script:PublicHealthLastFailure))."
+  }
+}
+
+if (-not $ngrokProc) {
+  $ngrokProc = Get-ProjectNgrokProcess
+}
+if ($ngrokProc) { $script:NgrokPid = $ngrokProc.ProcessId }
+
+Write-Step -Label 'ngrok' -Status ('OK' + $(if ($ngrokReused) { ' (reused)' } else { '' }))
 Write-Sub -Text ("Public URL: {0}" -f $script:NgrokBase)
+Write-Sub -Text 'ngrok public health: READY'
 
 # ---------------------------------------------------------------- runtime state
 # Record the live PIDs for stop-server.ps1. No secrets are stored here.
 New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
 $stateObject = [ordered]@{
-  fastapi_pid  = $fastapiPid
-  ngrok_pid    = $script:NgrokPid
-  started_at   = (Get-Date).ToString('o')
-  port         = $FastApiPort
-  ngrok_domain = $script:NgrokBase
+  managed_version        = 3
+  fastapi_launcher_pid   = $fastapiLauncherPid
+  fastapi_listener_pid   = $fastapiPid
+  fastapi_pid            = $fastapiPid
+  fastapi_launcher_identity = Get-ProcessIdentity -Proc (Get-ProcessById -Id $fastapiLauncherPid)
+  fastapi_listener_identity = Get-ProcessIdentity -Proc (Get-ProcessById -Id $fastapiPid)
+  ngrok_pid              = $script:NgrokPid
+  started_at             = (Get-Date).ToString('o')
+  port                   = $FastApiPort
+  ngrok_domain           = $script:NgrokBase
+  fastapi_hash           = $desiredFastapiHash
+  ngrok_hash             = $desiredNgrokHash
+  allowed_hosts          = ($allowedHosts -join ',')
 }
 $stateObject | ConvertTo-Json | Set-Content -LiteralPath $StateFile -Encoding UTF8
 

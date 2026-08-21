@@ -8,7 +8,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
@@ -16,6 +16,7 @@ from app.core.config import settings
 from app.observability.operations import observed_operation
 from app.providers.argos_translator import ArgosTranslator
 from app.services.hunyuan_example import _text_in_sentence
+from app.services.request_reliability import StreamCancelController
 
 logger = logging.getLogger(__name__)
 
@@ -438,6 +439,7 @@ def _call_once(
     *,
     deadline: float,
     strict_retry: bool = False,
+    attempt_recorder: Callable[[], None] | None = None,
 ) -> _AttemptResult:
     format_spec: dict[str, Any] | str = _json_schema_format()
     payload = _build_payload(
@@ -448,6 +450,8 @@ def _call_once(
     )
 
     try:
+        if attempt_recorder:
+            attempt_recorder()
         response = _post_generate(payload, deadline)
         if response.status_code == 400:
             fallback_payload = dict(payload)
@@ -494,17 +498,33 @@ def _call_once(
 def generate_example_with_ollama(
     text: str,
     chinese_meaning: str | None = None,
+    *,
+    deadline: float | None = None,
+    attempt_recorder: Callable[[], None] | None = None,
 ) -> tuple[str | None, str | None]:
     target = str(text or "").strip()
     if not target:
         return None, None
 
-    deadline = time.monotonic() + settings.ollama_timeout_seconds
-    first = _call_once(target, chinese_meaning, deadline=deadline, strict_retry=False)
+    if deadline is None:
+        deadline = time.monotonic() + settings.ollama_timeout_seconds
+    first = _call_once(
+        target,
+        chinese_meaning,
+        deadline=deadline,
+        strict_retry=False,
+        attempt_recorder=attempt_recorder,
+    )
     result = first
-    if first.sentence is None and first.retryable:
+    if first.sentence is None and first.retryable and time.monotonic() < deadline:
         logger.info("[ollama][diag] retry | reason=%s", first.fail_reason)
-        result = _call_once(target, chinese_meaning, deadline=deadline, strict_retry=True)
+        result = _call_once(
+            target,
+            chinese_meaning,
+            deadline=deadline,
+            strict_retry=True,
+            attempt_recorder=attempt_recorder,
+        )
 
     if result.sentence is None:
         return None, None
@@ -526,6 +546,9 @@ def generate_example_with_ollama(
 def generate_analysis_with_ollama(
     text: str,
     category: str | None = None,
+    *,
+    deadline: float | None = None,
+    attempt_recorder: Callable[[], None] | None = None,
 ) -> dict[str, Any] | None:
     """Generate meaning + expression type + alternative meanings + example + translation
     + synonyms + similarPhrases in one Ollama call.
@@ -535,17 +558,35 @@ def generate_analysis_with_ollama(
     ``expressionType`` is one of the EXPRESSION_TYPES enum, ``alternativeMeanings`` is a
     list of ``{meaning, type, note}`` (0..2 items), and ``synonyms`` / ``similarPhrases``
     are lists of ``{english, chinese}`` (possibly empty).
+
+    ``deadline`` (a monotonic timestamp) bounds the total budget shared by the initial
+    attempt and the single strict retry. When omitted, ``ollama_timeout_seconds`` from
+    now is used. ``attempt_recorder`` is invoked once per actual model request (including
+    the strict retry) so the caller can observe ``generation_attempt``.
     """
     target = str(text or "").strip()
     if not target:
         return None
 
-    deadline = time.monotonic() + settings.ollama_timeout_seconds
-    first = _call_once(target, None, deadline=deadline, strict_retry=False)
+    if deadline is None:
+        deadline = time.monotonic() + settings.ollama_timeout_seconds
+    first = _call_once(
+        target,
+        None,
+        deadline=deadline,
+        strict_retry=False,
+        attempt_recorder=attempt_recorder,
+    )
     result = first
-    if first.sentence is None and first.retryable:
+    if first.sentence is None and first.retryable and time.monotonic() < deadline:
         logger.info("[ollama][diag] retry | reason=%s", first.fail_reason)
-        result = _call_once(target, None, deadline=deadline, strict_retry=True)
+        result = _call_once(
+            target,
+            None,
+            deadline=deadline,
+            strict_retry=True,
+            attempt_recorder=attempt_recorder,
+        )
 
     if result.sentence is None:
         return None
@@ -664,6 +705,10 @@ _STREAM_FIELD_ORDER = [
 def generate_analysis_with_ollama_stream(
     text: str,
     category: str | None = None,
+    *,
+    deadline: float | None = None,
+    attempt_recorder: Callable[[], None] | None = None,
+    cancel_controller: StreamCancelController | None = None,
 ):
     """Stream a single Ollama analysis call, yielding field events as they complete.
 
@@ -677,14 +722,23 @@ def generate_analysis_with_ollama_stream(
     re-emitted in ``_STREAM_FIELD_ORDER`` as soon as every earlier field is done.
 
     The single Ollama request is never retried here: a retry would mean a second
-    model call, which the streaming flow must not make.
+    model call, which the streaming flow must not make. ``deadline`` (a monotonic
+    timestamp) bounds the single request; when omitted ``ollama_timeout_seconds``
+    from now is used.
+
+    ``cancel_controller`` (a :class:`StreamCancelController`) is polled on every
+    streamed line and wires ``response.close()`` to the controller so a client
+    disconnect can abort a blocking read from another thread. When the controller
+    is firing, the generator yields ``("cancelled", None)`` instead of a result so
+    the caller can classify the outcome as a cancellation, never a 500.
     """
     target = str(text or "").strip()
     if not target:
         yield ("result", None)
         return
 
-    deadline = time.monotonic() + settings.ollama_timeout_seconds
+    if deadline is None:
+        deadline = time.monotonic() + settings.ollama_timeout_seconds
     payload = _build_payload(
         target,
         None,
@@ -693,7 +747,14 @@ def generate_analysis_with_ollama_stream(
         stream=True,
     )
 
+    if cancel_controller is not None and cancel_controller.cancelled():
+        logger.info("[ollama][diag] fail_reason=client_cancelled (pre-open)")
+        yield ("cancelled", None)
+        return
+
     try:
+        if attempt_recorder:
+            attempt_recorder()
         response = _post_generate_stream(payload, deadline)
     except _OllamaDeadlineExpired:
         logger.warning("[ollama][diag] fail_reason=ollama_total_timeout")
@@ -717,12 +778,21 @@ def generate_analysis_with_ollama_stream(
         yield ("result", None)
         return
 
+    if cancel_controller is not None:
+        # Closing the response is what unblocks a ``iter_lines()`` read that is
+        # stuck on the socket; registered once so a disconnect can abort it from
+        # another thread instead of waiting for a socket timeout.
+        cancel_controller.add_close_callback(response.close)
+
     buffer = ""
     completed: dict[str, Any] = {}
     emitted: set[str] = set()
     stream_result = "success"
     try:
         for raw_line in response.iter_lines(decode_unicode=False):
+            if cancel_controller is not None and cancel_controller.cancelled():
+                stream_result = "cancelled"
+                break
             if time.monotonic() > deadline:
                 raise _OllamaDeadlineExpired
             if not raw_line:
@@ -756,7 +826,8 @@ def generate_analysis_with_ollama_stream(
                 break
     except GeneratorExit:
         stream_result = "cancelled"
-        logger.warning("[ollama][diag] fail_reason=client_cancelled")
+        if cancel_controller is None or not cancel_controller.cancelled():
+            logger.warning("[ollama][diag] fail_reason=client_cancelled")
         raise
     except _OllamaDeadlineExpired:
         stream_result = "timeout"
@@ -773,9 +844,24 @@ def generate_analysis_with_ollama_stream(
         logger.warning("[ollama][diag] fail_reason=ollama_unavailable")
         yield ("result", None)
         return
+    except Exception:
+        # The response was closed from another thread (a disconnect cancels the
+        # bridge), so the mid-read call failed. Treat that as cancellation, not
+        # as a 500; anything else is a genuine stream error.
+        if cancel_controller is not None and cancel_controller.cancelled():
+            stream_result = "cancelled"
+        else:
+            stream_result = "error"
+            logger.warning("[ollama][diag] fail_reason=stream_read_error", exc_info=True)
+            yield ("result", None)
+            return
     finally:
         logger.info("[ollama][diag] stream_closed | result=%s", stream_result)
         response.close()
+
+    if stream_result == "cancelled":
+        yield ("cancelled", None)
+        return
 
     content = buffer.strip()
     if not content:

@@ -196,8 +196,13 @@ class OllamaDeadlineBudgetTest(unittest.TestCase):
         """Second strict retry gets less remaining time than the first request."""
         from app.services.ollama_example import generate_example_with_ollama
 
-        # Simulate time passing: T0=100, T1=100.1 (first req), T2=130 (retry)
-        timestamps = [100.0, 100.1, 130.0]
+        # Simulate time passing: T0=100 (deadline set), T1=100.1 (first req),
+        # T2=130 (retry gate), T3=130.1 (retry req). Extra monotonic reads (e.g.
+        # example validation) fall back to 999 so the mock never runs dry.
+        timestamps = iter([100.0, 100.1, 130.0, 130.1])
+
+        def fake_monotonic():
+            return next(timestamps, 999.0)
 
         bad = ollama_body("She wants quiet mornings.")
         good = ollama_body("She craves quiet mornings.")
@@ -209,7 +214,7 @@ class OllamaDeadlineBudgetTest(unittest.TestCase):
                 return bad
             return good
 
-        with patch("app.services.ollama_example.time.monotonic", side_effect=timestamps):
+        with patch("app.services.ollama_example.time.monotonic", side_effect=fake_monotonic):
             with patch("app.services.ollama_example.requests.post", side_effect=fake_post):
                 result = generate_example_with_ollama("crave")
 

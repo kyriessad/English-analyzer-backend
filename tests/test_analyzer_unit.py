@@ -3,7 +3,7 @@ Unit tests for app.services.analyzer.analyze_text.
 Focus: example-sentence generation gate (Phase 8D-hotfix).
 """
 import unittest
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 
 class AnalyzerExampleGateTest(unittest.TestCase):
@@ -41,7 +41,7 @@ class AnalyzerExampleGateTest(unittest.TestCase):
     def test_word_with_translation_calls_ollama(self):
         result, mock_ollama, mock_tmt = self._call("apply", translation_ok=True)
         self.assertEqual(result["category"], "word")
-        mock_ollama.assert_called_once_with("apply", "word")
+        mock_ollama.assert_called_once_with("apply", "word", deadline=ANY, attempt_recorder=None)
 
     def test_word_with_translation_does_not_call_tmt_by_default(self):
         result, mock_ollama, mock_tmt = self._call("apply", translation_ok=True)
@@ -55,7 +55,7 @@ class AnalyzerExampleGateTest(unittest.TestCase):
         """Ollama must be attempted even when translation failed."""
         result, mock_ollama, mock_tmt = self._call("apply", translation_ok=False)
         self.assertEqual(result["category"], "word")
-        mock_ollama.assert_called_once_with("apply", "word")
+        mock_ollama.assert_called_once_with("apply", "word", deadline=ANY, attempt_recorder=None)
 
     def test_word_without_translation_skips_tmt(self):
         """TMT needs a translation to build template sentences — must be skipped."""
@@ -69,7 +69,7 @@ class AnalyzerExampleGateTest(unittest.TestCase):
     def test_phrase_without_translation_calls_ollama(self):
         result, mock_ollama, mock_tmt = self._call("give up", translation_ok=False)
         self.assertEqual(result["category"], "phrase")
-        mock_ollama.assert_called_once_with("give up", "phrase")
+        mock_ollama.assert_called_once_with("give up", "phrase", deadline=ANY, attempt_recorder=None)
 
     def test_phrase_without_translation_skips_tmt(self):
         result, mock_ollama, mock_tmt = self._call("give up", translation_ok=False)
@@ -84,7 +84,7 @@ class AnalyzerExampleGateTest(unittest.TestCase):
             "I love English.", translation_ok=True
         )
         self.assertEqual(result["category"], "sentence")
-        mock_ollama.assert_called_once_with("I love English.", "sentence")
+        mock_ollama.assert_called_once_with("I love English.", "sentence", deadline=ANY, attempt_recorder=None)
         mock_tmt.assert_not_called()
 
     def test_sentence_without_translation_calls_ollama(self):
@@ -92,7 +92,7 @@ class AnalyzerExampleGateTest(unittest.TestCase):
             "I love English.", translation_ok=False
         )
         self.assertEqual(result["category"], "sentence")
-        mock_ollama.assert_called_once_with("I love English.", "sentence")
+        mock_ollama.assert_called_once_with("I love English.", "sentence", deadline=ANY, attempt_recorder=None)
 
     # ------------------------------------------------------------------
     # Hunyuan success propagates to response
@@ -232,7 +232,7 @@ class HyphenatedWordExampleChainTest(unittest.TestCase):
     def test_well_known_calls_ollama(self):
         result, mock_ollama, _ = self._call_with_mocks("well-known")
         self.assertEqual(result["category"], "word")
-        mock_ollama.assert_called_once_with("well-known", "word")
+        mock_ollama.assert_called_once_with("well-known", "word", deadline=ANY, attempt_recorder=None)
 
     def test_full_time_calls_ollama(self):
         result, mock_ollama, _ = self._call_with_mocks("full-time")

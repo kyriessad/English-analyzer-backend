@@ -90,7 +90,10 @@ function Test-PortListening {
 function Test-IsProjectUvicorn {
   param($Proc)
   if (-not $Proc -or -not $Proc.CommandLine) { return $false }
-  return ($Proc.CommandLine -match 'uvicorn' -and $Proc.CommandLine -match 'app\.main:app')
+  return ($Proc.CommandLine -match 'uvicorn' -and
+          $Proc.CommandLine -match 'app\.main:app' -and
+          $Proc.CommandLine -match ('\b{0}\b' -f $FastApiPort) -and
+          $Proc.CommandLine -notmatch '--reload')
 }
 
 function Get-OllamaExe {
@@ -142,6 +145,137 @@ function Stop-OneProcess {
   return 'STOPPED'
 }
 
+function Get-ProcessById {
+  param([int]$Id)
+  if (-not $Id) { return $null }
+  return Get-CimInstance Win32_Process -Filter "ProcessId=$Id" -ErrorAction SilentlyContinue
+}
+
+function Get-ProcessChildren {
+  param([int]$ParentId)
+  return @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$ParentId" -ErrorAction SilentlyContinue)
+}
+
+function Get-ProcessDescendantIds {
+  param([int]$RootId)
+  $result = New-Object 'System.Collections.Generic.List[int]'
+  $visited = New-Object 'System.Collections.Generic.HashSet[int]'
+  $queue = New-Object 'System.Collections.Generic.Queue[int]'
+  foreach ($child in (Get-ProcessChildren -ParentId $RootId)) {
+    $childId = [int]$child.ProcessId
+    if ($visited.Add($childId)) { $queue.Enqueue($childId) }
+  }
+  while ($queue.Count -gt 0) {
+    $id = $queue.Dequeue()
+    if ($result.Contains($id)) { continue }
+    $result.Add($id)
+    foreach ($grand in (Get-ProcessChildren -ParentId $id)) {
+      $grandId = [int]$grand.ProcessId
+      if ($visited.Add($grandId)) { $queue.Enqueue($grandId) }
+    }
+  }
+  return @($result)
+}
+
+function Get-CommandLineHash {
+  param([string]$CommandLine)
+
+  if (-not $CommandLine) { return '' }
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($CommandLine)
+    return ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
+  } finally {
+    $sha.Dispose()
+  }
+}
+
+function Test-ProcessIdentityMatches {
+  param(
+    $Proc,
+    $Identity
+  )
+
+  if (-not $Proc -or -not $Identity) { return $false }
+  $props = $Identity.PSObject.Properties.Name
+  if ($props -contains 'pid' -and $Identity.pid -and [int]$Identity.pid -ne [int]$Proc.ProcessId) { return $false }
+  if ($props -contains 'creation_date' -and $Identity.creation_date) {
+    $liveCreated = ''
+    try { $liveCreated = ([datetime]$Proc.CreationDate).ToString('o') } catch { }
+    if ($liveCreated -and $liveCreated -ne [string]$Identity.creation_date) { return $false }
+  }
+  if ($props -contains 'executable_path' -and $Identity.executable_path -and
+      [string]$Proc.ExecutablePath -ine [string]$Identity.executable_path) { return $false }
+  if ($props -contains 'command_line_hash' -and $Identity.command_line_hash) {
+    $liveHash = Get-CommandLineHash -CommandLine ([string]$Proc.CommandLine)
+    if ($liveHash -ne [string]$Identity.command_line_hash) { return $false }
+  }
+  return $true
+}
+
+function Test-ProcessCreatedNearState {
+  param(
+    $Proc,
+    [string]$StartedAt
+  )
+
+  if (-not $Proc -or -not $StartedAt) { return $false }
+  try {
+    $created = [datetime]$Proc.CreationDate
+    $stateTime = [datetime]$StartedAt
+    return ($created -ge $stateTime.AddMinutes(-20) -and $created -le $stateTime.AddSeconds(5))
+  } catch {
+    return $false
+  }
+}
+
+function Test-IsAncestorProcess {
+  param(
+    [int]$AncestorId,
+    [int]$ProcessId
+  )
+  if ($AncestorId -le 0 -or $ProcessId -le 0) { return $false }
+  $visited = New-Object 'System.Collections.Generic.HashSet[int]'
+  $cursor = Get-ProcessById -Id $ProcessId
+  while ($cursor) {
+    $cursorId = [int]$cursor.ProcessId
+    if (-not $visited.Add($cursorId)) { return $false }
+    if ($cursorId -eq $AncestorId) { return $true }
+    $parentId = $null
+    try { $parentId = [int]$cursor.ParentProcessId } catch { }
+    if (-not $parentId -or $parentId -le 0) { return $false }
+    $cursor = Get-ProcessById -Id $parentId
+  }
+  return $false
+}
+
+function Stop-FastApiProcessTree {
+  param(
+    [int]$LauncherPid,
+    [int]$ListenerPid
+  )
+  $ids = New-Object 'System.Collections.Generic.List[int]'
+  if ($LauncherPid) {
+    foreach ($descId in (Get-ProcessDescendantIds -RootId $LauncherPid)) {
+      $dp = Get-ProcessById -Id $descId
+      if ($dp -and (Test-IsProjectUvicorn -Proc $dp) -and -not $ids.Contains($descId)) { $ids.Add($descId) }
+    }
+  }
+  if ($ListenerPid -and -not $ids.Contains($ListenerPid)) { $ids.Add($ListenerPid) }
+  if ($LauncherPid -and -not $ids.Contains($LauncherPid)) { $ids.Add($LauncherPid) }
+
+  $allOk = $true
+  foreach ($id in $ids) {
+    $r = Stop-OneProcess -Id $id
+    if ($r -eq 'FAILED') { $allOk = $false }
+  }
+
+  return [ordered]@{
+    Ok = $allOk
+    Ids = @($ids)
+  }
+}
+
 # ---------------------------------------------------------------- load state
 $state = $null
 if (Test-Path -LiteralPath $StateFile) {
@@ -165,10 +299,21 @@ try { $script:NgrokHost = ([System.Uri]$script:NgrokBase).Host } catch { }
 if ($state -and $state.port) { $FastApiPort = [int]$state.port }
 
 $stateFastApiPid = $null
+$stateFastApiLauncherPid = $null
+$stateFastApiListenerPid = $null
+$stateFastApiLauncherIdentity = $null
+$stateFastApiListenerIdentity = $null
+$stateStartedAt = $null
 $stateNgrokPid = $null
 if ($state) {
-  if ($state.fastapi_pid) { $stateFastApiPid = [int]$state.fastapi_pid }
-  if ($state.ngrok_pid) { $stateNgrokPid = [int]$state.ngrok_pid }
+  $stateProps = $state.PSObject.Properties.Name
+  if ($stateProps -contains 'fastapi_pid' -and $state.fastapi_pid) { $stateFastApiPid = [int]$state.fastapi_pid }
+  if ($stateProps -contains 'fastapi_launcher_pid' -and $state.fastapi_launcher_pid) { $stateFastApiLauncherPid = [int]$state.fastapi_launcher_pid }
+  if ($stateProps -contains 'fastapi_listener_pid' -and $state.fastapi_listener_pid) { $stateFastApiListenerPid = [int]$state.fastapi_listener_pid }
+  if ($stateProps -contains 'fastapi_launcher_identity') { $stateFastApiLauncherIdentity = $state.fastapi_launcher_identity }
+  if ($stateProps -contains 'fastapi_listener_identity') { $stateFastApiListenerIdentity = $state.fastapi_listener_identity }
+  if ($stateProps -contains 'started_at' -and $state.started_at) { $stateStartedAt = [string]$state.started_at }
+  if ($stateProps -contains 'ngrok_pid' -and $state.ngrok_pid) { $stateNgrokPid = [int]$state.ngrok_pid }
 }
 
 # ================================================================ 1. ngrok
@@ -224,45 +369,86 @@ else {
 }
 
 # ================================================================ 2. FastAPI
-$ourFastApiIds = @()
 $unknownOccupant = $null
+$trackedLauncherPid = $stateFastApiLauncherPid
+$trackedListenerPid = $stateFastApiListenerPid
+
+if ($stateFastApiPid) {
+  # Legacy state only had fastapi_pid. Older versions wrote the port listener
+  # after resolving it, but tolerate a launcher PID if such a file exists.
+  $legacyProc = Get-ProcessById -Id $stateFastApiPid
+  if (-not $trackedListenerPid -and $legacyProc -and (Test-IsProjectUvicorn -Proc $legacyProc)) {
+    $trackedListenerPid = $stateFastApiPid
+  } elseif (-not $trackedLauncherPid) {
+    $trackedLauncherPid = $stateFastApiPid
+  }
+}
 
 $listener = Get-ListenerProcess -Port $FastApiPort
 if ($listener) {
   if (Test-IsProjectUvicorn -Proc $listener) {
-    $ourFastApiIds += $listener.ProcessId
+    $matchesTrackedListener = ($trackedListenerPid -and $listener.ProcessId -eq $trackedListenerPid)
+    $matchesTrackedIdentity = ($matchesTrackedListener -and
+      (-not $stateFastApiListenerIdentity -or
+       (Test-ProcessIdentityMatches -Proc $listener -Identity $stateFastApiListenerIdentity)))
+    $belongsToTrackedLauncher = ($trackedLauncherPid -and
+      (Test-IsAncestorProcess -AncestorId $trackedLauncherPid -ProcessId $listener.ProcessId))
+
+    # Compatibility for managed_version 2 state files that recorded the
+    # launcher PID only. This is deliberately narrower than the new listener
+    # identity path: it requires the expected command/port and a process start
+    # time consistent with the state file.
+    $legacyLauncherStateMatches = (-not $trackedListenerPid -and $trackedLauncherPid -and
+      $stateFastApiPid -eq $trackedLauncherPid -and
+      (Test-ProcessCreatedNearState -Proc $listener -StartedAt $stateStartedAt))
+
+    if ($matchesTrackedListener -and -not $matchesTrackedIdentity) {
+      Write-Warn ("Tracked FastAPI listener PID {0} failed identity validation; leaving it running." -f $listener.ProcessId)
+      $unknownOccupant = $listener
+    } elseif (-not ($matchesTrackedIdentity -or $belongsToTrackedLauncher -or $legacyLauncherStateMatches)) {
+      $unknownOccupant = $listener
+    } else {
+      if (-not $trackedListenerPid) { $trackedListenerPid = [int]$listener.ProcessId }
+    }
   } else {
     $unknownOccupant = $listener
   }
 }
 
-if ($stateFastApiPid) {
-  $sp = Get-CimInstance Win32_Process -Filter "ProcessId=$stateFastApiPid" -ErrorAction SilentlyContinue
-  if ($sp -and (Test-IsProjectUvicorn -Proc $sp)) {
-    $ourFastApiIds += $sp.ProcessId
+if (-not $unknownOccupant -and $trackedListenerPid) {
+  $trackedListenerProc = Get-ProcessById -Id $trackedListenerPid
+  if ($trackedListenerProc -and -not (Test-IsProjectUvicorn -Proc $trackedListenerProc)) {
+    Write-Warn ("Tracked FastAPI listener PID {0} is no longer this project's uvicorn; leaving it running." -f $trackedListenerPid)
+    $trackedListenerPid = $null
+    $script:Incomplete = $true
   }
 }
 
-$ourFastApiIds = @($ourFastApiIds | Sort-Object -Unique)
-
-if ($ourFastApiIds.Count -gt 0) {
-  $allOk = $true
-  foreach ($id in $ourFastApiIds) {
-    $r = Stop-OneProcess -Id $id
-    if ($r -eq 'FAILED') { $allOk = $false }
+if (-not $unknownOccupant -and ($trackedLauncherPid -or $trackedListenerPid)) {
+  if ($trackedLauncherPid) {
+    $launcherProc = Get-ProcessById -Id $trackedLauncherPid
+    if ($launcherProc -and $stateFastApiLauncherIdentity -and
+        -not (Test-ProcessIdentityMatches -Proc $launcherProc -Identity $stateFastApiLauncherIdentity)) {
+      Write-Warn ("Tracked FastAPI launcher PID {0} failed identity validation; it will not be stopped." -f $trackedLauncherPid)
+      $trackedLauncherPid = $null
+      $script:Incomplete = $true
+    } elseif ($launcherProc -and -not $stateFastApiLauncherIdentity -and
+              -not (Test-IsProjectUvicorn -Proc $launcherProc)) {
+      Write-Warn ("Tracked FastAPI launcher PID {0} no longer matches this project's uvicorn command; it will not be stopped." -f $trackedLauncherPid)
+      $trackedLauncherPid = $null
+      $script:Incomplete = $true
+    }
   }
-  Write-Step -Label 'FastAPI' -Status $(if ($allOk) { 'STOPPED' } else { 'STOP FAILED' })
-  Write-Sub -Text ("PID: {0}" -f ($ourFastApiIds -join ', '))
+  $stopResult = Stop-FastApiProcessTree -LauncherPid $trackedLauncherPid -ListenerPid $trackedListenerPid
+  $stoppedIds = @($stopResult.Ids | Sort-Object -Unique)
+  $portCleared = -not (Test-PortListening -Port $FastApiPort)
+  Write-Step -Label 'FastAPI' -Status $(if ($stopResult.Ok -and $portCleared) { 'STOPPED' } else { 'STOP FAILED' })
+  if ($trackedLauncherPid) { Write-Sub -Text ("Launcher PID: {0}" -f $trackedLauncherPid) }
+  if ($trackedListenerPid) { Write-Sub -Text ("Listener PID: {0}" -f $trackedListenerPid) }
+  if ($stoppedIds.Count -gt 0) { Write-Sub -Text ("Stopped PID: {0}" -f ($stoppedIds -join ', ')) }
   Write-Sub -Text 'Piper (in-process) released with FastAPI'
-  if (-not $allOk) { $script:Incomplete = $true }
-
-  if ($unknownOccupant) {
-    Write-Warn ("Port {0} is also held by an unrecognized process — NOT touched." -f $FastApiPort)
-    Write-Sub -Text ("UNKNOWN PID: {0}" -f $unknownOccupant.ProcessId)
-    Write-Sub -Text ("UNKNOWN Path: {0}" -f $unknownOccupant.ExecutablePath)
-    Write-Sub -Text ("UNKNOWN CommandLine: {0}" -f $unknownOccupant.CommandLine)
-    $script:Incomplete = $true
-  }
+  if (-not $portCleared) { Write-Warn ("Port {0} is still LISTENING after stop attempt." -f $FastApiPort) }
+  if (-not $stopResult.Ok -or -not $portCleared) { $script:Incomplete = $true }
 }
 elseif ($unknownOccupant) {
   Write-Step -Label 'FastAPI' -Status 'SKIPPED / UNKNOWN PROCESS'

@@ -125,6 +125,7 @@ class Settings:
     tts_global_concurrency: int = _env_int("TTS_GLOBAL_CONCURRENCY", 2)
     resource_queue_timeout_seconds: int = _env_int("RESOURCE_QUEUE_TIMEOUT_SECONDS", 3)
     ai_queue_timeout_seconds: int = _env_int("AI_QUEUE_TIMEOUT_SECONDS", 30)
+    ai_total_timeout_seconds: int = _env_int("AI_TOTAL_TIMEOUT_SECONDS", 90)
 
 
 settings = Settings()
