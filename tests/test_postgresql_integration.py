@@ -466,3 +466,228 @@ def test_postgresql_resource_usage_quota_unique_increment_and_limit():
         with pytest.raises(IntegrityError):
             db.commit()
         db.rollback()
+
+def _constraint_name(error: IntegrityError) -> str | None:
+    return getattr(getattr(error.orig, "diag", None), "constraint_name", None)
+
+
+def _review_session_values(user_id: UUID, **overrides) -> dict:
+    values = {
+        "user_id": user_id,
+        "review_date": date.today(),
+        "timezone": "UTC",
+        "session_type": "daily_suggested",
+        "started_at": datetime.now(timezone.utc),
+        "status": "active",
+        "batch_size": 5,
+        "total_count": 0,
+        "reviewed_count": 0,
+        "completed_count": 0,
+        "planned_new_count": 0,
+        "planned_review_count": 0,
+        "current_index": 0,
+    }
+    values.update(overrides)
+    return values
+
+
+def _create_constraint_review_context(prefix: str) -> tuple[UUID, UUID, UUID, UUID]:
+    user_id, _ = _create_user(prefix)
+    card_id = _create_review_ready_card(user_id, f"{prefix} card")
+    with SessionLocal() as db:
+        session = ReviewSession(
+            **_review_session_values(
+                user_id,
+                total_count=1,
+                planned_new_count=1,
+            )
+        )
+        db.add(session)
+        db.flush()
+        item = ReviewSessionItem(
+            session_id=session.id,
+            card_id=card_id,
+            position=0,
+            status="pending",
+            reappear_count=0,
+            is_repeat=False,
+            repeat_count=0,
+        )
+        db.add(item)
+        db.commit()
+        return user_id, card_id, session.id, item.id
+
+
+def _review_log_values(
+    user_id: UUID,
+    card_id: UUID,
+    session_id: UUID,
+    session_item_id: UUID,
+    **overrides,
+) -> dict:
+    values = {
+        "user_id": user_id,
+        "card_id": card_id,
+        "session_id": session_id,
+        "session_item_id": session_item_id,
+        "session_type": "daily_suggested",
+        "result": "got_it",
+        "reviewed_at": datetime.now(timezone.utc),
+        "card_state_before_review": "new",
+        "review_state_before": "new",
+        "review_state_after": "reviewing",
+        "mastery_score_before": 0,
+        "mastery_score_after": 1,
+        "recovery_stage_before": 0,
+        "recovery_stage_after": 0,
+    }
+    values.update(overrides)
+    return values
+
+
+def test_postgresql_a_class_constraints_allow_valid_direct_writes():
+    user_id, card_id, session_id, session_item_id = _create_constraint_review_context("pg-a-valid")
+
+    with SessionLocal() as db:
+        usage = ResourceUsage(
+            user_id=user_id,
+            resource="lexical",
+            usage_date=date.today(),
+            count=0,
+        )
+        log = ReviewLog(
+            **_review_log_values(user_id, card_id, session_id, session_item_id)
+        )
+        db.add_all((usage, log))
+        db.commit()
+        assert usage.id is not None
+        assert log.id is not None
+
+
+def test_postgresql_resource_usage_constraints_reject_invalid_direct_writes():
+    invalid_cases = (
+        ({"count": -1}, "ck_resource_usage_count_nonnegative"),
+        ({"resource": "unknown_resource"}, "ck_resource_usage_resource"),
+    )
+    for values, expected_constraint in invalid_cases:
+        user_id, _ = _create_user(f"pg-usage-constraint-{uuid4()}")
+        with SessionLocal() as db:
+            resource_usage_values = {
+                "user_id": user_id,
+                "resource": "ai",
+                "usage_date": date.today(),
+                "count": 0,
+            }
+            resource_usage_values.update(values)
+            db.add(ResourceUsage(**resource_usage_values))
+            with pytest.raises(IntegrityError) as exc_info:
+                db.flush()
+            assert _constraint_name(exc_info.value) == expected_constraint
+            db.rollback()
+
+
+def test_postgresql_review_session_count_constraints_reject_negative_direct_writes():
+    invalid_cases = (
+        ("total_count", "ck_review_sessions_total_count_nonnegative"),
+        ("completed_count", "ck_review_sessions_completed_count_nonnegative"),
+        ("reviewed_count", "ck_review_sessions_reviewed_count_nonnegative"),
+        ("current_index", "ck_review_sessions_current_index_nonnegative"),
+        ("planned_new_count", "ck_review_sessions_planned_new_count_nonnegative"),
+        ("planned_review_count", "ck_review_sessions_planned_review_count_nonnegative"),
+    )
+    for field, expected_constraint in invalid_cases:
+        user_id, _ = _create_user(f"pg-session-constraint-{field}-{uuid4()}")
+        with SessionLocal() as db:
+            db.add(ReviewSession(**_review_session_values(user_id, **{field: -1})))
+            with pytest.raises(IntegrityError) as exc_info:
+                db.flush()
+            assert _constraint_name(exc_info.value) == expected_constraint
+            db.rollback()
+
+
+def test_postgresql_review_session_item_constraints_reject_invalid_direct_writes():
+    invalid_cases = (
+        ("position", -1, "ck_review_session_items_position_nonnegative"),
+        ("repeat_count", -1, "ck_review_session_items_repeat_count_nonnegative"),
+        ("reappear_count", -1, "ck_review_session_items_reappear_count_nonnegative"),
+        ("result", "unknown_result", "ck_review_session_items_result"),
+        ("first_result", "unknown_result", "ck_review_session_items_first_result"),
+        ("final_result", "unknown_result", "ck_review_session_items_final_result"),
+    )
+    for field, value, expected_constraint in invalid_cases:
+        user_id, card_id, session_id, _ = _create_constraint_review_context(
+            f"pg-item-constraint-{field}-{uuid4()}"
+        )
+        with SessionLocal() as db:
+            values = {
+                "session_id": session_id,
+                "card_id": card_id,
+                "position": 1,
+                "status": "pending",
+                "reappear_count": 0,
+                "is_repeat": False,
+                "repeat_count": 0,
+                field: value,
+            }
+            db.add(ReviewSessionItem(**values))
+            with pytest.raises(IntegrityError) as exc_info:
+                db.flush()
+            assert _constraint_name(exc_info.value) == expected_constraint
+            db.rollback()
+
+
+def test_postgresql_review_log_constraints_reject_invalid_direct_writes():
+    invalid_cases = (
+        ("session_type", "unknown_session", "ck_review_logs_session_type"),
+        ("card_state_before_review", "unknown_state", "ck_review_logs_card_state_before_review"),
+        ("review_state_before", "unknown_state", "ck_review_logs_review_state_before"),
+        ("review_state_after", "unknown_state", "ck_review_logs_review_state_after"),
+        ("mastery_score_before", -1, "ck_review_logs_mastery_score_before_range"),
+        ("mastery_score_after", 6, "ck_review_logs_mastery_score_after_range"),
+        ("recovery_stage_before", -1, "ck_review_logs_recovery_stage_before_range"),
+        ("recovery_stage_after", 3, "ck_review_logs_recovery_stage_after_range"),
+    )
+    for field, value, expected_constraint in invalid_cases:
+        user_id, card_id, session_id, session_item_id = _create_constraint_review_context(
+            f"pg-log-constraint-{field}-{uuid4()}"
+        )
+        with SessionLocal() as db:
+            db.add(
+                ReviewLog(
+                    **_review_log_values(
+                        user_id,
+                        card_id,
+                        session_id,
+                        session_item_id,
+                        **{field: value},
+                    )
+                )
+            )
+            with pytest.raises(IntegrityError) as exc_info:
+                db.flush()
+            assert _constraint_name(exc_info.value) == expected_constraint
+            db.rollback()
+
+
+def test_postgresql_review_log_session_item_unique_constraint_rejects_duplicate():
+    user_id, card_id, session_id, session_item_id = _create_constraint_review_context("pg-log-unique")
+
+    with SessionLocal() as db:
+        db.add(ReviewLog(**_review_log_values(user_id, card_id, session_id, session_item_id)))
+        db.commit()
+        db.add(ReviewLog(**_review_log_values(user_id, card_id, session_id, session_item_id)))
+        with pytest.raises(IntegrityError) as exc_info:
+            db.flush()
+        assert _constraint_name(exc_info.value) == "uq_review_logs_session_item_id"
+        db.rollback()
+
+
+def test_postgresql_one_active_session_per_user_constraint_rejects_duplicate():
+    user_id, _, _, _ = _create_constraint_review_context("pg-active-session-unique")
+
+    with SessionLocal() as db:
+        db.add(ReviewSession(**_review_session_values(user_id)))
+        with pytest.raises(IntegrityError) as exc_info:
+            db.flush()
+        assert _constraint_name(exc_info.value) == "ux_review_sessions_one_active_per_user"
+        db.rollback()

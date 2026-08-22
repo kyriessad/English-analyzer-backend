@@ -71,7 +71,7 @@ class Settings:
     expected_database_schema: str = _env_str("EXPECTED_DATABASE_SCHEMA", "public") or "public"
     required_alembic_revision: str = _env_str(
         "REQUIRED_ALEMBIC_REVISION",
-        "d3e4f5a6b7c8",
+        "e4f5a6b7c8d9",
     )
     allow_sqlite_for_tests: bool = _env_bool("ALLOW_SQLITE_FOR_TESTS", False)
     allowed_hosts: tuple[str, ...] = _env_csv(

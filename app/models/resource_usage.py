@@ -1,7 +1,17 @@
 from datetime import date, datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import Date, DateTime, ForeignKey, Index, Integer, String, UniqueConstraint, Uuid
+from sqlalchemy import (
+    CheckConstraint,
+    Date,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+    Uuid,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -12,6 +22,11 @@ class ResourceUsage(Base):
     __tablename__ = "resource_usage"
     __table_args__ = (
         UniqueConstraint("user_id", "resource", "usage_date", name="uq_resource_usage_user_day"),
+        CheckConstraint("count >= 0", name="ck_resource_usage_count_nonnegative"),
+        CheckConstraint(
+            "resource IN ('ai', 'tts', 'lexical')",
+            name="ck_resource_usage_resource",
+        ),
         Index("ix_resource_usage_date_resource", "usage_date", "resource"),
     )
 

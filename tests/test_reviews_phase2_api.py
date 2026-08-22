@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -1311,8 +1312,7 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
                 self.assertEqual(session_type, data["session_type"])
                 self.assertEqual(expected_label, data["session_type_label"])
 
-    def test_history_detail_unknown_session_type_fallback_label(self):
-        """Phase 5-5B: unknown session_type falls back to 其他来源."""
+    def test_history_detail_unknown_session_type_is_rejected_by_database(self):
         card_id = self.create_card(content="unknown type", content_normalized="unknown type")
         with TestingSessionLocal() as db:
             session = ReviewSession(
@@ -1361,15 +1361,9 @@ class ReviewsPhase2ApiTest(unittest.TestCase):
                 recovery_stage_after=0,
             )
             db.add(log)
-            db.commit()
-            log_id = log.id
-
-        response = self.client.get(
-            f"/api/reviews/history/{log_id}",
-            headers=self.auth_headers(),
-        )
-        self.assertEqual(200, response.status_code, response.text)
-        self.assertEqual("其他来源", response.json()["session_type_label"])
+            with self.assertRaises(IntegrityError):
+                db.commit()
+            db.rollback()
 
     def test_history_detail_log_not_found_returns_404(self):
         """Phase 5-5B: non-existent log_id returns 404."""

@@ -13,6 +13,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     Uuid,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -32,8 +33,36 @@ class ReviewSession(Base):
             "status IN ('active', 'completed', 'abandoned', 'expired')",
             name="ck_review_sessions_status",
         ),
+        CheckConstraint("total_count >= 0", name="ck_review_sessions_total_count_nonnegative"),
+        CheckConstraint(
+            "completed_count >= 0",
+            name="ck_review_sessions_completed_count_nonnegative",
+        ),
+        CheckConstraint(
+            "reviewed_count >= 0",
+            name="ck_review_sessions_reviewed_count_nonnegative",
+        ),
+        CheckConstraint(
+            "current_index >= 0",
+            name="ck_review_sessions_current_index_nonnegative",
+        ),
+        CheckConstraint(
+            "planned_new_count >= 0",
+            name="ck_review_sessions_planned_new_count_nonnegative",
+        ),
+        CheckConstraint(
+            "planned_review_count >= 0",
+            name="ck_review_sessions_planned_review_count_nonnegative",
+        ),
         Index("ix_review_sessions_user_date_status", "user_id", "review_date", "status"),
         Index("ix_review_sessions_user_status", "user_id", "status"),
+        Index(
+            "ux_review_sessions_one_active_per_user",
+            "user_id",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+            sqlite_where=text("status = 'active'"),
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
@@ -72,6 +101,30 @@ class ReviewSessionItem(Base):
         CheckConstraint(
             "status IN ('pending', 'reviewed', 'done', 'skipped')",
             name="ck_review_session_items_status",
+        ),
+        CheckConstraint(
+            "position >= 0",
+            name="ck_review_session_items_position_nonnegative",
+        ),
+        CheckConstraint(
+            "repeat_count >= 0",
+            name="ck_review_session_items_repeat_count_nonnegative",
+        ),
+        CheckConstraint(
+            "reappear_count >= 0",
+            name="ck_review_session_items_reappear_count_nonnegative",
+        ),
+        CheckConstraint(
+            "result IS NULL OR result IN ('forgot', 'shaky', 'got_it', 'fluent')",
+            name="ck_review_session_items_result",
+        ),
+        CheckConstraint(
+            "first_result IS NULL OR first_result IN ('forgot', 'shaky', 'got_it', 'fluent')",
+            name="ck_review_session_items_first_result",
+        ),
+        CheckConstraint(
+            "final_result IS NULL OR final_result IN ('forgot', 'shaky', 'got_it', 'fluent')",
+            name="ck_review_session_items_final_result",
         ),
         Index("ix_review_session_items_session_status", "session_id", "status"),
     )
@@ -153,7 +206,40 @@ json_messages_type = JSON().with_variant(JSONB, "postgresql")
 class ReviewLog(Base):
     __tablename__ = "review_logs"
     __table_args__ = (
+        UniqueConstraint("session_item_id", name="uq_review_logs_session_item_id"),
         CheckConstraint("result IN ('forgot', 'shaky', 'got_it', 'fluent')", name="ck_review_logs_result"),
+        CheckConstraint(
+            "session_type IN ('daily_suggested', 'new_only', 'free_review')",
+            name="ck_review_logs_session_type",
+        ),
+        CheckConstraint(
+            "card_state_before_review IN ('new', 'strengthening', 'reviewing', 'mastered')",
+            name="ck_review_logs_card_state_before_review",
+        ),
+        CheckConstraint(
+            "review_state_before IN ('new', 'strengthening', 'reviewing', 'mastered')",
+            name="ck_review_logs_review_state_before",
+        ),
+        CheckConstraint(
+            "review_state_after IN ('new', 'strengthening', 'reviewing', 'mastered')",
+            name="ck_review_logs_review_state_after",
+        ),
+        CheckConstraint(
+            "mastery_score_before BETWEEN 0 AND 5",
+            name="ck_review_logs_mastery_score_before_range",
+        ),
+        CheckConstraint(
+            "mastery_score_after BETWEEN 0 AND 5",
+            name="ck_review_logs_mastery_score_after_range",
+        ),
+        CheckConstraint(
+            "recovery_stage_before BETWEEN 0 AND 2",
+            name="ck_review_logs_recovery_stage_before_range",
+        ),
+        CheckConstraint(
+            "recovery_stage_after BETWEEN 0 AND 2",
+            name="ck_review_logs_recovery_stage_after_range",
+        ),
         Index("ix_review_logs_user_reviewed_at", "user_id", "reviewed_at"),
         Index("ix_review_logs_card_reviewed_at", "card_id", "reviewed_at"),
     )
