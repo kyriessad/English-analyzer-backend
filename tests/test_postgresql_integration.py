@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import date, datetime, timezone
+from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 from uuid import UUID, uuid4
 
 import pytest
@@ -23,7 +25,7 @@ from app.models.resource_usage import ResourceUsage
 from app.models.review import ClientAction, ReviewLog, ReviewSession, ReviewSessionItem
 from app.models.user import User
 from app.services import auth_service
-from app.services.security import consume_daily_quota, rate_limiter
+from app.services.security import check_daily_quota, consume_daily_quota, rate_limiter
 
 
 EXPECTED_TEST_DATABASE = "english_analyzer_phase1_pytest"
@@ -466,6 +468,301 @@ def test_postgresql_resource_usage_quota_unique_increment_and_limit():
         with pytest.raises(IntegrityError):
             db.commit()
         db.rollback()
+
+
+def _quota_count(user_id: UUID) -> int:
+    with SessionLocal() as db:
+        usage = db.scalar(
+            select(ResourceUsage).where(
+                ResourceUsage.user_id == user_id,
+                ResourceUsage.resource == "ai",
+                ResourceUsage.usage_date == date.today(),
+            )
+        )
+        return 0 if usage is None else usage.count
+
+
+def _analyze_payload(suffix: str = "") -> dict:
+    return {
+        "text": f"quota boundary experiment {suffix}".strip(),
+        "cardType": "auto",
+        "targetLang": "zh",
+    }
+
+
+def test_postgresql_quota_precheck_does_not_increment():
+    user_id, _ = _create_user("pg-quota-precheck")
+    before_count = _quota_count(user_id)
+    assert before_count == 0
+    with SessionLocal() as db:
+        check_daily_quota(db, user_id=user_id, resource="ai", limit=2)
+    after_count = _quota_count(user_id)
+    assert after_count == 0
+
+
+def test_postgresql_ai_slot_failure_does_not_increment(client, monkeypatch):
+    user_id, token = _create_user("pg-quota-slot-failure")
+
+    @contextmanager
+    def rejected_slot(*args, **kwargs):
+        from fastapi import HTTPException, status
+
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="slot full")
+        yield
+
+    monkeypatch.setattr("app.main.resource_slot", rejected_slot)
+    before_count = _quota_count(user_id)
+    response = client.post(
+        "/api/analyze-english",
+        headers=_auth_headers(token),
+        json=_analyze_payload(),
+    )
+    assert response.status_code == 503, response.text
+    after_count = _quota_count(user_id)
+    assert before_count == 0
+    assert after_count == 0
+
+
+def test_postgresql_non_stream_ai_failure_keeps_committed_quota(monkeypatch):
+    user_id, token = _create_user("pg-quota-non-stream-failure")
+    events: list[str] = []
+
+    original_check = check_daily_quota
+    original_consume = consume_daily_quota
+
+    def tracked_check(*args, **kwargs):
+        events.append("quota_precheck")
+        return original_check(*args, **kwargs)
+
+    @contextmanager
+    def tracked_slot(*args, **kwargs):
+        events.append("slot_acquired")
+        try:
+            yield
+        finally:
+            events.append("slot_released")
+
+    def tracked_consume(*args, **kwargs):
+        events.append("quota_consume")
+        return original_consume(*args, **kwargs)
+
+    def failing_analyze(**kwargs):
+        events.append("analyze_start")
+        raise RuntimeError("deterministic non-stream AI failure")
+
+    monkeypatch.setattr("app.main.check_daily_quota", tracked_check)
+    monkeypatch.setattr("app.main.resource_slot", tracked_slot)
+    monkeypatch.setattr("app.main.consume_daily_quota", tracked_consume)
+    monkeypatch.setattr("app.main.analyze_text", failing_analyze)
+    with TestClient(app, raise_server_exceptions=False) as failure_client:
+        response = failure_client.post(
+            "/api/analyze-english",
+            headers=_auth_headers(token),
+            json=_analyze_payload("non-stream-failure"),
+        )
+    assert response.status_code == 500
+    assert _quota_count(user_id) == 1
+    assert events == ["quota_precheck", "slot_acquired", "quota_consume", "analyze_start", "slot_released"]
+
+
+def test_postgresql_stream_ai_failure_keeps_committed_quota(monkeypatch):
+    user_id, token = _create_user("pg-quota-stream-failure")
+    events: list[str] = []
+
+    original_check = check_daily_quota
+    original_consume = consume_daily_quota
+
+    def tracked_check(*args, **kwargs):
+        events.append("quota_precheck")
+        return original_check(*args, **kwargs)
+
+    @contextmanager
+    def tracked_slot(*args, **kwargs):
+        events.append("slot_acquired")
+        try:
+            yield
+        finally:
+            events.append("slot_released")
+
+    def tracked_consume(*args, **kwargs):
+        events.append("quota_consume")
+        return original_consume(*args, **kwargs)
+
+    def failing_stream(**kwargs):
+        events.append("analyze_start")
+        yield ("field", "translation", "temporary")
+        raise RuntimeError("deterministic stream AI failure")
+
+    monkeypatch.setattr("app.main.check_daily_quota", tracked_check)
+    monkeypatch.setattr("app.main.resource_slot", tracked_slot)
+    monkeypatch.setattr("app.main.consume_daily_quota", tracked_consume)
+    monkeypatch.setattr("app.main.analyze_text_streaming", failing_stream)
+    with TestClient(app, raise_server_exceptions=False) as failure_client:
+        response = failure_client.post(
+            "/api/analyze-english/stream",
+            headers=_auth_headers(token),
+            json=_analyze_payload("stream-failure"),
+        )
+    assert response.status_code == 200
+    assert _quota_count(user_id) == 1
+    assert events == ["quota_precheck", "slot_acquired", "quota_consume", "analyze_start", "slot_released"]
+
+
+def test_postgresql_non_stream_ai_call_order(monkeypatch):
+    user_id, token = _create_user("pg-quota-order")
+    events: list[str] = []
+
+    original_check = check_daily_quota
+    original_consume = consume_daily_quota
+
+    def tracked_check(*args, **kwargs):
+        events.append("quota_precheck")
+        return original_check(*args, **kwargs)
+
+    @contextmanager
+    def tracked_slot(*args, **kwargs):
+        events.append("slot_acquired")
+        try:
+            yield
+        finally:
+            events.append("slot_released")
+
+    def tracked_consume(*args, **kwargs):
+        events.append("quota_consume")
+        return original_consume(*args, **kwargs)
+
+    def tracked_analyze(**kwargs):
+        events.append("analyze_start")
+        return {
+            "ok": True,
+            "level": "pass",
+            "category": "unknown",
+            "normalizedText": "quota boundary experiment non-stream-order",
+            "warnings": [],
+            "errors": [],
+            "provider": "mock",
+        }
+
+    monkeypatch.setattr("app.main.check_daily_quota", tracked_check)
+    monkeypatch.setattr("app.main.resource_slot", tracked_slot)
+    monkeypatch.setattr("app.main.consume_daily_quota", tracked_consume)
+    monkeypatch.setattr("app.main.analyze_text", tracked_analyze)
+
+    with TestClient(app, raise_server_exceptions=False) as failure_client:
+        response = failure_client.post(
+            "/api/analyze-english",
+            headers=_auth_headers(token),
+            json=_analyze_payload("non-stream-order"),
+        )
+
+    assert response.status_code == 200, response.text
+    assert events == ["quota_precheck", "slot_acquired", "quota_consume", "analyze_start", "slot_released"]
+
+
+def test_postgresql_stream_ai_slot_failure_does_not_increment(monkeypatch):
+    user_id, token = _create_user("pg-quota-stream-slot-failure")
+
+    @contextmanager
+    def rejected_slot(*args, **kwargs):
+        from fastapi import HTTPException, status
+
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="slot full")
+        yield
+
+    monkeypatch.setattr("app.main.resource_slot", rejected_slot)
+    before_count = _quota_count(user_id)
+    with TestClient(app, raise_server_exceptions=False) as failure_client:
+        response = failure_client.post(
+            "/api/analyze-english/stream",
+            headers=_auth_headers(token),
+            json=_analyze_payload("stream-slot-failure"),
+        )
+    assert response.status_code == 503, response.text
+    after_count = _quota_count(user_id)
+    assert before_count == 0
+    assert after_count == 0
+
+
+def test_postgresql_stream_ai_call_order(monkeypatch):
+    user_id, token = _create_user("pg-quota-stream-order")
+    events: list[str] = []
+
+    original_check = check_daily_quota
+    original_consume = consume_daily_quota
+
+    def tracked_check(*args, **kwargs):
+        events.append("quota_precheck")
+        return original_check(*args, **kwargs)
+
+    @contextmanager
+    def tracked_slot(*args, **kwargs):
+        events.append("slot_acquired")
+        try:
+            yield
+        finally:
+            events.append("slot_released")
+
+    def tracked_consume(*args, **kwargs):
+        events.append("quota_consume")
+        return original_consume(*args, **kwargs)
+
+    def tracked_stream(**kwargs):
+        events.append("analyze_start")
+        yield ("final", {
+            "ok": True,
+            "level": "pass",
+            "category": "unknown",
+            "normalizedText": "quota boundary experiment stream-order",
+            "warnings": [],
+            "errors": [],
+            "provider": "mock",
+        })
+
+    monkeypatch.setattr("app.main.check_daily_quota", tracked_check)
+    monkeypatch.setattr("app.main.resource_slot", tracked_slot)
+    monkeypatch.setattr("app.main.consume_daily_quota", tracked_consume)
+    monkeypatch.setattr("app.main.analyze_text_streaming", tracked_stream)
+
+    with TestClient(app, raise_server_exceptions=False) as failure_client:
+        response = failure_client.post(
+            "/api/analyze-english/stream",
+            headers=_auth_headers(token),
+            json=_analyze_payload("stream-order"),
+        )
+
+    assert response.status_code == 200, response.text
+    assert events == ["quota_precheck", "slot_acquired", "quota_consume", "analyze_start", "slot_released"]
+
+
+def test_postgresql_concurrent_quota_consumption_is_atomic():
+    user_id, _ = _create_user("pg-quota-concurrent")
+    limit = 4
+
+    def consume() -> str:
+        try:
+            with SessionLocal() as db:
+                consume_daily_quota(db, user_id=user_id, resource="ai", limit=limit)
+            return "success"
+        except Exception as exc:  # quota rejection is an expected race outcome
+            return type(exc).__name__
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        outcomes = list(executor.map(lambda _: consume(), range(8)))
+
+    assert outcomes.count("success") == limit
+    with SessionLocal() as db:
+        rows = list(
+            db.scalars(
+                select(ResourceUsage).where(
+                    ResourceUsage.user_id == user_id,
+                    ResourceUsage.resource == "ai",
+                    ResourceUsage.usage_date == date.today(),
+                )
+            )
+        )
+    assert len(rows) == 1
+    assert rows[0].count == limit
+
 
 def _constraint_name(error: IntegrityError) -> str | None:
     return getattr(getattr(error.orig, "diag", None), "constraint_name", None)

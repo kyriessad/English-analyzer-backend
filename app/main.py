@@ -63,6 +63,7 @@ from app.services.request_reliability import (
     wait_for_ai_request_record,
 )
 from app.services.security import (
+    check_daily_quota,
     consume_daily_quota,
     enforce_resource_rate_limit,
     resource_slot,
@@ -494,13 +495,24 @@ def analyze_english(
         return AnalyzeResponse(**_reliability_error_response(error, payload.text))
 
     try:
-        consume_daily_quota(
+        check_daily_quota(
             db,
             user_id=current_user.id,
             resource="ai",
             limit=settings.ai_daily_quota,
         )
+        log_event(logger, logging.INFO, "quota_precheck", resource="ai", outcome="passed")
+        log_event(logger, logging.INFO, "ai_slot_wait_start", resource="ai")
         with resource_slot("ai", _slot_timeout(deadline_at)):
+            log_event(logger, logging.INFO, "ai_slot_acquired", resource="ai")
+            consume_daily_quota(
+                db,
+                user_id=current_user.id,
+                resource="ai",
+                limit=settings.ai_daily_quota,
+            )
+            log_event(logger, logging.INFO, "quota_committed", resource="ai", increment=1)
+            log_event(logger, logging.INFO, "ai_analyze_start", resource="ai", provider="ollama", model=settings.ollama_model)
             with observed_operation(
                 "ai",
                 "analyze_english",
@@ -674,20 +686,32 @@ def analyze_english_stream(
             headers={"Content-Encoding": "identity"},
         )
 
+    slot_entered = False
     try:
+        check_daily_quota(
+            db,
+            user_id=current_user.id,
+            resource="ai",
+            limit=settings.ai_daily_quota,
+        )
+        log_event(logger, logging.INFO, "quota_precheck", resource="ai", outcome="passed")
+        # Acquire the AI slot before reserving quota, then hold it for the stream.
+        log_event(logger, logging.INFO, "ai_slot_wait_start", resource="ai")
+        slot = resource_slot("ai", _slot_timeout(deadline_at))
+        slot.__enter__()
+        slot_entered = True
+        log_event(logger, logging.INFO, "ai_slot_acquired", resource="ai")
         consume_daily_quota(
             db,
             user_id=current_user.id,
             resource="ai",
             limit=settings.ai_daily_quota,
         )
-        # Acquire the AI concurrency slot synchronously so a full queue still
-        # returns 503 before the response starts (matching the non-stream
-        # endpoint), then hold it for the whole stream and release it when the
-        # stream finishes.
-        slot = resource_slot("ai", _slot_timeout(deadline_at))
-        slot.__enter__()
+        log_event(logger, logging.INFO, "quota_committed", resource="ai", increment=1)
+        log_event(logger, logging.INFO, "ai_analyze_start", resource="ai", provider="ollama", model=settings.ollama_model)
     except HTTPException as exc:
+        if slot_entered:
+            slot.__exit__(type(exc), exc, exc.__traceback__)
         if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
             code, stage = "AI_DAILY_QUOTA", "quota"
         else:
@@ -704,6 +728,8 @@ def analyze_english_stream(
         )
         raise
     except Exception as exc:
+        if slot_entered:
+            slot.__exit__(type(exc), exc, exc.__traceback__)
         _ai_event("failure", "AI_INTERNAL_ERROR", error_type=type(exc).__name__)
         finish_ai_request(
             key,

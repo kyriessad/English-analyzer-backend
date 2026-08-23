@@ -413,7 +413,7 @@ function Get-ManagedConfig {
     expected_database_dialect = (Get-EffectiveEnvValue -Name 'EXPECTED_DATABASE_DIALECT' -Default 'postgresql').ToLowerInvariant()
     expected_database_name = Get-EffectiveEnvValue -Name 'EXPECTED_DATABASE_NAME' -Default 'english_analyzer'
     expected_database_schema = Get-EffectiveEnvValue -Name 'EXPECTED_DATABASE_SCHEMA' -Default 'public'
-    required_alembic_revision = Get-EffectiveEnvValue -Name 'REQUIRED_ALEMBIC_REVISION' -Default 'd3e4f5a6b7c8'
+    required_alembic_revision = Get-EffectiveEnvValue -Name 'REQUIRED_ALEMBIC_REVISION' -Default 'f5a6b7c8d9e'
     allow_sqlite_for_tests = (Get-EffectiveBoolValue -Name 'ALLOW_SQLITE_FOR_TESTS' -Default $false)
     allowed_hosts = ($allowedHosts -join ',')
     max_request_body_bytes = (Get-EffectiveIntValue -Name 'MAX_REQUEST_BODY_BYTES' -Default 1048576)

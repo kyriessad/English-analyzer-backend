@@ -10,6 +10,7 @@ from uuid import UUID
 
 from fastapi import HTTPException, Request, status
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -56,6 +57,30 @@ _resource_semaphores = {
 }
 
 
+def check_daily_quota(
+    db: Session,
+    *,
+    user_id: UUID,
+    resource: str,
+    limit: int,
+) -> None:
+    """Check quota before queueing without reserving a unit."""
+    usage = db.scalar(
+        select(ResourceUsage).where(
+            ResourceUsage.user_id == user_id,
+            ResourceUsage.resource == resource,
+            ResourceUsage.usage_date == date.today(),
+        )
+    )
+    over_limit = usage is not None and usage.count >= max(1, limit)
+    db.rollback()
+    if over_limit:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="今日调用额度已用完",
+        )
+
+
 def consume_daily_quota(
     db: Session,
     *,
@@ -63,24 +88,42 @@ def consume_daily_quota(
     resource: str,
     limit: int,
 ) -> None:
+    """Atomically reserve one unit and commit a short transaction."""
     today = date.today()
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        db.execute(
+            pg_insert(ResourceUsage)
+            .values(user_id=user_id, resource=resource, usage_date=today, count=0)
+            .on_conflict_do_nothing(
+                index_elements=[
+                    ResourceUsage.user_id,
+                    ResourceUsage.resource,
+                    ResourceUsage.usage_date,
+                ]
+            )
+        )
+    else:
+        usage = db.scalar(
+            select(ResourceUsage).where(
+                ResourceUsage.user_id == user_id,
+                ResourceUsage.resource == resource,
+                ResourceUsage.usage_date == today,
+            )
+        )
+        if usage is None:
+            db.add(ResourceUsage(user_id=user_id, resource=resource, usage_date=today, count=0))
+            db.flush()
+
     usage = db.scalar(
-        select(ResourceUsage).where(
+        select(ResourceUsage)
+        .where(
             ResourceUsage.user_id == user_id,
             ResourceUsage.resource == resource,
             ResourceUsage.usage_date == today,
         )
+        .with_for_update()
     )
-    if usage is None:
-        usage = ResourceUsage(
-            user_id=user_id,
-            resource=resource,
-            usage_date=today,
-            count=0,
-        )
-        db.add(usage)
-        db.flush()
-    if usage.count >= max(1, limit):
+    if usage is None or usage.count >= max(1, limit):
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,

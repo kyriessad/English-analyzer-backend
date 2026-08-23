@@ -7,10 +7,14 @@ __pycache__/
 .mypy_cache/
 
 .env
+.env.*
+!.env.example
 *.db
 *.sqlite
 *.sqlite3
 *.argosmodel
+*.dump
+*.partial
 
 .DS_Store
 .vscode/
@@ -25,6 +29,11 @@ tests/**/__pycache__/
 uvicorn-*.log
 logs/
 .runtime/
+
+# Local fault-experiment outputs and credentials
+fault-experiments/token.txt
+fault-experiments/*.execution.json
+fault-experiments/*.toc.list
 
 # Local language assets
 data/ecdict/
