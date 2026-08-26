@@ -6,7 +6,7 @@
 .DESCRIPTION
   Checks/start PostgreSQL, Ollama, the FastAPI backend (always via the project
   .venv, without --reload), warms qwen3:8b, confirms in-process Piper warmup,
-  and checks/starts the fixed-domain ngrok tunnel. Every step polls a real
+  and, only when explicitly enabled, checks/starts an ngrok tunnel. Every step polls a real
   health endpoint instead of relying on a fixed sleep. Re-running the script
   reuses any service that is already running correctly instead of starting a
   second copy.
@@ -16,12 +16,7 @@
   .\start-server.ps1
 #>
 [CmdletBinding()]
-param(
-  # Fixed ngrok domain (scheme + host, no trailing slash). When empty, the
-  # value is read from English-study-miniapp's localBackendConfig.js, then
-  # falls back to the current fixed domain.
-  [string]$NgrokDomain = ""
-)
+param()
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -34,7 +29,6 @@ $StdoutLog = Join-Path $LogsDir 'server.out.log'
 $StderrLog = Join-Path $LogsDir 'server.err.log'
 $StateDir = Join-Path $BackendDir '.runtime'
 $StateFile = Join-Path $StateDir 'server-state.json'
-$MiniappConfigPath = Join-Path (Split-Path -Parent $BackendDir) 'English-study-miniapp\utils\localBackendConfig.js'
 
 $FastApiPort = 8000
 $FastApiHost = '0.0.0.0'
@@ -42,7 +36,7 @@ $FastApiHealthUrl = "http://127.0.0.1:$FastApiPort/health"
 $OllamaUrl = 'http://127.0.0.1:11434'
 $OllamaModel = 'qwen3:8b'
 $PgPort = 5432
-$FallbackNgrokDomain = 'https://detergent-starry-oboe.ngrok-free.dev'
+$NgrokApiUrl = 'http://127.0.0.1:4040/api/tunnels'
 
 $script:StepNumber = 0
 $script:StepLabel = ''
@@ -279,27 +273,24 @@ function Test-ProcessIdentityMatches {
   return $true
 }
 
-function Get-NgrokDomainFromConfig {
-  if (-not (Test-Path -LiteralPath $MiniappConfigPath)) { return $null }
-  $content = Get-Content -LiteralPath $MiniappConfigPath -Raw
-  if ($content -match "NGROK_BACKEND_BASE_URL\s*=\s*['`"]([^'`"]+)['`"]") {
-    return $Matches[1]
+function Get-NgrokExe {
+  $configured = Get-EffectiveEnvValue -Name 'NGROK_EXE' -Default ''
+  if ($configured) {
+    if (-not (Test-Path -LiteralPath $configured -PathType Leaf)) { Fail "NGROK_EXE does not exist: $configured" }
+    return (Resolve-Path -LiteralPath $configured).Path
   }
+  $command = Get-Command ngrok -ErrorAction SilentlyContinue
+  if ($command) { return $command.Source }
   return $null
 }
 
-function Get-ProjectNgrokProcess {
-  # Returns the ngrok process serving THIS project's fixed domain on THIS
-  # port. Never used to identify other tunnels, so a future second ngrok is
-  # left alone.
-  $procs = Get-CimInstance Win32_Process -Filter "Name='ngrok.exe'" -ErrorAction SilentlyContinue
-  foreach ($p in $procs) {
-    if ($p.CommandLine -and
-        $p.CommandLine -match [regex]::Escape($script:NgrokHost) -and
-        $p.CommandLine -match ('\b{0}\b' -f $FastApiPort)) {
-      return $p
-    }
-  }
+function Get-NgrokPublicUrl {
+  try {
+    $match = @((Invoke-RestMethod -Uri $NgrokApiUrl -TimeoutSec 5).tunnels | Where-Object {
+      $_.public_url -match '^https://' -and $_.config.addr -match (":{0}$" -f $FastApiPort)
+    } | Select-Object -First 1)
+    if ($match.Count -gt 0) { return [string]$match[0].public_url }
+  } catch { }
   return $null
 }
 
@@ -409,7 +400,7 @@ function Get-ManagedConfig {
       $allowedHosts += $hostName
     }
   }
-  if ($script:NgrokHost -and ($allowedHosts -notcontains $script:NgrokHost)) {
+  if ($script:NgrokEnabled -and $script:NgrokHost -and ($allowedHosts -notcontains $script:NgrokHost)) {
     $allowedHosts += $script:NgrokHost
   }
 
@@ -474,11 +465,13 @@ function Get-ManagedConfig {
     fastapi = $fastapi
     fastapi_hash = Get-SettingHash -Value $fastapi
     ngrok = [ordered]@{
+      enabled = $script:NgrokEnabled
       base = $script:NgrokBase
       host = $script:NgrokHost
       port = $FastApiPort
     }
     ngrok_hash = Get-SettingHash -Value ([ordered]@{
+      enabled = $script:NgrokEnabled
       base = $script:NgrokBase
       host = $script:NgrokHost
       port = $FastApiPort
@@ -560,12 +553,13 @@ if (-not $effectiveDatabaseUrl) {
   Fail "DATABASE_URL is not set in the environment or .env. Set it as a User environment variable (password must not be committed). See .env.example."
 }
 
-$script:NgrokBase = $NgrokDomain
-if (-not $script:NgrokBase) { $script:NgrokBase = Get-NgrokDomainFromConfig }
-if (-not $script:NgrokBase) { $script:NgrokBase = $FallbackNgrokDomain }
-$script:NgrokBase = $script:NgrokBase.TrimEnd('/')
+$script:NgrokEnabled = Get-EffectiveBoolValue -Name 'NGROK_ENABLED' -Default $false
+$script:NgrokBase = (Get-EffectiveEnvValue -Name 'NGROK_DOMAIN' -Default '').TrimEnd('/')
 $script:NgrokHost = $null
-try { $script:NgrokHost = ([System.Uri]$script:NgrokBase).Host } catch { }
+if ($script:NgrokBase) {
+  try { $script:NgrokHost = ([System.Uri]$script:NgrokBase).Host } catch { Fail 'NGROK_DOMAIN must be an absolute URL.' }
+  if (-not $script:NgrokHost) { Fail 'NGROK_DOMAIN must contain a host.' }
+}
 
 $runtimeConfig = Get-ManagedConfig
 $allowedHosts = @($runtimeConfig.allowed_hosts)
@@ -969,120 +963,33 @@ if ($piperMale.Status -eq 'WARM') {
 }
 $piperDegraded = ($piperFemale.Status -ne 'WARM') -or ($piperMale.Status -ne 'WARM')
 
-# ================================================================ 7. ngrok
-$script:StepLabel = 'ngrok / public health'
-$publicHealthUrl = "$($script:NgrokBase)/health"
-function Test-PublicHealth {
-  $script:PublicHealthLastFailure = 'no response'
-  $headers = @{ 'ngrok-skip-browser-warning' = '1' }
-  try {
-    $timeout = Get-StageTimeoutSec -Preferred 8
-    if ($timeout -le 0) { return $false }
-    $resp = Invoke-WebRequest -Uri $publicHealthUrl -Headers $headers -TimeoutSec $timeout -UseBasicParsing
-    return Test-PublicHealthResponse -Response $resp
-  } catch {
-    $details = Get-HealthResponseDetails -ErrorRecord $_
-    if ($details.status) {
-      $script:PublicHealthLastFailure = "HTTP $($details.status)" + $(if ($details.body) { "`n$($details.body)" } else { '' })
-    } elseif ($details.body) {
-      $script:PublicHealthLastFailure = $details.body
-    } else {
-      $script:PublicHealthLastFailure = $details.message
-    }
-    return $false
-  }
-}
-
-function Test-PublicHealthResponse {
-  param([Parameter(Mandatory)]$Response)
-
-  $status = 0
-  try { $status = [int]$Response.StatusCode } catch { }
-  $body = ''
-  try { $body = [string]$Response.Content } catch { }
-  $errorCode = $null
-  try { $errorCode = $Response.Headers['Ngrok-Error-Code'] } catch { }
-
-  if ($status -ne 200) {
-    $script:PublicHealthLastFailure = "HTTP $status" + $(if ($body) { "`n$body" } else { '' })
-    return $false
-  }
-  if ($errorCode) {
-    $script:PublicHealthLastFailure = "HTTP 200 with Ngrok-Error-Code $errorCode"
-    return $false
-  }
-  if ($body -match 'ERR_NGROK_\d+') {
-    $script:PublicHealthLastFailure = $body.Trim()
-    return $false
-  }
-
-  try {
-    $json = $body | ConvertFrom-Json
-    if ($json.status -eq 'ok') { return $true }
-    $script:PublicHealthLastFailure = "HTTP 200 but health payload was not status=ok: $body"
-    return $false
-  } catch {
-    $script:PublicHealthLastFailure = "HTTP 200 but response was not backend health: $body"
-    return $false
-  }
-}
-
-$ngrokProc = $null
-$ngrokReused = $false
-if ($stateNgrokPid) {
-  $ngrokProc = Get-CimInstance Win32_Process -Filter "ProcessId=$stateNgrokPid" -ErrorAction SilentlyContinue
-  if ($ngrokProc -and $ngrokProc.Name -eq 'ngrok.exe' -and
-      $ngrokProc.CommandLine -match [regex]::Escape($script:NgrokHost) -and
-      $ngrokProc.CommandLine -match ('\b{0}\b' -f $FastApiPort)) {
-    if ($stateNgrokHash -and $stateNgrokHash -eq $desiredNgrokHash) {
-      $ngrokReused = $true
-    } else {
-      if (-not (Stop-OneProcess -Id $stateNgrokPid)) {
-        Fail "Managed ngrok PID $stateNgrokPid could not be stopped before restart."
-      }
-      $ngrokProc = $null
-    }
-  }
-}
-
-if (-not (Test-PublicHealth)) {
-  if (-not $ngrokReused) {
-    $existingNgrok = Get-ProjectNgrokProcess
-    if (-not $existingNgrok) {
-      $ngrokExeCommand = Get-Command ngrok -ErrorAction SilentlyContinue
-      $ngrokExe = if ($ngrokExeCommand) { $ngrokExeCommand.Source } else { $null }
-      if (-not $ngrokExe) { Fail "ngrok executable not found on PATH." }
-      Start-Process -FilePath $ngrokExe -ArgumentList @('http', [string]$FastApiPort, '--url', $script:NgrokBase) -WindowStyle Hidden
-    } else {
-      Write-Sub -Text 'ngrok process already exists; waiting for the fixed tunnel to become healthy.'
-      $ngrokProc = $existingNgrok
-    }
-  }
-
+# ================================================================ 7. ngrok (optional)
+if (-not $script:NgrokEnabled) {
+  Write-Step -Label 'ngrok' -Status 'DISABLED'
+  Write-Sub -Text 'FastAPI is ready for local development without ngrok.'
+} else {
+  $script:StepLabel = 'ngrok / public health'
+  $ngrokExe = Get-NgrokExe
+  if (-not $ngrokExe) { Fail 'ngrok is enabled but NGROK_EXE is not set and ngrok is not on PATH.' }
+  $arguments = @('http', [string]$FastApiPort)
+  if ($script:NgrokBase) { $arguments += @('--url', $script:NgrokBase) }
+  $ngrokProc = Start-Process -FilePath $ngrokExe -ArgumentList $arguments -WindowStyle Hidden -PassThru
+  $script:NgrokPid = $ngrokProc.Id
   $deadline = (Get-Date).AddSeconds([Math]::Min(45, [Math]::Max(5, (Get-RemainingStartupSeconds))))
-  while ((Get-Date) -lt $deadline) {
-    Start-Sleep -Seconds 2
-    if (Get-RemainingStartupSeconds -le 0) { break }
-    if (Test-PublicHealth) {
-      break
-    }
-    Write-Sub -Text ("ngrok health retry failed: {0}" -f $script:PublicHealthLastFailure)
-  }
-  if (-not (Test-PublicHealth)) {
-    Write-Sub -Text 'ngrok public health: FAILED'
-    Write-Sub -Text $script:PublicHealthLastFailure
-    Fail "ngrok public health check failed after 45s: $publicHealthUrl ($($script:PublicHealthLastFailure))."
-  }
+  do {
+    Start-Sleep -Seconds 1
+    $publicUrl = Get-NgrokPublicUrl
+  } while (-not $publicUrl -and (Get-Date) -lt $deadline)
+  if (-not $publicUrl) { Fail 'ngrok started but did not publish an HTTPS URL within 45 seconds.' }
+  $script:NgrokBase = $publicUrl.TrimEnd('/')
+  $script:NgrokHost = ([System.Uri]$script:NgrokBase).Host
+  try {
+    $response = Invoke-WebRequest -Uri "$($script:NgrokBase)/health" -Headers @{ 'ngrok-skip-browser-warning' = '1' } -TimeoutSec 10 -UseBasicParsing
+    if ($response.StatusCode -ne 200 -or (($response.Content | ConvertFrom-Json).status -ne 'ok')) { throw 'unexpected health response' }
+  } catch { Fail "ngrok public health check failed: $($_.Exception.Message)" }
+  Write-Step -Label 'ngrok' -Status 'READY'
+  Write-Sub -Text ("Public URL: {0}" -f $script:NgrokBase)
 }
-
-if (-not $ngrokProc) {
-  $ngrokProc = Get-ProjectNgrokProcess
-}
-if ($ngrokProc) { $script:NgrokPid = $ngrokProc.ProcessId }
-
-Write-Step -Label 'ngrok' -Status ('OK' + $(if ($ngrokReused) { ' (reused)' } else { '' }))
-Write-Sub -Text ("Public URL: {0}" -f $script:NgrokBase)
-Write-Sub -Text 'ngrok public health: READY'
 
 # ---------------------------------------------------------------- runtime state
 # Record the live PIDs for stop-server.ps1. No secrets are stored here.

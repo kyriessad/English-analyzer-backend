@@ -37,9 +37,6 @@ $FastApiPort = 8000
 $OllamaUrl = 'http://127.0.0.1:11434'
 $OllamaModel = 'qwen3:8b'
 $PgPort = 5432
-$NgrokApiUrl = 'http://127.0.0.1:4040/api/tunnels'
-$FallbackNgrokDomain = 'https://detergent-starry-oboe.ngrok-free.dev'
-$MiniappConfigPath = Join-Path (Split-Path -Parent $BackendDir) 'English-study-miniapp\utils\localBackendConfig.js'
 $StateDir = Join-Path $BackendDir '.runtime'
 $StateFile = Join-Path $StateDir 'server-state.json'
 
@@ -111,15 +108,6 @@ function Test-OllamaUp {
   } catch {
     return $false
   }
-}
-
-function Get-NgrokDomainFromConfig {
-  if (-not (Test-Path -LiteralPath $MiniappConfigPath)) { return $null }
-  $content = Get-Content -LiteralPath $MiniappConfigPath -Raw
-  if ($content -match "NGROK_BACKEND_BASE_URL\s*=\s*['`"]([^'`"]+)['`"]") {
-    return $Matches[1]
-  }
-  return $null
 }
 
 function Stop-OneProcess {
@@ -286,16 +274,6 @@ if (Test-Path -LiteralPath $StateFile) {
   }
 }
 
-$script:NgrokBase = $FallbackNgrokDomain
-if ($state -and $state.ngrok_domain) { $script:NgrokBase = [string]$state.ngrok_domain }
-else {
-  $cfg = Get-NgrokDomainFromConfig
-  if ($cfg) { $script:NgrokBase = $cfg }
-}
-$script:NgrokBase = $script:NgrokBase.TrimEnd('/')
-$script:NgrokHost = $null
-try { $script:NgrokHost = ([System.Uri]$script:NgrokBase).Host } catch { }
-
 if ($state -and $state.port) { $FastApiPort = [int]$state.port }
 
 $stateFastApiPid = $null
@@ -318,32 +296,12 @@ if ($state) {
 
 # ================================================================ 1. ngrok
 $ngrokIds = @()
-$tunnelUp = $false
-
-$ngrokProcs = Get-CimInstance Win32_Process -Filter "Name='ngrok.exe'" -ErrorAction SilentlyContinue
-foreach ($p in $ngrokProcs) {
-  if ($p.CommandLine -and
-      $p.CommandLine -match [regex]::Escape($script:NgrokHost) -and
-      $p.CommandLine -match ('\b{0}\b' -f $FastApiPort)) {
-    $ngrokIds += $p.ProcessId
-  }
-}
-
 if ($stateNgrokPid) {
   $sp = Get-CimInstance Win32_Process -Filter "ProcessId=$stateNgrokPid" -ErrorAction SilentlyContinue
-  if ($sp -and $sp.Name -eq 'ngrok.exe' -and $sp.CommandLine -and $sp.CommandLine -match [regex]::Escape($script:NgrokHost)) {
+  if ($sp -and $sp.Name -eq 'ngrok.exe' -and $sp.CommandLine -match ('\b{0}\b' -f $FastApiPort)) {
     $ngrokIds += $sp.ProcessId
   }
 }
-
-$ngrokIds = @($ngrokIds | Sort-Object -Unique)
-
-try {
-  $tunnelsResp = Invoke-RestMethod -Uri $NgrokApiUrl -TimeoutSec 5
-  foreach ($t in $tunnelsResp.tunnels) {
-    if ($t.public_url -and $t.public_url -match [regex]::Escape($script:NgrokHost)) { $tunnelUp = $true }
-  }
-} catch { }
 
 if ($ngrokIds.Count -gt 0) {
   $allOk = $true
@@ -354,15 +312,6 @@ if ($ngrokIds.Count -gt 0) {
   Write-Step -Label 'ngrok' -Status $(if ($allOk) { 'STOPPED' } else { 'STOP FAILED' })
   Write-Sub -Text ("PID: {0}" -f ($ngrokIds -join ', '))
   if (-not $allOk) { $script:Incomplete = $true }
-}
-elseif ($tunnelUp) {
-  Write-Step -Label 'ngrok' -Status 'NOT STOPPED (unconfirmed)'
-  Write-Warn ("A tunnel for {0} is still up, but no matching ngrok process could be confirmed; leaving it running." -f $script:NgrokBase)
-  $allNgrok = Get-Process ngrok -ErrorAction SilentlyContinue
-  foreach ($np in $allNgrok) {
-    Write-Sub -Text ("ngrok process PID {0}: {1}" -f $np.Id, $np.Path)
-  }
-  $script:Incomplete = $true
 }
 else {
   Write-Step -Label 'ngrok' -Status 'NOT RUNNING'

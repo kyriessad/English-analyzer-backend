@@ -161,12 +161,25 @@ Success: it prints True twice. PIPER_DATA_DIR can move the directory;
 PIPER_FEMALE_VOICE, PIPER_MALE_VOICE, PIPER_DEFAULT_VOICE, and
 PIPER_AUDIO_CACHE_DIR are optional overrides.
 
-An optional ECDICT database is ignored at data\ecdict\ecdict.db. The repository
-has no downloader or canonical public source configuration for it. Its absence
-can leave phonetic/dictionary information empty, but does not block login,
-cards, Ollama analysis, Piper audio, or review.
+## 7. Prepare ECDICT
 
-## 7. Start and Verify the Backend
+ECDICT provides local phonetic and dictionary enrichment. It is downloaded from
+the upstream [skywind3000/ECDICT](https://github.com/skywind3000/ECDICT)
+repository at pinned commit `bc015ed2e24a7abef49fc6dbbb7fe32c1dadaf8b`
+under its MIT license. The exact raw source URL is
+`https://raw.githubusercontent.com/skywind3000/ECDICT/bc015ed2e24a7abef49fc6dbbb7fe32c1dadaf8b/ecdict.csv`.
+The upstream source is CSV;
+the project builds the compatible SQLite `stardict` table locally.
+
+    .\scripts\setup-ecdict.ps1
+
+The generated, Git-ignored target is `data\ecdict\ecdict.db`. The command keeps
+an existing valid database unchanged. It verifies SQLite can open it, that the
+required `stardict.word`, `phonetic`, and `translation` fields exist, and that a
+known `hello` lookup has phonetic and translation data. Success prints
+`ECDICT READY`; failure prints `ECDICT SETUP FAILED` and exits non-zero.
+
+## 8. Start and Verify the Backend
 
 For the first local start, use Uvicorn directly. It works without ngrok and is
 the correct path for a DevTools simulator using 127.0.0.1.
@@ -183,26 +196,22 @@ voice assets are absent; the server can still start but TTS will be unavailable.
 ### Managed Start Script
 
 start-server.ps1 additionally checks PostgreSQL, configuration, Alembic,
-Ollama, FastAPI, Piper warmup, and a public ngrok health URL. It requires ngrok
-on PATH and a reserved fixed ngrok domain in your account. Only after reserving
-that domain, run:
+Ollama, FastAPI, and Piper warmup. ngrok is disabled by default, so this is a
+valid local managed-start command:
 
-    .\start-server.ps1 -NgrokDomain https://your-reserved-domain.ngrok-free.app
+    .\start-server.ps1
 
 Success: it ends with SERVER READY, or SERVER READY (Piper degraded - TTS may be
-unavailable). Do not use it with a random temporary ngrok URL. For release
-migrations, use [release-runbook.md](release-runbook.md), not this script.
+unavailable), and reports `ngrok DISABLED`. For release migrations, use
+[release-runbook.md](release-runbook.md), not this script.
 
-## 8. Configure and Run the Mini Program
+## 9. Configure and Run the Mini Program
 
-The client reads BACKEND_BASE_URL from
-C:\Projects\English-study-miniapp\utils\localBackendConfig.js. The repository
-currently tracks this file and may contain another developer's local address;
-replace it in your own worktree before compiling. Configure local DevTools with:
+The client reads BACKEND_BASE_URL from its ignored local configuration. Create it
+from the tracked example, then use the local default for DevTools:
 
-    module.exports = {
-      BACKEND_BASE_URL: 'http://127.0.0.1:8000'
-    };
+    Set-Location C:\Projects\English-study-miniapp
+    Copy-Item .\utils\localBackendConfig.example.js .\utils\localBackendConfig.js
 
 In WeChat Developer Tools, import C:\Projects\English-study-miniapp. Choose
 your own Mini Program AppID during import, or set the appid in
@@ -218,19 +227,21 @@ Success: the project compiles without a blocking error. Trigger a backend action
 the app calls wx.login, posts the code to /api/auth/wechat-login, and stores the
 returned access token. A successful login lets cards load from the backend.
 
-## 9. Phone HTTPS with ngrok
+## 10. Phone HTTPS with ngrok (optional)
 
 DevTools and a phone are different clients. 127.0.0.1 on a phone means the
 phone itself, not your Windows computer. Real Mini Program requests generally
 need an HTTPS domain; ngrok is a development bridge, not a FastAPI dependency
 or production solution.
 
-In another PowerShell window:
+Install and configure your own ngrok account only when phone HTTPS is needed.
+The simplest temporary-tunnel path is to leave the backend running, then in
+another PowerShell window run:
 
     ngrok http 8000
 
-Copy the displayed HTTPS forwarding URL, update BACKEND_BASE_URL to it, and add
-its host to backend .env:
+Copy the displayed HTTPS forwarding URL, update the ignored
+`utils\localBackendConfig.js`, and add its host to backend `.env`:
 
     ALLOWED_HOSTS=127.0.0.1,localhost,your-temporary-domain.ngrok-free.app
 
@@ -239,7 +250,20 @@ code in WeChat. Success: the phone can log in and load backend data. When ngrok
 creates a new URL, repeat both updates. Production requires a stable domain,
 HTTPS certificate, and WeChat legal-domain configuration.
 
-## 10. Smoke Test Checklist
+To let the managed script start ngrok instead, set these optional `.env` values:
+
+    NGROK_ENABLED=true
+    NGROK_DOMAIN=
+    NGROK_EXE=
+
+`NGROK_EXE` is optional and otherwise uses `ngrok` on PATH. An empty
+`NGROK_DOMAIN` asks ngrok for a temporary URL; set a URL only when your ngrok
+account has one configured. For a temporary URL, ALLOWED_HOSTS must permit the
+generated host before startup; the separate `ngrok http 8000` flow above is the
+simplest first-phone path. Never commit a domain or credential. The script
+prints the public URL after verifying `/health`.
+
+## 11. Smoke Test Checklist
 
 After DevTools login, and separately on a phone when required, verify:
 
@@ -255,7 +279,7 @@ After DevTools login, and separately on a phone when required, verify:
 If one check fails, see [troubleshooting.md](troubleshooting.md) before changing
 resource limits or credentials.
 
-## 11. Run Tests
+## 12. Run Tests
 
 The backend suite creates and drops the isolated
 english_analyzer_phase1_pytest database; it does not use the application
@@ -276,7 +300,7 @@ install is required:
 
 Success: Node reports all subtests passing.
 
-## 12. Stop Safely
+## 13. Stop Safely
 
 For direct Uvicorn, press Ctrl+C in its terminal. For a temporary ngrok tunnel,
 press Ctrl+C in its terminal. PostgreSQL and Ollama are installed services and
@@ -289,20 +313,9 @@ processes with:
 
 It intentionally leaves PostgreSQL and Ollama running.
 
-## Reproducibility Gaps
+## Reproducibility Status
 
-1. data\ecdict\ecdict.db is ignored and has no downloader or canonical public
-   source in this repository. ECDICT-backed phonetic/dictionary enrichment is
-   not reproducible from the repository alone.
-2. start-server.ps1 assumes a reserved fixed ngrok domain and has a
-   project-specific fallback. A new developer can use direct Uvicorn plus
-   temporary ngrok, but cannot use the managed script unchanged until they
-   reserve and configure their own domain.
-3. utils\localBackendConfig.js is tracked even though it is environment-specific.
-   A new developer can replace it by following this guide, but the repository
-   should eventually provide an ignored template instead of committing a local
-   address.
-
-Neither gap blocks the core smoke test except ECDICT-specific lexical
-enrichment. They should be resolved in code/configuration before claiming a
-fully self-contained managed-start or ECDICT setup.
+The setup path downloads ECDICT from a pinned public upstream, keeps ngrok
+optional for local work, and creates the Mini Program backend URL from a tracked
+safe template. No author-machine asset, tunnel domain, or local configuration is
+required for the base Windows setup.

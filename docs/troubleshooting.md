@@ -44,15 +44,16 @@ as a shortcut. Read docs/release-runbook.md for release migrations.
 
 ## start-server.ps1 refuses to start
 
-**Symptom:** configuration/database preflight fails, ngrok is missing, or public
-health fails.
+**Symptom:** configuration/database preflight fails, or an explicitly enabled
+ngrok tunnel fails.
 
 **Check:** Run scripts\check_config.py and scripts\check_database_target.py with
 .\.venv\Scripts\python.exe. Check ngrok version if using the script.
 
-**Fix:** Correct .env first. For initial local DevTools work, use direct Uvicorn
-from the setup guide. start-server.ps1 additionally requires a reserved fixed
-ngrok domain and is not the temporary-tunnel command.
+**Fix:** Correct .env first. `ngrok: DISABLED` is normal for local development.
+Only set `NGROK_ENABLED=true` for phone HTTPS; then install ngrok or set a valid
+NGROK_EXE path. If tunnel health fails, use the shown public URL in the ignored
+Mini Program configuration and add its host to ALLOWED_HOSTS before restarting.
 
 ## Port 8000 is already in use
 
@@ -100,10 +101,12 @@ check the Mini Program download/network error first.
 
 **Symptom:** request failure, timeout, or connection refused in the simulator.
 
-**Check:** Open http://127.0.0.1:8000/health from Windows and inspect
-utils\localBackendConfig.js.
+**Check:** Open http://127.0.0.1:8000/health from Windows and confirm
+utils\localBackendConfig.js exists.
 
-**Fix:** set BACKEND_BASE_URL to http://127.0.0.1:8000, compile again, and
+**Fix:** if it is missing, copy `utils\localBackendConfig.example.js` to
+`utils\localBackendConfig.js`. Set BACKEND_BASE_URL to http://127.0.0.1:8000,
+compile again, and
 enable the local DevTools debug option that skips valid-domain/TLS/HTTPS checks.
 That option is for development only.
 
@@ -143,13 +146,17 @@ english_analyzer_phase1_pytest. Run node --version for the frontend test.
 .\scripts\run-postgresql-tests.ps1. Install Node.js LTS and run:
 node --test .\tests\stream-provisional.test.js from the Mini Program repository.
 
-## ECDICT phonetic data is empty
+## ECDICT is missing, download failed, or SQLite is invalid
 
 **Symptom:** lexical information has no ECDICT-backed phonetic or dictionary
 entry while other functions work.
 
-**Check:** look for data\ecdict\ecdict.db or the configured ECDICT_DB_PATH.
+**Check:** run:
 
-**Fix:** this is a known reproducibility gap. The repository has no downloader
-or canonical public ECDICT source. Keep this feature optional until a documented
-source and setup command are added.
+    .\scripts\setup-ecdict.ps1 -ValidateOnly
+
+**Fix:** run ` .\scripts\setup-ecdict.ps1`. It downloads the pinned public
+ECDICT CSV and builds `data\ecdict\ecdict.db`. A valid existing database is not
+overwritten; use `-Force` only when you deliberately want to replace it. Check
+internet access to GitHub if download fails. `ECDICT SETUP FAILED` is non-zero
+and includes the validation/download reason.

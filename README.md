@@ -57,6 +57,7 @@ english_analyzer.
     .\.venv\Scripts\alembic.exe upgrade head
     .\.venv\Scripts\python.exe scripts\check_config.py
     .\.venv\Scripts\python.exe scripts\check_database_target.py
+    .\scripts\setup-ecdict.ps1
     .\scripts\setup-local-ai.ps1
     .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 
@@ -65,8 +66,8 @@ In another PowerShell window, verify:
     Invoke-RestMethod http://127.0.0.1:8000/health
 
 Expected result: @{status=ok}. This is the recommended first-start path because
-it has no ngrok dependency. start-server.ps1 is a managed local-server script,
-but it requires ngrok and a reserved fixed ngrok domain; see the setup guide.
+it has no ngrok dependency. `start-server.ps1` is also local by default;
+enable ngrok only for phone HTTPS as described in the setup guide.
 
 ## Configuration
 
