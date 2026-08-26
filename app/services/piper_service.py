@@ -187,6 +187,24 @@ def prune_audio_cache(protected_path: Path | None = None) -> None:
     record_operation_result("tts", "wav_cache_prune", "success", time.perf_counter() - started)
 
 
+def get_cached_audio(text: str, voice: str | None = None) -> Path | None:
+    """Return an existing valid WAV without entering the Piper execution queue."""
+    started = time.perf_counter()
+    normalized_text = normalize_pronunciation_text(text)
+    if not normalized_text:
+        raise PronunciationError("Text is required.")
+
+    key = _cache_key(normalized_text, voice)
+    cache_path = Path(settings.piper_audio_cache_dir) / f"{key}.wav"
+    if not cache_path.is_file() or cache_path.stat().st_size <= 44:
+        return None
+
+    TTS_CACHE_EVENTS_TOTAL.labels(operation="wav_cache", result="hit").inc()
+    record_operation_result("tts", "wav_cache", "hit", time.perf_counter() - started)
+    prune_audio_cache(protected_path=cache_path)
+    return cache_path
+
+
 def synthesize_or_get_cached_audio(text: str, voice: str | None = None) -> Path:
     started = time.perf_counter()
     normalized_text = normalize_pronunciation_text(text)
@@ -201,16 +219,15 @@ def synthesize_or_get_cached_audio(text: str, voice: str | None = None) -> Path:
             f"Invalid voice '{voice}'. Supported values: male, female."
         )
 
+    cached_path = get_cached_audio(normalized_text, resolved_voice)
+    if cached_path is not None:
+        return cached_path
+
     cache_dir = Path(settings.piper_audio_cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     key = _cache_key(normalized_text, resolved_voice)
     cache_path = cache_dir / f"{key}.wav"
-    if cache_path.is_file() and cache_path.stat().st_size > 44:
-        TTS_CACHE_EVENTS_TOTAL.labels(operation="wav_cache", result="hit").inc()
-        record_operation_result("tts", "wav_cache", "hit", time.perf_counter() - started)
-        prune_audio_cache(protected_path=cache_path)
-        return cache_path
 
     lock = _get_cache_lock(key)
     with lock:

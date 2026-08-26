@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import date, datetime, timezone
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from uuid import UUID, uuid4
 
@@ -503,14 +503,14 @@ def test_postgresql_quota_precheck_does_not_increment():
 def test_postgresql_ai_slot_failure_does_not_increment(client, monkeypatch):
     user_id, token = _create_user("pg-quota-slot-failure")
 
-    @contextmanager
-    def rejected_slot(*args, **kwargs):
+    @asynccontextmanager
+    async def rejected_slot(*args, **kwargs):
         from fastapi import HTTPException, status
 
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="slot full")
         yield
 
-    monkeypatch.setattr("app.main.resource_slot", rejected_slot)
+    monkeypatch.setattr("app.main.async_resource_slot", rejected_slot)
     before_count = _quota_count(user_id)
     response = client.post(
         "/api/analyze-english",
@@ -534,8 +534,8 @@ def test_postgresql_non_stream_ai_failure_keeps_committed_quota(monkeypatch):
         events.append("quota_precheck")
         return original_check(*args, **kwargs)
 
-    @contextmanager
-    def tracked_slot(*args, **kwargs):
+    @asynccontextmanager
+    async def tracked_slot(*args, **kwargs):
         events.append("slot_acquired")
         try:
             yield
@@ -551,7 +551,7 @@ def test_postgresql_non_stream_ai_failure_keeps_committed_quota(monkeypatch):
         raise RuntimeError("deterministic non-stream AI failure")
 
     monkeypatch.setattr("app.main.check_daily_quota", tracked_check)
-    monkeypatch.setattr("app.main.resource_slot", tracked_slot)
+    monkeypatch.setattr("app.main.async_resource_slot", tracked_slot)
     monkeypatch.setattr("app.main.consume_daily_quota", tracked_consume)
     monkeypatch.setattr("app.main.analyze_text", failing_analyze)
     with TestClient(app, raise_server_exceptions=False) as failure_client:
@@ -576,8 +576,8 @@ def test_postgresql_stream_ai_failure_keeps_committed_quota(monkeypatch):
         events.append("quota_precheck")
         return original_check(*args, **kwargs)
 
-    @contextmanager
-    def tracked_slot(*args, **kwargs):
+    @asynccontextmanager
+    async def tracked_slot(*args, **kwargs):
         events.append("slot_acquired")
         try:
             yield
@@ -594,7 +594,7 @@ def test_postgresql_stream_ai_failure_keeps_committed_quota(monkeypatch):
         raise RuntimeError("deterministic stream AI failure")
 
     monkeypatch.setattr("app.main.check_daily_quota", tracked_check)
-    monkeypatch.setattr("app.main.resource_slot", tracked_slot)
+    monkeypatch.setattr("app.main.async_resource_slot", tracked_slot)
     monkeypatch.setattr("app.main.consume_daily_quota", tracked_consume)
     monkeypatch.setattr("app.main.analyze_text_streaming", failing_stream)
     with TestClient(app, raise_server_exceptions=False) as failure_client:
@@ -619,8 +619,8 @@ def test_postgresql_non_stream_ai_call_order(monkeypatch):
         events.append("quota_precheck")
         return original_check(*args, **kwargs)
 
-    @contextmanager
-    def tracked_slot(*args, **kwargs):
+    @asynccontextmanager
+    async def tracked_slot(*args, **kwargs):
         events.append("slot_acquired")
         try:
             yield
@@ -644,7 +644,7 @@ def test_postgresql_non_stream_ai_call_order(monkeypatch):
         }
 
     monkeypatch.setattr("app.main.check_daily_quota", tracked_check)
-    monkeypatch.setattr("app.main.resource_slot", tracked_slot)
+    monkeypatch.setattr("app.main.async_resource_slot", tracked_slot)
     monkeypatch.setattr("app.main.consume_daily_quota", tracked_consume)
     monkeypatch.setattr("app.main.analyze_text", tracked_analyze)
 
@@ -662,14 +662,14 @@ def test_postgresql_non_stream_ai_call_order(monkeypatch):
 def test_postgresql_stream_ai_slot_failure_does_not_increment(monkeypatch):
     user_id, token = _create_user("pg-quota-stream-slot-failure")
 
-    @contextmanager
-    def rejected_slot(*args, **kwargs):
+    @asynccontextmanager
+    async def rejected_slot(*args, **kwargs):
         from fastapi import HTTPException, status
 
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="slot full")
         yield
 
-    monkeypatch.setattr("app.main.resource_slot", rejected_slot)
+    monkeypatch.setattr("app.main.async_resource_slot", rejected_slot)
     before_count = _quota_count(user_id)
     with TestClient(app, raise_server_exceptions=False) as failure_client:
         response = failure_client.post(
@@ -694,8 +694,8 @@ def test_postgresql_stream_ai_call_order(monkeypatch):
         events.append("quota_precheck")
         return original_check(*args, **kwargs)
 
-    @contextmanager
-    def tracked_slot(*args, **kwargs):
+    @asynccontextmanager
+    async def tracked_slot(*args, **kwargs):
         events.append("slot_acquired")
         try:
             yield
@@ -719,7 +719,7 @@ def test_postgresql_stream_ai_call_order(monkeypatch):
         })
 
     monkeypatch.setattr("app.main.check_daily_quota", tracked_check)
-    monkeypatch.setattr("app.main.resource_slot", tracked_slot)
+    monkeypatch.setattr("app.main.async_resource_slot", tracked_slot)
     monkeypatch.setattr("app.main.consume_daily_quota", tracked_consume)
     monkeypatch.setattr("app.main.analyze_text_streaming", tracked_stream)
 

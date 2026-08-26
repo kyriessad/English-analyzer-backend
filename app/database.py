@@ -1,12 +1,16 @@
 """Database wiring and non-secret runtime identity checks."""
 from collections.abc import Generator
 from dataclasses import dataclass
+from pathlib import Path
 
+from alembic.config import Config as AlembicConfig
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.core.config import settings
+from app.observability.metrics import bind_db_pool_metrics
 
 
 DATABASE_URL = settings.database_url
@@ -30,7 +34,22 @@ if DATABASE_DIALECT != settings.expected_database_dialect and not _sqlite_test_a
 
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 
-engine = create_engine(DATABASE_URL, connect_args=connect_args, pool_pre_ping=True)
+if DATABASE_DIALECT == "postgresql":
+    engine = create_engine(
+        DATABASE_URL,
+        connect_args=connect_args,
+        pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+        pool_timeout=settings.db_pool_timeout,
+        pool_pre_ping=True,
+    )
+else:
+    engine = create_engine(
+        DATABASE_URL,
+        connect_args=connect_args,
+        pool_pre_ping=True,
+    )
+bind_db_pool_metrics(engine.pool)
 
 
 if DATABASE_URL.startswith("sqlite"):
@@ -60,6 +79,34 @@ class DatabaseRuntimeInfo:
     search_path: str
     alembic_revisions: tuple[str, ...]
     url_source: str
+
+
+@dataclass(frozen=True)
+class ExpectedAlembicRevision:
+    revision: str
+    source: str
+
+
+def get_expected_alembic_revision() -> ExpectedAlembicRevision:
+    """Resolve the explicit restore override or the unique Alembic code head."""
+    override = settings.required_alembic_revision.strip()
+    if override:
+        return ExpectedAlembicRevision(
+            revision=override,
+            source="environment_override",
+        )
+
+    backend_root = Path(__file__).resolve().parents[1]
+    config = AlembicConfig(str(backend_root / "alembic.ini"))
+    script = ScriptDirectory.from_config(config)
+    heads = tuple(sorted(script.get_heads()))
+    if len(heads) != 1:
+        rendered_heads = ",".join(heads) or "none"
+        raise RuntimeError(
+            "Alembic code head safety check failed: expected exactly one head, "
+            f"found {len(heads)} ({rendered_heads})"
+        )
+    return ExpectedAlembicRevision(revision=heads[0], source="alembic_head")
 
 
 def get_database_runtime_info() -> DatabaseRuntimeInfo:
@@ -110,10 +157,14 @@ def get_database_runtime_info() -> DatabaseRuntimeInfo:
         )
 
 
-def assert_expected_database(info: DatabaseRuntimeInfo) -> None:
+def assert_expected_database(
+    info: DatabaseRuntimeInfo,
+    expected_revision: ExpectedAlembicRevision | None = None,
+) -> None:
     """Abort non-test startup when the reached database is not the approved target."""
     if _sqlite_test_allowed:
         return
+    expected_revision = expected_revision or get_expected_alembic_revision()
     problems: list[str] = []
     if info.dialect != settings.expected_database_dialect:
         problems.append(
@@ -127,14 +178,12 @@ def assert_expected_database(info: DatabaseRuntimeInfo) -> None:
         problems.append(
             f"schema is '{info.schema}', expected '{settings.expected_database_schema}'"
         )
-    if (
-        settings.required_alembic_revision
-        and info.alembic_revisions != (settings.required_alembic_revision,)
-    ):
+    if info.alembic_revisions != (expected_revision.revision,):
         problems.append(
             "Alembic revision is "
             f"{list(info.alembic_revisions) or ['missing']}, "
-            f"expected ['{settings.required_alembic_revision}']"
+            f"expected ['{expected_revision.revision}'] "
+            f"from {expected_revision.source}"
         )
     if problems:
         raise RuntimeError("Database startup safety check failed: " + "; ".join(problems))

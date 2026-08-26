@@ -13,6 +13,7 @@ from typing import Any, Callable
 import requests
 
 from app.core.config import settings
+from app.observability.logging import log_event
 from app.observability.operations import observed_operation
 from app.providers.argos_translator import ArgosTranslator
 from app.services.hunyuan_example import _text_in_sentence
@@ -675,6 +676,173 @@ def _extract_complete_fields(text: str) -> list[tuple[str, Any]]:
     return fields
 
 
+_STREAM_DELTA_FIELDS = (
+    "meaning",
+    "usageScenario",
+    "exampleSentence",
+    "exampleTranslation",
+)
+_JSON_SIMPLE_ESCAPES = {
+    '"': '"',
+    "\\": "\\",
+    "/": "/",
+    "b": "\b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+}
+_JSON_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_JSON_DECODER = json.JSONDecoder()
+
+
+def _decode_partial_json_string(text: str, start: int) -> tuple[str, int | None, bool]:
+    """Decode the committed prefix of one JSON string.
+
+    ``text`` may end at any byte-decoded Ollama chunk boundary, including in the
+    middle of ``\\n``, ``\\u4f60`` or a UTF-16 surrogate pair. Incomplete escape
+    sequences are deliberately withheld until the next chunk, which guarantees
+    that a character is neither emitted twice nor replaced with mojibake.
+
+    Returns ``(decoded_prefix, end, complete)``. ``end`` is the first character
+    after the closing quote when the string is complete; otherwise it is ``None``.
+    """
+    if start >= len(text) or text[start] != '"':
+        return "", None, False
+
+    decoded: list[str] = []
+    i = start + 1
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            return "".join(decoded), i + 1, True
+        if ch != "\\":
+            # A raw control character makes the JSON invalid. Do not expose the
+            # malformed suffix; the authoritative full parse will reject it.
+            if ord(ch) < 0x20:
+                return "".join(decoded), None, False
+            decoded.append(ch)
+            i += 1
+            continue
+
+        if i + 1 >= n:
+            return "".join(decoded), None, False
+        escape = text[i + 1]
+        simple = _JSON_SIMPLE_ESCAPES.get(escape)
+        if simple is not None:
+            decoded.append(simple)
+            i += 2
+            continue
+        if escape != "u":
+            return "".join(decoded), None, False
+        if i + 6 > n:
+            return "".join(decoded), None, False
+
+        raw_codepoint = text[i + 2 : i + 6]
+        if any(char not in _JSON_HEX_DIGITS for char in raw_codepoint):
+            return "".join(decoded), None, False
+        codepoint = int(raw_codepoint, 16)
+        if 0xD800 <= codepoint <= 0xDBFF:
+            # A high surrogate is not committed until its low surrogate is also
+            # present. This matters when Ollama splits an escaped emoji in half.
+            if i + 12 > n or text[i + 6 : i + 8] != "\\u":
+                return "".join(decoded), None, False
+            raw_low = text[i + 8 : i + 12]
+            if any(char not in _JSON_HEX_DIGITS for char in raw_low):
+                return "".join(decoded), None, False
+            low = int(raw_low, 16)
+            if not 0xDC00 <= low <= 0xDFFF:
+                return "".join(decoded), None, False
+            combined = 0x10000 + ((codepoint - 0xD800) << 10) + (low - 0xDC00)
+            decoded.append(chr(combined))
+            i += 12
+            continue
+        if 0xDC00 <= codepoint <= 0xDFFF:
+            return "".join(decoded), None, False
+        decoded.append(chr(codepoint))
+        i += 6
+
+    return "".join(decoded), None, False
+
+
+def _complete_json_value_end(text: str, start: int) -> int | None:
+    """Return the end of a complete JSON value, or ``None`` for a partial value."""
+    try:
+        _, relative_end = _JSON_DECODER.raw_decode(text[start:])
+    except (TypeError, ValueError):
+        return None
+    return start + relative_end
+
+
+def _extract_streamable_string_prefixes(text: str) -> dict[str, str]:
+    """Return decoded prefixes for the safe top-level string fields only.
+
+    This is intentionally not a general streaming JSON parser. It walks root
+    object members in order, skips completed non-string values with Python's
+    JSON decoder, and exposes only the four user-facing scalar strings. Nested
+    keys such as ``alternativeMeanings[*].meaning`` can therefore never leak
+    into the provisional UI.
+    """
+    prefixes: dict[str, str] = {}
+    n = len(text)
+    i = 0
+    while i < n and text[i] in " \t\r\n":
+        i += 1
+    if i >= n or text[i] != "{":
+        return prefixes
+    i += 1
+
+    while i < n:
+        while i < n and text[i] in " \t\r\n":
+            i += 1
+        if i >= n or text[i] == "}":
+            return prefixes
+        if text[i] == ",":
+            i += 1
+            continue
+        if text[i] != '"':
+            return prefixes
+
+        key, key_end, key_complete = _decode_partial_json_string(text, i)
+        if not key_complete or key_end is None:
+            return prefixes
+        i = key_end
+        while i < n and text[i] in " \t\r\n":
+            i += 1
+        if i >= n or text[i] != ":":
+            return prefixes
+        i += 1
+        while i < n and text[i] in " \t\r\n":
+            i += 1
+        if i >= n:
+            return prefixes
+
+        if key in _STREAM_DELTA_FIELDS and text[i] == '"':
+            value, value_end, value_complete = _decode_partial_json_string(text, i)
+            prefixes[key] = value
+            if not value_complete or value_end is None:
+                return prefixes
+            i = value_end
+        else:
+            value_end = _complete_json_value_end(text, i)
+            if value_end is None:
+                return prefixes
+            i = value_end
+
+        while i < n and text[i] in " \t\r\n":
+            i += 1
+        if i >= n:
+            return prefixes
+        if text[i] == ",":
+            i += 1
+            continue
+        if text[i] == "}":
+            return prefixes
+        return prefixes
+    return prefixes
+
+
 def _post_generate_stream(payload: dict[str, Any], deadline: float) -> requests.Response:
     with observed_operation(
         "ollama",
@@ -702,72 +870,59 @@ _STREAM_FIELD_ORDER = [
 ]
 
 
-def generate_analysis_with_ollama_stream(
-    text: str,
-    category: str | None = None,
+@dataclass(frozen=True)
+class _StreamAttemptOutcome:
+    result: _AttemptResult | None
+    seq: int
+    fail_reason: str | None = None
+    retryable: bool = False
+    cancelled: bool = False
+
+
+def _generate_analysis_stream_attempt(
+    target: str,
     *,
-    deadline: float | None = None,
-    attempt_recorder: Callable[[], None] | None = None,
-    cancel_controller: StreamCancelController | None = None,
+    deadline: float,
+    attempt: int,
+    seq_start: int,
+    attempt_recorder: Callable[[], None] | None,
+    cancel_controller: StreamCancelController | None,
 ):
-    """Stream a single Ollama analysis call, yielding field events as they complete.
-
-    Yields ``("field", key, raw_value)`` for each complete top-level JSON field,
-    then a final ``("result", dict | None)`` where the dict matches
-    ``generate_analysis_with_ollama`` (or None on failure).
-
-    The model does not necessarily emit fields in the prompt's order (constrained
-    decoding tends to emit the schema ``required`` fields first). To guarantee the
-    "primary meaning first" progressive UX, completed fields are buffered and
-    re-emitted in ``_STREAM_FIELD_ORDER`` as soon as every earlier field is done.
-
-    The single Ollama request is never retried here: a retry would mean a second
-    model call, which the streaming flow must not make. ``deadline`` (a monotonic
-    timestamp) bounds the single request; when omitted ``ollama_timeout_seconds``
-    from now is used.
-
-    ``cancel_controller`` (a :class:`StreamCancelController`) is polled on every
-    streamed line and wires ``response.close()`` to the controller so a client
-    disconnect can abort a blocking read from another thread. When the controller
-    is firing, the generator yields ``("cancelled", None)`` instead of a result so
-    the caller can classify the outcome as a cancellation, never a 500.
-    """
-    target = str(text or "").strip()
-    if not target:
-        yield ("result", None)
-        return
-
-    if deadline is None:
-        deadline = time.monotonic() + settings.ollama_timeout_seconds
+    """Run one Ollama stream and return its normalized validation outcome."""
     payload = _build_payload(
         target,
         None,
-        strict_retry=False,
+        strict_retry=attempt > 1,
         format_spec=_json_schema_format(),
         stream=True,
     )
-
     if cancel_controller is not None and cancel_controller.cancelled():
         logger.info("[ollama][diag] fail_reason=client_cancelled (pre-open)")
-        yield ("cancelled", None)
-        return
+        return _StreamAttemptOutcome(None, seq_start, "client_cancelled", cancelled=True)
 
+    attempt_started = time.monotonic()
     try:
         if attempt_recorder:
             attempt_recorder()
+        log_event(
+            logger,
+            logging.INFO,
+            "ollama_generation_start",
+            operation="api_generate_stream",
+            result=True,
+            attempt=attempt,
+            model=payload.get("model"),
+        )
         response = _post_generate_stream(payload, deadline)
     except _OllamaDeadlineExpired:
         logger.warning("[ollama][diag] fail_reason=ollama_total_timeout")
-        yield ("result", None)
-        return
+        return _StreamAttemptOutcome(None, seq_start, "ollama_total_timeout")
     except requests.exceptions.Timeout:
         logger.warning("[ollama][diag] fail_reason=ollama_timeout")
-        yield ("result", None)
-        return
+        return _StreamAttemptOutcome(None, seq_start, "ollama_timeout")
     except requests.exceptions.RequestException:
         logger.warning("[ollama][diag] fail_reason=ollama_unavailable")
-        yield ("result", None)
-        return
+        return _StreamAttemptOutcome(None, seq_start, "ollama_unavailable")
 
     if response.status_code != 200:
         logger.warning(
@@ -775,18 +930,19 @@ def generate_analysis_with_ollama_stream(
             response.status_code,
         )
         response.close()
-        yield ("result", None)
-        return
+        return _StreamAttemptOutcome(None, seq_start, "ollama_http_error")
 
     if cancel_controller is not None:
-        # Closing the response is what unblocks a ``iter_lines()`` read that is
-        # stuck on the socket; registered once so a disconnect can abort it from
-        # another thread instead of waiting for a socket timeout.
+        # Closing the response unblocks an iter_lines() socket read when the
+        # FastAPI disconnect watcher fires from another thread.
         cancel_controller.add_close_callback(response.close)
 
     buffer = ""
     completed: dict[str, Any] = {}
-    emitted: set[str] = set()
+    emitted_fields: set[str] = set()
+    emitted_prefixes = {key: "" for key in _STREAM_DELTA_FIELDS}
+    seq = seq_start
+    first_body_delta_logged = False
     stream_result = "success"
     try:
         for raw_line in response.iter_lines(decode_unicode=False):
@@ -805,23 +961,60 @@ def generate_analysis_with_ollama_stream(
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            delta = obj.get("response")
-            if isinstance(delta, str):
-                buffer += delta
+
+            raw_delta = obj.get("response")
+            if isinstance(raw_delta, str):
+                buffer += raw_delta
+
+            # Re-scan the small accumulated JSON prefix and emit only newly
+            # committed decoded characters. A pending escape stays withheld.
+            prefixes = _extract_streamable_string_prefixes(buffer)
+            for key in _STREAM_DELTA_FIELDS:
+                current = prefixes.get(key)
+                if current is None:
+                    continue
+                previous = emitted_prefixes[key]
+                if current == previous:
+                    continue
+                if not current.startswith(previous):
+                    # The source buffer is append-only, so this would indicate a
+                    # parser invariant violation. Never risk duplicate UI text.
+                    logger.warning(
+                        "[ollama][diag] fail_reason=stream_delta_prefix_mismatch | field=%s | attempt=%s",
+                        key,
+                        attempt,
+                    )
+                    continue
+                body_delta = current[len(previous) :]
+                emitted_prefixes[key] = current
+                if not body_delta:
+                    continue
+                seq += 1
+                if not first_body_delta_logged:
+                    first_body_delta_logged = True
+                    log_event(
+                        logger,
+                        logging.INFO,
+                        "first_ollama_delta",
+                        attempt=attempt,
+                        duration_ms=round((time.monotonic() - attempt_started) * 1000, 1),
+                        field=key,
+                        seq=seq,
+                    )
+                yield ("delta", key, body_delta, seq, attempt)
+
             for key, value in _extract_complete_fields(buffer):
                 if key not in completed:
                     completed[key] = value
-            # Emit completed fields in the fixed progressive order so the primary
-            # meaning always appears first, regardless of the model's output order.
-            # ``break`` (not ``continue``) holds later-priority fields back until
-            # every earlier field has been emitted.
+            # Preserve the existing field-level ordering contract. Delta events
+            # are independent and can appear as soon as a safe string grows.
             for key in _STREAM_FIELD_ORDER:
-                if key in emitted:
+                if key in emitted_fields:
                     continue
                 if key not in completed:
                     break
-                emitted.add(key)
-                yield ("field", key, completed[key])
+                emitted_fields.add(key)
+                yield ("field", key, completed[key], attempt)
             if obj.get("done"):
                 break
     except GeneratorExit:
@@ -832,50 +1025,128 @@ def generate_analysis_with_ollama_stream(
     except _OllamaDeadlineExpired:
         stream_result = "timeout"
         logger.warning("[ollama][diag] fail_reason=ollama_total_timeout")
-        yield ("result", None)
-        return
+        return _StreamAttemptOutcome(None, seq, "ollama_total_timeout")
     except requests.exceptions.Timeout:
         stream_result = "timeout"
         logger.warning("[ollama][diag] fail_reason=ollama_timeout")
-        yield ("result", None)
-        return
+        return _StreamAttemptOutcome(None, seq, "ollama_timeout")
     except requests.exceptions.RequestException:
         stream_result = "error"
         logger.warning("[ollama][diag] fail_reason=ollama_unavailable")
-        yield ("result", None)
-        return
+        return _StreamAttemptOutcome(None, seq, "ollama_unavailable")
     except Exception:
-        # The response was closed from another thread (a disconnect cancels the
-        # bridge), so the mid-read call failed. Treat that as cancellation, not
-        # as a 500; anything else is a genuine stream error.
+        # Closing the response from the disconnect watcher may make the active
+        # socket read raise. Classify that as cancellation, never as a retry.
         if cancel_controller is not None and cancel_controller.cancelled():
             stream_result = "cancelled"
         else:
             stream_result = "error"
             logger.warning("[ollama][diag] fail_reason=stream_read_error", exc_info=True)
-            yield ("result", None)
-            return
+            return _StreamAttemptOutcome(None, seq, "stream_read_error")
     finally:
-        logger.info("[ollama][diag] stream_closed | result=%s", stream_result)
+        logger.info(
+            "[ollama][diag] stream_closed | result=%s | attempt=%s",
+            stream_result,
+            attempt,
+        )
         response.close()
 
     if stream_result == "cancelled":
-        yield ("cancelled", None)
-        return
+        return _StreamAttemptOutcome(None, seq, "client_cancelled", cancelled=True)
 
     content = buffer.strip()
     if not content:
-        yield ("result", None)
-        return
+        return _StreamAttemptOutcome(None, seq, "empty_response")
     try:
         data = json.loads(_strip_outer_code_fence(content))
     except json.JSONDecodeError as exc:
-        logger.warning("[ollama][diag] fail_reason=json_parse_failed | %s | content=%r", exc, content[:200])
-        yield ("result", None)
-        return
+        logger.warning(
+            "[ollama][diag] fail_reason=json_parse_failed | %s | content=%r",
+            exc,
+            content[:200],
+        )
+        return _StreamAttemptOutcome(None, seq, "json_parse_failed", retryable=True)
 
     result = _normalize_analysis_data(target, data)
-    if result.sentence is None:
-        yield ("result", None)
+    return _StreamAttemptOutcome(
+        result,
+        seq,
+        fail_reason=result.fail_reason,
+        retryable=result.retryable,
+    )
+
+
+def generate_analysis_with_ollama_stream(
+    text: str,
+    category: str | None = None,
+    *,
+    deadline: float | None = None,
+    attempt_recorder: Callable[[], None] | None = None,
+    cancel_controller: StreamCancelController | None = None,
+):
+    """Stream provisional body deltas, complete fields, then one final result.
+
+    Event contract:
+
+    * ``("delta", field, text, seq, attempt)`` for safe string-body growth;
+    * ``("field", field, raw_value, attempt)`` for a complete top-level field;
+    * ``("reset", 2)`` before the existing strict validation retry;
+    * ``("result", dict | None, attempt)`` for the authoritative outcome;
+    * ``("cancelled", None)`` when the client disconnects.
+
+    ``seq`` is globally monotonic across both attempts. The final dict follows
+    the same parse, normalize, validation, translation-fallback and assembly path
+    as ``generate_analysis_with_ollama``.
+
+    The model does not necessarily emit fields in the prompt's order (constrained
+    decoding tends to emit the schema ``required`` fields first). To guarantee the
+    "primary meaning first" progressive UX, completed fields are buffered and
+    re-emitted in ``_STREAM_FIELD_ORDER`` as soon as every earlier field is done.
+
+    A normal valid response makes exactly one model request. A second request is
+    allowed only when the first full JSON/normalized result has the same
+    retryable validation failure used by the direct path, and it shares the same
+    monotonic deadline.
+
+    ``cancel_controller`` (a :class:`StreamCancelController`) is polled on every
+    streamed line and wires ``response.close()`` to the controller so a client
+    disconnect can abort a blocking read from another thread. When the controller
+    is firing, the generator yields ``("cancelled", None)`` instead of a result so
+    the caller can classify the outcome as a cancellation, never a 500.
+    """
+    target = str(text or "").strip()
+    if not target:
+        yield ("result", None, 1)
         return
-    yield ("result", _assemble_analysis_result(target, result))
+
+    if deadline is None:
+        deadline = time.monotonic() + settings.ollama_timeout_seconds
+    seq = 0
+    for attempt in (1, 2):
+        outcome = yield from _generate_analysis_stream_attempt(
+            target,
+            deadline=deadline,
+            attempt=attempt,
+            seq_start=seq,
+            attempt_recorder=attempt_recorder,
+            cancel_controller=cancel_controller,
+        )
+        seq = outcome.seq
+        if outcome.cancelled:
+            yield ("cancelled", None)
+            return
+        if outcome.result is not None and outcome.result.sentence is not None:
+            yield ("result", _assemble_analysis_result(target, outcome.result), attempt)
+            return
+        if attempt == 1 and outcome.retryable and time.monotonic() < deadline:
+            if cancel_controller is not None and cancel_controller.cancelled():
+                yield ("cancelled", None)
+                return
+            logger.info(
+                "[ollama][diag] retry | reason=%s | next_attempt=2",
+                outcome.fail_reason,
+            )
+            yield ("reset", 2)
+            continue
+        yield ("result", None, attempt)
+        return

@@ -1,7 +1,9 @@
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 from uuid import UUID
 import unittest
+import jwt
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, select
@@ -149,6 +151,51 @@ class AuthApiTest(unittest.TestCase):
         decoded_user_id = auth_service.decode_access_token(data["access_token"])
 
         self.assertEqual(UUID(data["user_id"]), decoded_user_id)
+
+    def test_logout_revokes_existing_token_and_new_login_works(self):
+        with patch(
+            "app.services.auth_service.request_wechat_code2session",
+            return_value={"openid": "openid-logout"},
+        ):
+            login_response = self.client.post("/api/auth/wechat-login", json={"code": "wx-code"})
+        token_a = login_response.json()["access_token"]
+        headers_a = {"Authorization": f"Bearer {token_a}"}
+
+        self.assertEqual(200, self.client.get("/api/auth/me", headers=headers_a).status_code)
+        logout_response = self.client.post("/api/auth/logout", headers=headers_a)
+        self.assertEqual(200, logout_response.status_code, logout_response.text)
+        self.assertEqual(401, self.client.get("/api/auth/me", headers=headers_a).status_code)
+
+        with patch(
+            "app.services.auth_service.request_wechat_code2session",
+            return_value={"openid": "openid-logout"},
+        ):
+            relogin_response = self.client.post("/api/auth/wechat-login", json={"code": "wx-code"})
+        token_b = relogin_response.json()["access_token"]
+        self.assertNotEqual(token_a, token_b)
+        self.assertEqual(
+            200,
+            self.client.get("/api/auth/me", headers={"Authorization": f"Bearer {token_b}"}).status_code,
+        )
+
+    def test_expired_token_is_rejected(self):
+        with TestingSessionLocal() as db:
+            user = User(wx_openid="openid-expired")
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+            token = jwt.encode(
+                {
+                    "sub": str(user.id),
+                    "ver": user.token_version,
+                    "iat": datetime.now(timezone.utc) - timedelta(days=2),
+                    "exp": datetime.now(timezone.utc) - timedelta(days=1),
+                },
+                auth_service.settings.jwt_secret_key,
+                algorithm=auth_service.settings.jwt_algorithm,
+            )
+        response = self.client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(401, response.status_code)
 
 
 if __name__ == "__main__":

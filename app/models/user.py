@@ -29,6 +29,7 @@ class User(Base):
     avatar_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     daily_goal: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
     pronunciation_voice: Mapped[str] = mapped_column(String(16), nullable=False, default="male")
+    token_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

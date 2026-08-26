@@ -260,7 +260,15 @@ function Test-ProcessIdentityMatches {
   if ($props -contains 'pid' -and $Identity.pid -and [int]$Identity.pid -ne [int]$Proc.ProcessId) { return $false }
   if ($props -contains 'creation_date' -and $Identity.creation_date) {
     $liveCreated = Get-ProcessCreationDateString -Proc $Proc
-    if ($liveCreated -and $liveCreated -ne [string]$Identity.creation_date) { return $false }
+    if ($liveCreated) {
+      try {
+        $liveCreatedUtc = ([datetime]$Proc.CreationDate).ToUniversalTime()
+        $trackedCreatedUtc = ([datetime]$Identity.creation_date).ToUniversalTime()
+        if ($liveCreatedUtc.Ticks -ne $trackedCreatedUtc.Ticks) { return $false }
+      } catch {
+        if ($liveCreated -ne [string]$Identity.creation_date) { return $false }
+      }
+    }
   }
   if ($props -contains 'executable_path' -and $Identity.executable_path -and
       [string]$Proc.ExecutablePath -ine [string]$Identity.executable_path) { return $false }
@@ -405,6 +413,12 @@ function Get-ManagedConfig {
     $allowedHosts += $script:NgrokHost
   }
 
+  $requiredAlembicRevisionOverride = [string][System.Environment]::GetEnvironmentVariable(
+    'REQUIRED_ALEMBIC_REVISION',
+    'Process'
+  )
+  $requiredAlembicRevisionOverride = $requiredAlembicRevisionOverride.Trim()
+
   $fastapi = [ordered]@{
     app_env = (Get-EffectiveEnvValue -Name 'APP_ENV' -Default 'development').ToLowerInvariant()
     log_level = (Get-EffectiveEnvValue -Name 'LOG_LEVEL' -Default 'INFO')
@@ -413,10 +427,14 @@ function Get-ManagedConfig {
     expected_database_dialect = (Get-EffectiveEnvValue -Name 'EXPECTED_DATABASE_DIALECT' -Default 'postgresql').ToLowerInvariant()
     expected_database_name = Get-EffectiveEnvValue -Name 'EXPECTED_DATABASE_NAME' -Default 'english_analyzer'
     expected_database_schema = Get-EffectiveEnvValue -Name 'EXPECTED_DATABASE_SCHEMA' -Default 'public'
-    required_alembic_revision = Get-EffectiveEnvValue -Name 'REQUIRED_ALEMBIC_REVISION' -Default 'f5a6b7c8d9e'
+    required_alembic_revision_override = $requiredAlembicRevisionOverride
     allow_sqlite_for_tests = (Get-EffectiveBoolValue -Name 'ALLOW_SQLITE_FOR_TESTS' -Default $false)
     allowed_hosts = ($allowedHosts -join ',')
     max_request_body_bytes = (Get-EffectiveIntValue -Name 'MAX_REQUEST_BODY_BYTES' -Default 1048576)
+    http_limit_concurrency = (Get-EffectiveIntValue -Name 'HTTP_LIMIT_CONCURRENCY' -Default 30)
+    db_pool_size = (Get-EffectiveIntValue -Name 'DB_POOL_SIZE' -Default 5)
+    db_max_overflow = (Get-EffectiveIntValue -Name 'DB_MAX_OVERFLOW' -Default 10)
+    db_pool_timeout = (Get-EffectiveIntValue -Name 'DB_POOL_TIMEOUT' -Default 3)
     translation_provider = (Get-EffectiveEnvValue -Name 'TRANSLATION_PROVIDER' -Default 'argos').ToLowerInvariant()
     example_generator_provider = (Get-EffectiveEnvValue -Name 'EXAMPLE_GENERATOR_PROVIDER' -Default 'ollama').ToLowerInvariant()
     ollama_base_url = (Get-EffectiveEnvValue -Name 'OLLAMA_BASE_URL' -Default 'http://127.0.0.1:11434').TrimEnd('/')
@@ -443,7 +461,10 @@ function Get-ManagedConfig {
     tts_daily_quota = (Get-EffectiveIntValue -Name 'TTS_DAILY_QUOTA' -Default 100)
     lexical_daily_quota = (Get-EffectiveIntValue -Name 'LEXICAL_DAILY_QUOTA' -Default 500)
     ai_global_concurrency = (Get-EffectiveIntValue -Name 'AI_GLOBAL_CONCURRENCY' -Default 1)
-    tts_global_concurrency = (Get-EffectiveIntValue -Name 'TTS_GLOBAL_CONCURRENCY' -Default 2)
+    ai_queue_waiting_capacity = (Get-EffectiveIntValue -Name 'AI_QUEUE_WAITING_CAPACITY' -Default 2)
+    ai_inflight_follower_capacity = (Get-EffectiveIntValue -Name 'AI_INFLIGHT_FOLLOWER_CAPACITY' -Default 3)
+    tts_global_concurrency = (Get-EffectiveIntValue -Name 'TTS_GLOBAL_CONCURRENCY' -Default 1)
+    tts_queue_waiting_capacity = (Get-EffectiveIntValue -Name 'TTS_QUEUE_WAITING_CAPACITY' -Default 2)
     resource_queue_timeout_seconds = (Get-EffectiveIntValue -Name 'RESOURCE_QUEUE_TIMEOUT_SECONDS' -Default 3)
     ai_queue_timeout_seconds = (Get-EffectiveIntValue -Name 'AI_QUEUE_TIMEOUT_SECONDS' -Default 30)
     ai_total_timeout_seconds = (Get-EffectiveIntValue -Name 'AI_TOTAL_TIMEOUT_SECONDS' -Default 90)
@@ -549,6 +570,16 @@ try { $script:NgrokHost = ([System.Uri]$script:NgrokBase).Host } catch { }
 $runtimeConfig = Get-ManagedConfig
 $allowedHosts = @($runtimeConfig.allowed_hosts)
 
+$configCheck = @(& $PythonExe (Join-Path $BackendDir 'scripts\check_config.py') 2>&1)
+if ($LASTEXITCODE -ne 0) {
+  Fail "Application configuration preflight failed.`n$($configCheck -join "`n")"
+}
+foreach ($line in $configCheck) { Write-Sub -Text ([string]$line) }
+$script:OllamaBaseUrl = (Get-EffectiveEnvValue -Name 'OLLAMA_BASE_URL' -Default 'http://127.0.0.1:11434').TrimEnd('/')
+$script:OllamaModel = Get-EffectiveEnvValue -Name 'OLLAMA_MODEL' -Default 'qwen3:8b'
+$OllamaUrl = $script:OllamaBaseUrl
+$OllamaModel = $script:OllamaModel
+
 # ALLOWED_HOSTS must include the ngrok host or TrustedHostMiddleware rejects
 # public requests. This env var is set before uvicorn launches.
 $env:ALLOWED_HOSTS = ($allowedHosts -join ',')
@@ -573,6 +604,16 @@ if (-not $pgHealth) {
   Fail "PostgreSQL health check failed: could not connect with DATABASE_URL."
 }
 Write-Step -Label 'PostgreSQL' -Status 'OK'
+
+$databaseTargetOutput = @(& $PythonExe (Join-Path $BackendDir 'scripts\check_database_target.py') 2>&1)
+$databaseTargetExitCode = $LASTEXITCODE
+foreach ($line in $databaseTargetOutput) {
+  Write-Sub -Text ([string]$line)
+}
+if ($databaseTargetExitCode -ne 0) {
+  Fail "Database target or Alembic revision preflight failed. FastAPI was not started."
+}
+Write-Step -Label 'Database target' -Status 'OK'
 
 # ================================================================ 2. Ollama
 $ollamaUp = Test-OllamaUp
@@ -760,48 +801,37 @@ if ($listener) {
     Fail "Port $FastApiPort is occupied by a uvicorn process that is not tracked by the current state file (PID $($listener.ProcessId))."
   }
 
-  if ($stateFastApiHash -and $stateFastApiHash -eq $desiredFastapiHash) {
-    if (-not (Test-LocalHealth)) {
-      Write-Sub -Text 'FastAPI local: FAILED'
-      Write-Sub -Text $script:LocalHealthLastFailure
-      Fail "FastAPI listener PID $($listener.ProcessId) is listening but $FastApiHealthUrl is not healthy."
-    }
-    $fastapiProc = $listener
-    $fastapiPid = $listener.ProcessId
-    $fastapiLauncherPid = $trackedLauncherPid
-    $fastapiReused = $true
-  } else {
-    # Config changed: stop THIS project's tree before restarting. An
-    # unrelated listener on the port is never stopped here.
-    if ($stateFastApiListenerIdentity -and
-        -not (Test-ProcessIdentityMatches -Proc $listener -Identity $stateFastApiListenerIdentity)) {
-      Fail "Tracked FastAPI listener PID $($listener.ProcessId) failed identity validation before restart; leaving it running."
-    }
-    if (-not (Stop-FastApiProcessTree -LauncherPid $trackedLauncherPid -ListenerPid $listener.ProcessId)) {
-      Fail "Managed FastAPI process tree (launcher $trackedLauncherPid, listener $($listener.ProcessId)) could not be stopped before restart."
-    }
-    $fastapiProc = $null
-    $fastapiPid = $null
-    $listener = $null
+  # FastAPI always restarts so Python source changes are loaded. Keep the
+  # existing tracked-process and listener identity checks before stopping only
+  # this project's uvicorn tree.
+  if ($stateFastApiListenerIdentity -and
+      -not (Test-ProcessIdentityMatches -Proc $listener -Identity $stateFastApiListenerIdentity)) {
+    Fail "Tracked FastAPI listener PID $($listener.ProcessId) failed identity validation before restart; leaving it running."
   }
+  Write-Sub -Text ("Restarting managed FastAPI listener PID {0}" -f $listener.ProcessId)
+  if (-not (Stop-FastApiProcessTree -LauncherPid $trackedLauncherPid -ListenerPid $listener.ProcessId)) {
+    Fail "Managed FastAPI process tree (launcher $trackedLauncherPid, listener $($listener.ProcessId)) could not be stopped before restart."
+  }
+  $fastapiProc = $null
+  $fastapiPid = $null
+  $listener = $null
 }
 
 if (-not $fastapiReused) {
   if (-not $listener) {
-    # Recorded launcher alive but nothing listening: if the config changed,
-    # stop the stale tree first; the new instance will bind the free port.
-    if ($stateFastApiHash -and $trackedLauncherPid) {
+    # Recorded launcher alive but nothing listening: stop the stale managed
+    # launcher before the new instance binds the free port.
+    if ($trackedLauncherPid) {
       $launcherProc = Get-ProcessById -Id $trackedLauncherPid
-      if ($launcherProc -and (Test-ManagedUvicorn -Proc $launcherProc) -and
-          $stateFastApiHash -ne $desiredFastapiHash) {
-        if (-not (Stop-FastApiProcessTree -LauncherPid $trackedLauncherPid -ListenerPid $trackedListenerPid)) {
+      if ($launcherProc -and (Test-ManagedUvicorn -Proc $launcherProc)) {
+        if (-not (Stop-FastApiProcessTree -LauncherPid $trackedLauncherPid -ListenerPid 0)) {
           Fail "Managed FastAPI process tree (launcher $trackedLauncherPid) could not be stopped before restart."
         }
       }
     }
 
     New-Item -ItemType Directory -Force -Path $LogsDir | Out-Null
-    $uvicornArgs = @('-m', 'uvicorn', 'app.main:app', '--host', $FastApiHost, '--port', [string]$FastApiPort)
+    $uvicornArgs = @('-m', 'uvicorn', 'app.main:app', '--host', $FastApiHost, '--port', [string]$FastApiPort, '--limit-concurrency', [string]$runtimeConfig.fastapi.http_limit_concurrency)
     $proc = Start-Process `
       -FilePath $PythonExe `
       -ArgumentList $uvicornArgs `

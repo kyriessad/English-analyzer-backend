@@ -5,7 +5,7 @@ import asyncio
 import requests
 from fastapi import HTTPException, status
 from pydantic import ValidationError
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError, TimeoutError as SQLAlchemyTimeoutError
 
 
 def result_from_status(status_code: int) -> str:
@@ -16,6 +16,14 @@ def result_from_status(status_code: int) -> str:
     return "server_error"
 
 
+def is_db_pool_timeout(exc: BaseException) -> bool:
+    """Identify SQLAlchemy QueuePool checkout exhaustion without matching other DB errors."""
+    if not isinstance(exc, SQLAlchemyTimeoutError):
+        return False
+    message = str(exc)
+    return "QueuePool limit of size" in message and "connection timed out" in message
+
+
 def classify_exception(exc: BaseException) -> str:
     if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
         return "cancelled"
@@ -23,6 +31,8 @@ def classify_exception(exc: BaseException) -> str:
         return "timeout"
     if isinstance(exc, requests.exceptions.Timeout):
         return "timeout"
+    if is_db_pool_timeout(exc):
+        return "db_pool_timeout"
     if isinstance(exc, SQLAlchemyError):
         return "database_error"
     if isinstance(exc, ValidationError):

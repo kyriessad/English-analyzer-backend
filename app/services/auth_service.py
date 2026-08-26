@@ -17,6 +17,7 @@ from app.schemas.auth import AuthUserResponse, DEFAULT_TIMEZONE, WechatLoginResp
 
 WECHAT_CODE2SESSION_URL = "https://api.weixin.qq.com/sns/jscode2session"
 TOKEN_SUBJECT_KEY = "sub"
+TOKEN_VERSION_KEY = "ver"
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
@@ -52,31 +53,41 @@ def request_wechat_code2session(code: str) -> dict[str, Any]:
     return response.json()
 
 
-def create_access_token(user_id: UUID) -> str:
+def create_access_token(user_id: UUID, token_version: int = 0) -> str:
     _require_jwt_config()
     now = datetime.now(timezone.utc)
     payload = {
         TOKEN_SUBJECT_KEY: str(user_id),
+        TOKEN_VERSION_KEY: int(token_version),
         "iat": now,
         "exp": now + timedelta(days=settings.jwt_expire_days),
     }
     return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
 
 
-def decode_access_token(token: str) -> UUID:
+def _decode_access_token_claims(token: str) -> tuple[UUID, int]:
     _require_jwt_config()
     try:
         payload = jwt.decode(token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm])
         subject = payload.get(TOKEN_SUBJECT_KEY)
         if not subject:
             raise ValueError("Missing token subject")
-        return UUID(str(subject))
+        token_version = payload.get(TOKEN_VERSION_KEY)
+        if not isinstance(token_version, int) or isinstance(token_version, bool) or token_version < 0:
+            raise ValueError("Missing token version")
+        return UUID(str(subject)), token_version
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired access token",
             headers={"WWW-Authenticate": "Bearer"},
         ) from exc
+
+
+def decode_access_token(token: str) -> UUID:
+    """Decode a token and preserve the historical helper's UUID return value."""
+    user_id, _ = _decode_access_token_claims(token)
+    return user_id
 
 
 def login_with_wechat_code(db: Session, code: str, timezone_name: str = DEFAULT_TIMEZONE) -> WechatLoginResponse:
@@ -134,7 +145,7 @@ def login_with_wechat_code(db: Session, code: str, timezone_name: str = DEFAULT_
 
     return WechatLoginResponse(
         user_id=user.id,
-        access_token=create_access_token(user.id),
+        access_token=create_access_token(user.id, user.token_version),
         is_new_user=is_new_user,
         user=AuthUserResponse(id=user.id, timezone=user.timezone),
     )
@@ -166,7 +177,7 @@ def get_current_user(
             detail="Unsupported authorization scheme",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    user_id = decode_access_token(credentials.credentials)
+    user_id, token_version = _decode_access_token_claims(credentials.credentials)
     user = db.get(User, user_id)
     if user is None:
         raise HTTPException(
@@ -174,5 +185,16 @@ def get_current_user(
             detail="User not found",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    if token_version != user.token_version:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Access token has been revoked",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     request.state.auth_scheme = "bearer"
     return _ensure_user_can_authenticate(user)
+
+
+def revoke_user_tokens(db: Session, user: User) -> None:
+    user.token_version += 1
+    db.commit()

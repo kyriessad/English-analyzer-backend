@@ -10,6 +10,9 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 DATABASE_URL_WAS_IN_PROCESS_ENV = bool(os.environ.get("DATABASE_URL", "").strip())
+REQUIRED_ALEMBIC_REVISION_PROCESS_OVERRIDE = os.environ.get(
+    "REQUIRED_ALEMBIC_REVISION", ""
+).strip()
 load_dotenv(BASE_DIR / ".env")
 DATABASE_URL_SOURCE = (
     "process environment"
@@ -26,7 +29,10 @@ def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    value = raw.strip().lower()
+    if value not in {"0", "1", "false", "true", "no", "yes", "off", "on"}:
+        raise ValueError(f"{name} must be a boolean (true/false)")
+    return value in {"1", "true", "yes", "on"}
 
 
 def _env_int(name: str, default: int) -> int:
@@ -35,8 +41,8 @@ def _env_int(name: str, default: int) -> int:
         return default
     try:
         return int(raw)
-    except ValueError:
-        return default
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
 
 
 def _env_float(name: str, default: float) -> float:
@@ -45,8 +51,8 @@ def _env_float(name: str, default: float) -> float:
         return default
     try:
         return float(raw)
-    except ValueError:
-        return default
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number") from exc
 
 
 def _env_csv(name: str, default: str = "") -> tuple[str, ...]:
@@ -69,16 +75,20 @@ class Settings:
     )
     expected_database_name: str = _env_str("EXPECTED_DATABASE_NAME", "english_analyzer")
     expected_database_schema: str = _env_str("EXPECTED_DATABASE_SCHEMA", "public") or "public"
-    required_alembic_revision: str = _env_str(
-        "REQUIRED_ALEMBIC_REVISION",
-        "f5a6b7c8d9e",
-    )
+    # Normal startup derives the expected revision from the Alembic chain.
+    # Only an explicit process environment value acts as a restore/test override;
+    # a legacy value left in .env cannot pin production to an old migration.
+    required_alembic_revision: str = REQUIRED_ALEMBIC_REVISION_PROCESS_OVERRIDE
     allow_sqlite_for_tests: bool = _env_bool("ALLOW_SQLITE_FOR_TESTS", False)
     allowed_hosts: tuple[str, ...] = _env_csv(
         "ALLOWED_HOSTS",
         "127.0.0.1,localhost,testserver",
     )
     max_request_body_bytes: int = _env_int("MAX_REQUEST_BODY_BYTES", 1_048_576)
+    http_limit_concurrency: int = _env_int("HTTP_LIMIT_CONCURRENCY", 30)
+    db_pool_size: int = _env_int("DB_POOL_SIZE", 5)
+    db_max_overflow: int = _env_int("DB_MAX_OVERFLOW", 10)
+    db_pool_timeout: int = _env_int("DB_POOL_TIMEOUT", 3)
 
     translation_provider: str = _env_str("TRANSLATION_PROVIDER", "argos").lower() or "argos"
     example_generator_provider: str = _env_str("EXAMPLE_GENERATOR_PROVIDER", "ollama").lower() or "ollama"
@@ -116,16 +126,68 @@ class Settings:
     wechat_secret: str = _env_str("WECHAT_SECRET")
     jwt_secret_key: str = _env_str("JWT_SECRET_KEY")
     jwt_algorithm: str = _env_str("JWT_ALGORITHM", "HS256") or "HS256"
-    jwt_expire_days: int = _env_int("JWT_EXPIRE_DAYS", 30)
+    jwt_expire_days: int = _env_int("JWT_EXPIRE_DAYS", 3)
 
     ai_daily_quota: int = _env_int("AI_DAILY_QUOTA", 30)
     tts_daily_quota: int = _env_int("TTS_DAILY_QUOTA", 100)
     lexical_daily_quota: int = _env_int("LEXICAL_DAILY_QUOTA", 500)
     ai_global_concurrency: int = _env_int("AI_GLOBAL_CONCURRENCY", 1)
-    tts_global_concurrency: int = _env_int("TTS_GLOBAL_CONCURRENCY", 2)
+    ai_queue_waiting_capacity: int = _env_int("AI_QUEUE_WAITING_CAPACITY", 2)
+    ai_inflight_follower_capacity: int = _env_int("AI_INFLIGHT_FOLLOWER_CAPACITY", 3)
+    tts_global_concurrency: int = _env_int("TTS_GLOBAL_CONCURRENCY", 1)
+    tts_queue_waiting_capacity: int = _env_int("TTS_QUEUE_WAITING_CAPACITY", 2)
     resource_queue_timeout_seconds: int = _env_int("RESOURCE_QUEUE_TIMEOUT_SECONDS", 3)
     ai_queue_timeout_seconds: int = _env_int("AI_QUEUE_TIMEOUT_SECONDS", 30)
     ai_total_timeout_seconds: int = _env_int("AI_TOTAL_TIMEOUT_SECONDS", 90)
 
 
 settings = Settings()
+
+
+def validate_settings(value: Settings = settings) -> None:
+    """Fail early on unsafe or ambiguous runtime configuration."""
+    errors: list[str] = []
+    if not value.database_url:
+        errors.append("DATABASE_URL is required")
+    for name, current, minimum in (
+        ("DB_POOL_SIZE", value.db_pool_size, 1),
+        ("AI_GLOBAL_CONCURRENCY", value.ai_global_concurrency, 1),
+        ("TTS_GLOBAL_CONCURRENCY", value.tts_global_concurrency, 1),
+        ("HTTP_LIMIT_CONCURRENCY", value.http_limit_concurrency, 1),
+        ("JWT_EXPIRE_DAYS", value.jwt_expire_days, 1),
+    ):
+        if current < minimum:
+            errors.append(f"{name} must be >= {minimum}")
+    for name, current in (
+        ("DB_MAX_OVERFLOW", value.db_max_overflow),
+        ("AI_QUEUE_WAITING_CAPACITY", value.ai_queue_waiting_capacity),
+        ("AI_INFLIGHT_FOLLOWER_CAPACITY", value.ai_inflight_follower_capacity),
+        ("TTS_QUEUE_WAITING_CAPACITY", value.tts_queue_waiting_capacity),
+    ):
+        if current < 0:
+            errors.append(f"{name} must be >= 0")
+    for name, current in (
+        ("DB_POOL_TIMEOUT", value.db_pool_timeout),
+        ("RESOURCE_QUEUE_TIMEOUT_SECONDS", value.resource_queue_timeout_seconds),
+        ("AI_QUEUE_TIMEOUT_SECONDS", value.ai_queue_timeout_seconds),
+        ("AI_TOTAL_TIMEOUT_SECONDS", value.ai_total_timeout_seconds),
+    ):
+        if current <= 0:
+            errors.append(f"{name} must be > 0")
+    if value.jwt_expire_days > 3:
+        errors.append("JWT_EXPIRE_DAYS must be <= 3")
+    if value.app_env.lower() != "test":
+        for name, current in (
+            ("JWT_SECRET_KEY", value.jwt_secret_key),
+            ("WECHAT_APPID", value.wechat_appid),
+            ("WECHAT_SECRET", value.wechat_secret),
+        ):
+            if not current:
+                errors.append(f"{name} is required")
+        if value.jwt_secret_key in {"change_me", "change_me_to_a_long_random_secret"}:
+            errors.append("JWT_SECRET_KEY must not use the example placeholder")
+    if errors:
+        raise ValueError("Invalid application configuration: " + "; ".join(errors))
+
+
+validate_settings()

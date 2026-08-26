@@ -357,6 +357,24 @@ def _finalize_analysis(
     cacheable = bool(translation)
     if cacheable and not (_is_word_or_phrase(category) and not example_sentence):
         set_cache(cache_key, response)
+        log_event(
+            logger,
+            logging.INFO,
+            "ai_cache_write",
+            result="written",
+            cache_key=cache_key[:12],
+            category=category,
+        )
+    else:
+        log_event(
+            logger,
+            logging.INFO,
+            "ai_cache_write",
+            result="skipped",
+            reason="not_cacheable",
+            cache_key=cache_key[:12],
+            category=category,
+        )
 
     return response
 
@@ -567,15 +585,16 @@ def analyze_text_streaming(
     record: Any | None = None,
     cancel_controller: StreamCancelController | None = None,
 ):
-    """Like ``analyze_text``, but streams Ollama field events as they complete.
+    """Like ``analyze_text``, but streams provisional Ollama events.
 
-    Yields ``("field", key, raw_value)`` for each complete field during the
-    single Ollama stream, then a final ``("final", dict)`` carrying the full
-    ``AnalyzeResponse`` dict (ok True or False). The ``final`` payload is built
-    by the exact same ``_finalize_analysis`` path as the non-streaming endpoint.
+    String deltas, completed fields, and retry resets are forwarded unchanged,
+    followed by ``("final", dict, attempt)`` carrying the full AnalyzeResponse
+    dict (ok True or False). The final payload is still built by the exact same
+    ``_finalize_analysis`` path as the non-streaming endpoint.
 
-    The stream path starts Qwen exactly once and never falls back to a second
-    (non-streaming) Qwen call, even if the stream is interrupted.
+    A retryable parse/example-validation failure may start the existing single
+    strict retry inside this same stream/deadline/AI slot. Transport failures and
+    client cancellation never retry or fall back to a second model call here.
     """
     started = time.perf_counter()
     result_label = "success"
@@ -593,6 +612,14 @@ def analyze_text_streaming(
 
         if validation["level"] == "error":
             result_label = "validation_error"
+            log_event(
+                logger,
+                logging.INFO,
+                "ollama_generation_start",
+                operation="analyze_text_streaming",
+                result=False,
+                reason="validation_error",
+            )
             yield (
                 "final",
                 _build_response(
@@ -622,6 +649,7 @@ def analyze_text_streaming(
                         operation="analyze_text_streaming",
                         result="stale",
                         category=cached_category,
+                        cache_key=cache_key[:12],
                     )
                 else:
                     cached["cacheHit"] = True
@@ -633,6 +661,16 @@ def analyze_text_streaming(
                         operation="analyze_text_streaming",
                         result="hit",
                         category=cached_category,
+                        cache_key=cache_key[:12],
+                    )
+                    log_event(
+                        logger,
+                        logging.INFO,
+                        "ollama_generation_start",
+                        operation="analyze_text_streaming",
+                        result=False,
+                        reason="ai_cache_hit",
+                        cache_key=cache_key[:12],
                     )
                     yield ("final", cached)
                     return
@@ -645,6 +683,7 @@ def analyze_text_streaming(
                     operation="analyze_text_streaming",
                     result="miss",
                     category=category,
+                    cache_key=cache_key[:12],
                 )
         else:
             AI_CACHE_EVENTS_TOTAL.labels(operation="analyze_text_streaming", result="bypass").inc()
@@ -655,15 +694,26 @@ def analyze_text_streaming(
                 operation="analyze_text_streaming",
                 result="bypass",
                 category=category,
+                cache_key=cache_key[:12],
             )
 
         ollama = None
+        final_attempt = 1
         if (
             category in ("word", "phrase", "sentence")
             and settings.example_generator_provider == "ollama"
         ):
             if time.monotonic() >= deadline_at:
                 result_label = "timeout"
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "ollama_generation_start",
+                    operation="analyze_text_streaming",
+                    result=False,
+                    reason="deadline_before_generate",
+                    cache_key=cache_key[:12],
+                )
                 _ai_event("failure", "AI_TOTAL_TIMEOUT", category=category, stage="before_generate")
                 yield (
                     "final",
@@ -695,7 +745,7 @@ def analyze_text_streaming(
                         attempt_recorder=_make_attempt_recorder(record),
                         cancel_controller=cancel_controller,
                     ):
-                        if event[0] == "field":
+                        if event[0] in {"delta", "field", "reset"}:
                             yield event
                         elif event[0] == "cancelled":
                             # The Ollama stream aborted because the client went
@@ -703,11 +753,24 @@ def analyze_text_streaming(
                             # the reliability record) classifies this as a
                             # cancellation, never as a 500.
                             raise GeneratorExit
-                        else:  # ("result", dict | None)
+                        else:  # ("result", dict | None, attempt)
                             ollama = event[1]
+                            if len(event) > 2:
+                                final_attempt = event[2]
             except Exception as exc:
                 logger.warning("[analyzer] ollama analysis error: %s", _short_error(exc))
                 ollama = None
+        else:
+            log_event(
+                logger,
+                logging.INFO,
+                "ollama_generation_start",
+                operation="analyze_text_streaming",
+                result=False,
+                reason="provider_or_category_not_ollama",
+                category=category,
+                cache_key=cache_key[:12],
+            )
 
         # Qwen is the formal AI result for word/phrase/sentence. A failed Qwen call must
         # surface as a clear failure, not be disguised by an Argos+template fallback.
@@ -734,6 +797,7 @@ def analyze_text_streaming(
                     errors=[user_message_for(code)],
                     provider=None,
                 ),
+                final_attempt,
             )
             return
 
@@ -750,6 +814,7 @@ def analyze_text_streaming(
                     ollama=ollama,
                 )
             ),
+            final_attempt,
         )
     except GeneratorExit:
         result_label = "cancelled"

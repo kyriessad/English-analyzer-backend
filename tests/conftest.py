@@ -5,6 +5,7 @@ import os
 
 postgres_test_url = os.environ.get("POSTGRES_TEST_DATABASE_URL", "").strip()
 os.environ["APP_ENV"] = "test"
+os.environ["JWT_EXPIRE_DAYS"] = "3"
 
 if postgres_test_url:
     os.environ["DATABASE_URL"] = postgres_test_url

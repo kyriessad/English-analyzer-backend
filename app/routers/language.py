@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from functools import partial
+
+import anyio
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -15,6 +18,7 @@ from app.services.ecdict_service import (
 )
 from app.services.piper_service import (
     PronunciationError,
+    get_cached_audio,
     normalize_pronunciation_text,
     pronunciation_available,
     pronunciation_available_all,
@@ -22,9 +26,9 @@ from app.services.piper_service import (
 )
 from app.services.auth_service import get_current_user
 from app.services.security import (
+    async_resource_slot,
     consume_daily_quota,
     enforce_resource_rate_limit,
-    resource_slot,
 )
 
 
@@ -82,7 +86,7 @@ def get_lexical_info(
 
 
 @router.get("/pronunciation/audio")
-def get_pronunciation_audio(
+async def get_pronunciation_audio(
     request: Request,
     text: str = Query(min_length=1, max_length=300),
     voice: str | None = Query(default=None, pattern=r"^(male|female)$"),
@@ -90,16 +94,25 @@ def get_pronunciation_audio(
     db: Session = Depends(get_db),
 ) -> FileResponse:
     enforce_resource_rate_limit(request, current_user.id, "tts")
-    consume_daily_quota(
-        db,
-        user_id=current_user.id,
-        resource="tts",
-        limit=settings.tts_daily_quota,
+    await anyio.to_thread.run_sync(
+        partial(
+            consume_daily_quota,
+            db,
+            user_id=current_user.id,
+            resource="tts",
+            limit=settings.tts_daily_quota,
+        )
     )
     try:
         normalized_text = normalize_pronunciation_text(text)
-        with resource_slot("tts"):
-            audio_path = synthesize_or_get_cached_audio(normalized_text, voice=voice)
+        audio_path = await anyio.to_thread.run_sync(
+            partial(get_cached_audio, normalized_text, voice=voice)
+        )
+        if audio_path is None:
+            async with async_resource_slot("tts"):
+                audio_path = await anyio.to_thread.run_sync(
+                    partial(synthesize_or_get_cached_audio, normalized_text, voice=voice)
+                )
     except PronunciationError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 

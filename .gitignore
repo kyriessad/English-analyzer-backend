@@ -14,7 +14,12 @@ __pycache__/
 *.sqlite3
 *.argosmodel
 *.dump
+*.backup
 *.partial
+*.pem
+*.key
+*.p12
+*.pfx
 
 .DS_Store
 .vscode/
@@ -26,9 +31,15 @@ tests/**/__pycache__/
 
 # Runtime logs
 *.log
+*.jsonl
 uvicorn-*.log
 logs/
 .runtime/
+.e2e-artifacts/
+.e2e-cli-diagnostics/
+.mixed-overload-lab-*/
+.tts-resource-lab-*/
+.wechatdevtools/
 
 # Local fault-experiment outputs and credentials
 fault-experiments/token.txt
@@ -39,3 +50,7 @@ fault-experiments/*.toc.list
 data/ecdict/
 data/piper/
 data/audio-cache/
+
+# Local Node dependencies for E2E client
+node_modules/
+e2e/wechat-client/node_modules/

@@ -1,3 +1,9 @@
+param(
+  # Normal backups remain strict. Release migration backups may deliberately
+  # capture the currently deployed revision before code head changes.
+  [switch]$AllowRevisionMismatch
+)
+
 $ErrorActionPreference = "Stop"
 
 $ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -53,7 +59,6 @@ try:
         "username": url.username,
         "password": str(url.password) if url.password is not None else "",
         "database": url.database,
-        "required_alembic_revision": settings.required_alembic_revision,
     }))
 except Exception:
     print("Could not read the approved PostgreSQL connection configuration.", file=sys.stderr)
@@ -66,20 +71,40 @@ if ($LASTEXITCODE -ne 0) {
 }
 $connection = $connectionJson | ConvertFrom-Json
 
-$ExpectedAlembicRevision = [string]$connection.required_alembic_revision
-if ([string]::IsNullOrWhiteSpace($ExpectedAlembicRevision)) {
-  throw "Required Alembic revision is not configured."
+$previousErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+  # A permitted revision mismatch writes a Python traceback to stderr. Capture
+  # it without letting Windows PowerShell stop before the exit code is checked.
+  $preflightOutput = @(& $Python scripts\check_database_target.py 2>&1)
+  $preflightExitCode = $LASTEXITCODE
 }
-
-$preflightOutput = & $Python scripts\check_database_target.py
-if ($LASTEXITCODE -ne 0) {
+finally {
+  $ErrorActionPreference = $previousErrorActionPreference
+}
+if ($preflightExitCode -ne 0 -and -not $AllowRevisionMismatch) {
   throw "Database target preflight failed."
 }
 
-$revisionLine = $preflightOutput | Where-Object { $_ -like "Alembic revision:*" } | Select-Object -First 1
-if ($revisionLine -ne "Alembic revision: $ExpectedAlembicRevision") {
+$actualRevisionLine = $preflightOutput | Where-Object { $_ -like "Actual Alembic revision:*" } | Select-Object -First 1
+$expectedRevisionLine = $preflightOutput | Where-Object { $_ -like "Expected Alembic revision:*" } | Select-Object -First 1
+$revisionSourceLine = $preflightOutput | Where-Object { $_ -like "Expected revision source:*" } | Select-Object -First 1
+if (-not $actualRevisionLine -or -not $expectedRevisionLine -or -not $revisionSourceLine) {
+  throw "Database target preflight did not report complete Alembic revision details."
+}
+$ExpectedAlembicRevision = ([string]$expectedRevisionLine).Substring("Expected Alembic revision:".Length).Trim()
+$ExpectedRevisionSource = ([string]$revisionSourceLine).Substring("Expected revision source:".Length).Trim()
+if ([string]::IsNullOrWhiteSpace($ExpectedAlembicRevision)) {
+  throw "Expected Alembic revision could not be resolved."
+}
+if (-not $actualRevisionLine) {
+  throw "Database target preflight did not report the actual Alembic revision."
+}
+if (-not $AllowRevisionMismatch -and $actualRevisionLine -ne "Actual Alembic revision: $ExpectedAlembicRevision") {
   throw "Expected Alembic revision was not confirmed."
 }
+$ActualAlembicRevision = ([string]$actualRevisionLine).Substring("Actual Alembic revision:".Length).Trim()
+$BackupRevisionLabel = if ($ActualAlembicRevision -and $ActualAlembicRevision -ne "missing") { $ActualAlembicRevision } else { "unknown" }
 
 if ([string]$connection.database -ne $ExpectedDatabase) {
   throw "Configured database is not the approved production database."
@@ -89,7 +114,7 @@ New-Item -ItemType Directory -Path $BackupDirectory -Force | Out-Null
 
 $createdAt = Get-Date
 $timestamp = $createdAt.ToString("yyyyMMdd_HHmmss")
-$backupName = "${ExpectedDatabase}_prod_${timestamp}_${ExpectedAlembicRevision}.dump"
+$backupName = "${ExpectedDatabase}_prod_${timestamp}_${BackupRevisionLabel}.dump"
 $backupPath = Join-Path $BackupDirectory $backupName
 $temporaryPath = "${backupPath}.partial"
 
@@ -159,7 +184,8 @@ try {
   Write-Host "Backup SUCCESS"
   Write-Host "Database: $ExpectedDatabase"
   Write-Host "PostgreSQL / pg_dump version: $pgDumpVersion"
-  Write-Host "Alembic revision: $ExpectedAlembicRevision"
+  Write-Host "Alembic revision: $ActualAlembicRevision"
+  Write-Host "Expected revision source: $ExpectedRevisionSource"
   Write-Host "Backup path: $backupPath"
   Write-Host "File size: $($backupFile.Length) bytes"
   Write-Host "SHA-256: $sha256"

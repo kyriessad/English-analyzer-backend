@@ -22,12 +22,15 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+import anyio
+
 
 AI_REQUEST_IDEMPOTENCY_TTL_SECONDS = 15 * 60
 
 # Internal error codes are kept for logs / metrics / traces; the frontend only
 # ever sees the corresponding Chinese message.
 AI_ERROR_MESSAGES: dict[str, str] = {
+    "AI_INFLIGHT_FOLLOWER_FULL": "\u5f53\u524d\u76f8\u540c AI \u8bf7\u6c42\u8fc7\u591a\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5",
     "AI_QUEUE_FULL": "AI 服务暂时繁忙，请稍后再试",
     "AI_TOTAL_TIMEOUT": "分析超时，请稍后重试",
     "AI_LLM_FAILED": "分析服务暂时不可用，请稍后重试",
@@ -110,6 +113,7 @@ def total_timeout_deadline(seconds: float) -> float:
 
 @dataclass
 class AiRequestRecord:
+    user_namespace: str
     fingerprint: str
     created_at: float = field(default_factory=time.monotonic)
     expires_at: float = field(default_factory=lambda: time.monotonic() + AI_REQUEST_IDEMPOTENCY_TTL_SECONDS)
@@ -120,8 +124,8 @@ class AiRequestRecord:
     event: threading.Event = field(default_factory=threading.Event)
 
 
-_records_by_key: dict[str, AiRequestRecord] = {}
-_inflight_by_fingerprint: dict[str, AiRequestRecord] = {}
+_records_by_key: dict[tuple[str, str], AiRequestRecord] = {}
+_inflight_by_fingerprint: dict[tuple[str, str], AiRequestRecord] = {}
 _records_lock = threading.Lock()
 
 
@@ -144,7 +148,11 @@ def _purge_expired(now: float | None = None) -> None:
         _inflight_by_fingerprint.pop(fingerprint, None)
 
 
-def claim_ai_request(idempotency_key: str | None, fingerprint: str) -> tuple[str | None, AiRequestRecord | None, bool]:
+def claim_ai_request(
+    user_id: object,
+    idempotency_key: str | None = None,
+    fingerprint: str | None = None,
+) -> tuple[str | None, AiRequestRecord | None, bool]:
     """Claim the AI request identified by *idempotency_key* + *fingerprint*.
 
     Returns ``(key, record, is_owner)``:
@@ -153,23 +161,33 @@ def claim_ai_request(idempotency_key: str | None, fingerprint: str) -> tuple[str
       ``finish_ai_request``.
     * ``is_owner=False``: this caller must wait for the owner via
       ``wait_for_ai_request_record`` and reuse its result.
+
+    A non-empty Idempotency-Key defines one user operation. A different key is
+    therefore always a different operation, even when its payload fingerprint
+    matches an in-flight request. Fingerprint-only coalescing is reserved for
+    legacy/key-less callers.
     """
+    # Keep the old two-argument form usable for isolated unit tests while all
+    # production callers pass the authenticated current_user.id explicitly.
+    if fingerprint is None:
+        fingerprint = str(idempotency_key or "")
+        idempotency_key = str(user_id) if user_id is not None else None
+        user_namespace = "__legacy_test_namespace__"
+    else:
+        user_namespace = str(user_id)
+
     key = normalize_idempotency_key(idempotency_key)
     with _records_lock:
         _purge_expired()
 
         if key:
-            record = _records_by_key.get(key)
+            record = _records_by_key.get((user_namespace, key))
             if record is None:
-                # Same payload may already be in flight under a different key
-                # (or key-less): join it instead of running a second generation.
-                inflight = _inflight_by_fingerprint.get(fingerprint)
-                if inflight is not None:
-                    _records_by_key[key] = inflight
-                    return key, inflight, False
-                record = AiRequestRecord(fingerprint=fingerprint)
-                _records_by_key[key] = record
-                _inflight_by_fingerprint[fingerprint] = record
+                record = AiRequestRecord(user_namespace=user_namespace, fingerprint=fingerprint)
+                _records_by_key[(user_namespace, key)] = record
+                # Keep key-less in-flight dedup available without allowing it
+                # to merge two explicit, independently keyed user operations.
+                _inflight_by_fingerprint[(user_namespace, fingerprint)] = record
                 return key, record, True
 
             if record.fingerprint != fingerprint:
@@ -177,12 +195,12 @@ def claim_ai_request(idempotency_key: str | None, fingerprint: str) -> tuple[str
 
             return key, record, False
 
-        record = _inflight_by_fingerprint.get(fingerprint)
+        record = _inflight_by_fingerprint.get((user_namespace, fingerprint))
         if record is not None:
             return None, record, False
 
-        record = AiRequestRecord(fingerprint=fingerprint)
-        _inflight_by_fingerprint[fingerprint] = record
+        record = AiRequestRecord(user_namespace=user_namespace, fingerprint=fingerprint)
+        _inflight_by_fingerprint[(user_namespace, fingerprint)] = record
         return None, record, True
 
 
@@ -202,8 +220,9 @@ def finish_ai_request(
         record.completed_at = time.monotonic()
         record.expires_at = record.completed_at + AI_REQUEST_IDEMPOTENCY_TTL_SECONDS
         record.event.set()
-        if _inflight_by_fingerprint.get(record.fingerprint) is record:
-            _inflight_by_fingerprint.pop(record.fingerprint, None)
+        inflight_key = (record.user_namespace, record.fingerprint)
+        if _inflight_by_fingerprint.get(inflight_key) is record:
+            _inflight_by_fingerprint.pop(inflight_key, None)
 
 
 def wait_for_ai_request_record(
@@ -236,6 +255,39 @@ def wait_for_ai_request_record(
 
         if record.event.wait(timeout=min(0.25, remaining)):
             return record.result, record.error
+
+
+async def wait_for_ai_request_record_async(
+    key: str | None,
+    record: AiRequestRecord | None,
+    *,
+    deadline_at: float,
+    cancel_check: Callable[[], bool] | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Async counterpart of ``wait_for_ai_request_record``.
+
+    It polls the same ``threading.Event`` with ``is_set()`` and sleeps
+    cooperatively, so follower queueing does not occupy an AnyIO worker thread.
+    """
+    if record is None:
+        return None, None
+
+    while True:
+        if cancel_check and cancel_check():
+            raise ClientCancelledError()
+
+        if record.event.is_set():
+            return record.result, record.error
+
+        remaining = deadline_at - time.monotonic()
+        if remaining <= 0:
+            return None, {
+                "code": "AI_TOTAL_TIMEOUT",
+                "message": user_message_for("AI_TOTAL_TIMEOUT"),
+                "timeoutStage": "idempotency_wait",
+            }
+
+        await anyio.sleep(min(0.25, remaining))
 
 
 def touch_generation_attempt(record: AiRequestRecord | None) -> int:
