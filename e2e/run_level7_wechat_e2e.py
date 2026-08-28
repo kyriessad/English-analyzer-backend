@@ -32,6 +32,7 @@ from e2e.run_level7_e2e import (  # noqa: E402
     PROXY_PORT,
     E2EFailure,
     Level7Runner,
+    ManagedProcess,
     fetch_metrics,
     iso_now,
     metric_value,
@@ -51,6 +52,9 @@ WECHAT_CLI = Path(r"C:\Program Files (x86)\Tencent\微信web开发者工具\cli.
 WECHAT_SERVICE_PORT: int | None = None
 WECHAT_AUTOMATION_PORT = 19420
 E2E_BASE_URL = f"http://127.0.0.1:{APP_PORT}"
+HARPER_BASE_URL = "http://127.0.0.1:8082"
+HARPER_PORT = 8082
+HARPER_DIR = ROOT / "harper-sidecar"
 
 _wechat_cli_candidates = sorted(
     Path(r"C:\Program Files (x86)\Tencent").glob("*/cli.bat"),
@@ -80,6 +84,61 @@ def _config_value(name: str) -> str:
 
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _read_harper_health() -> dict[str, Any] | None:
+    try:
+        with urllib.request.urlopen(f"{HARPER_BASE_URL}/health", timeout=2) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if response.status == 200 and payload.get("status") == "ok":
+            return payload
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    return None
+
+
+def _ensure_harper(run_dir: Path) -> tuple[ManagedProcess | None, dict[str, Any]]:
+    listener_pid = port_listener_pid(HARPER_PORT)
+    health = _read_harper_health()
+    if listener_pid is not None:
+        if not health or health.get("service") != "harper-sidecar":
+            raise E2EFailure(
+                f"Port {HARPER_PORT} is occupied by a process that is not the Harper sidecar"
+            )
+        return None, {
+            "status": "READY",
+            "managed_by_runner": False,
+            "pid": listener_pid,
+            "health": health,
+        }
+
+    required = (HARPER_DIR / "server.mjs", HARPER_DIR / "package.json")
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise E2EFailure(f"Harper sidecar files are missing: {missing}")
+    process = ManagedProcess(
+        "harper-sidecar",
+        [NODE, "server.mjs"],
+        HARPER_DIR,
+        os.environ.copy(),
+        run_dir / "harper-sidecar.log",
+    )
+    pid = process.start()
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        health = _read_harper_health()
+        if health and health.get("service") == "harper-sidecar":
+            return process, {
+                "status": "READY",
+                "managed_by_runner": True,
+                "pid": pid,
+                "health": health,
+            }
+        if process.process is not None and process.process.poll() is not None:
+            break
+        time.sleep(0.1)
+    process.stop()
+    raise E2EFailure("Harper sidecar did not become ready within 30 seconds")
 
 
 def _append_exception(result: dict[str, Any], stage: str, exc: BaseException) -> None:
@@ -247,6 +306,14 @@ def _preflight() -> dict[str, Any]:
     if port_listener_pid(WECHAT_AUTOMATION_PORT) is not None:
         raise E2EFailure(f"Automation port {WECHAT_AUTOMATION_PORT} is already in use")
 
+    try:
+        with urllib.request.urlopen(f"{HARPER_BASE_URL}/health", timeout=3) as response:
+            harper_health = json.loads(response.read().decode("utf-8"))
+        if response.status != 200 or harper_health.get("status") != "ok":
+            raise E2EFailure(f"Harper sidecar health check failed: {harper_health}")
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise E2EFailure("Real Harper sidecar must be running on 127.0.0.1:8082") from exc
+
     return {
         "checked_at": iso_now(),
         "miniapp_project": str(MINIAPP),
@@ -265,6 +332,8 @@ def _preflight() -> dict[str, Any]:
         "developer_cli": str(WECHAT_CLI),
         "miniprogram_automator": package.get("version"),
         "backend_base_url": E2E_BASE_URL,
+        "harper_base_url": HARPER_BASE_URL,
+        "harper_health": harper_health,
         "package_json_present_in_miniapp": (MINIAPP / "package.json").is_file(),
     }
 
@@ -467,6 +536,15 @@ def _final_database_audit(runner: Level7Runner) -> dict[str, Any]:
         logs = connection.execute(
             "SELECT id, user_id, session_id, session_item_id, card_id, result FROM review_logs"
         ).fetchall()
+        answer_logs = connection.execute(
+            """
+            SELECT id, user_id, session_id, session_item_id, card_id, source_card_id,
+                   question_id, selected_option_id, selected_answer_text, is_correct,
+                   prompt_content_snapshot, correct_answer_snapshot, options_snapshot,
+                   fsrs_state_before_json, fsrs_state_after_json
+            FROM review_answer_logs
+            """
+        ).fetchall()
         actions = connection.execute(
             "SELECT client_action_id, user_id, action_type, status FROM client_actions ORDER BY created_at"
         ).fetchall()
@@ -530,6 +608,26 @@ def _final_database_audit(runner: Level7Runner) -> dict[str, Any]:
             }
             for row in logs
         ],
+        "review_answer_logs": [
+            {
+                "id": str(row[0]),
+                "user_id": str(row[1]),
+                "session_id": str(row[2]),
+                "session_item_id": str(row[3]),
+                "card_id": str(row[4]) if row[4] else None,
+                "source_card_id": str(row[5]),
+                "question_id": str(row[6]),
+                "selected_option_id": row[7],
+                "selected_answer_text": row[8],
+                "is_correct": bool(row[9]),
+                "prompt_content_snapshot": row[10],
+                "correct_answer_snapshot": row[11],
+                "options_snapshot": row[12],
+                "fsrs_state_before_json": row[13],
+                "fsrs_state_after_json": row[14],
+            }
+            for row in answer_logs
+        ],
         "client_actions": [
             {
                 "client_action_id": row[0],
@@ -550,6 +648,13 @@ def _final_database_audit(runner: Level7Runner) -> dict[str, Any]:
     ownership_ok = bool(users) and all(str(row[1]) == str(users[0][0]) for row in cards)
     ownership_ok = ownership_ok and all(str(row[1]) == str(users[0][0]) for row in sessions)
     ownership_ok = ownership_ok and all(str(row[1]) == str(users[0][0]) for row in logs)
+    ownership_ok = ownership_ok and all(str(row[1]) == str(users[0][0]) for row in answer_logs)
+    review_entries = len(logs) + len(answer_logs)
+    review_actions = [row for row in actions if row[2] in {"review_feedback", "review_mcq_answer"}]
+    snapshots_ok = all(
+        row[10] and row[11] and len(row[12] or []) == 4 and row[13] and row[14]
+        for row in answer_logs
+    )
     checks = {
         "exactly_one_real_user": len(users) == 1 and bool(users[0][1]),
         "exactly_one_card": len(cards) == 1,
@@ -560,9 +665,10 @@ def _final_database_audit(runner: Level7Runner) -> dict[str, Any]:
         "card_analysis_committed": len(cards) == 1 and cards[0][6] == "done",
         "no_duplicate_or_half_transaction": all(int(value or 0) == 0 for value in violations.values()),
         "sync_replay_no_duplicate": len(cards) == 1 and int(violations.get("duplicate_card_local_ids") or 0) == 0,
-        "review_log_committed_once": len(logs) == 1 and len(actions) == 1,
-        "review_state_consistent": len(items) == 1 and bool(items[0][4]) and len(logs) == 1,
-        "ai_quota_correct": usage_map.get("ai") == 2,
+        "review_log_committed_once": review_entries == 1 and len(review_actions) == 1,
+        "review_state_consistent": len(items) == 1 and bool(items[0][4]) and review_entries == 1,
+        "review_snapshot_complete": snapshots_ok,
+        "ai_quota_correct": usage_map.get("ai") == 3,
         "tts_quota_correct": usage_map.get("tts") == 1,
         "user_ownership_correct": ownership_ok,
     }
@@ -573,6 +679,7 @@ def _final_database_audit(runner: Level7Runner) -> dict[str, Any]:
 
 def _http_evidence(log_path: Path) -> dict[str, Any]:
     relevant = {
+        "/api/validate-english",
         "/api/auth/wechat-login",
         "/api/auth/me",
         "/api/auth/logout",
@@ -617,6 +724,7 @@ def _http_evidence(log_path: Path) -> dict[str, Any]:
 
 def _build_acceptance(
     core: dict[str, Any] | None,
+    system_validation: dict[str, Any] | None,
     recovery: dict[str, Any] | None,
     auth_state: dict[str, Any] | None,
     database: dict[str, Any] | None,
@@ -633,6 +741,8 @@ def _build_acceptance(
     )
     stream = (core or {}).get("streaming") or {}
     tts = (core or {}).get("tts") or {}
+    validation = (core or {}).get("validation") or {}
+    system_state = (system_validation or {}).get("validation") or {}
     card = (core or {}).get("card") or {}
     recovery_evidence = (recovery or {}).get("recovery") or {}
     resource_gauge_names = tuple(name for name in GAUGE_NAMES if name != "http_requests_in_progress")
@@ -645,6 +755,7 @@ def _build_acceptance(
         "code2session": "REAL PASS" if real_auth else "REAL FAIL",
         "jwt": "REAL PASS" if real_auth and recovery_ok else "REAL FAIL",
         "card_ui_flow": "PASS" if core_ok and card.get("reread_after_edit") == "ineffable" else "FAIL",
+        "validation_ux": "PASS" if core_ok and validation.get("status") == "PASS" and validation.get("validation_request_events", 0) >= 8 and (tts.get("invalid_blocked") or {}).get("request_events") == 0 and (tts.get("content_warning_blocked") or {}).get("request_events") == 0 and system_validation and system_validation.get("status") == "PASS" and all(system_state.get(name) is True for name in ("canSave", "canAnalyze", "canPronounce")) else "FAIL",
         "sync": "PASS" if core_ok and (card.get("sync_replay") or {}).get("synced_one_events", 0) >= 1 else "FAIL",
         "qwen": "REAL PASS" if core_ok and stream.get("final_events", 0) >= 1 else "REAL FAIL",
         "wx_onChunkReceived": "REAL PASS" if core_ok and stream.get("chunk_events", 0) >= 2 else "REAL FAIL",
@@ -682,6 +793,7 @@ def _render_report(result: dict[str, Any]) -> str:
         ("code2session", "code2session"),
         ("jwt", "JWT"),
         ("card_ui_flow", "Card UI flow"),
+        ("validation_ux", "Validation UX"),
         ("sync", "Sync"),
         ("qwen", "Qwen"),
         ("wx_onChunkReceived", "wx.onChunkReceived"),
@@ -716,9 +828,92 @@ def _render_report(result: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _source_revision(path: Path) -> dict[str, Any]:
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=path, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    dirty = bool(
+        subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    )
+    return {"head": head, "dirty": dirty}
+
+
+def _layer3_artifact(result: dict[str, Any], run_dir: Path) -> dict[str, Any]:
+    core = ((result.get("client") or {}).get("core") or {})
+    system_validation = ((result.get("client") or {}).get("system_validation") or {})
+    recovery = ((result.get("client") or {}).get("recovery") or {})
+    http_requests = ((result.get("http_evidence") or {}).get("requests") or [])
+    request_ids = [item.get("request_id") for item in http_requests if item.get("request_id")]
+    steps = (core.get("steps") or []) + (system_validation.get("steps") or []) + (recovery.get("steps") or [])
+    screenshots = (
+        (core.get("screenshots") or [])
+        + (system_validation.get("screenshots") or [])
+        + (recovery.get("screenshots") or [])
+    )
+    acceptance = result.get("acceptance") or {}
+    common = {
+        "operationLog": steps,
+        "requestCapture": http_requests,
+        "requestIds": request_ids,
+        "screenshots": screenshots,
+        "backendLogRefs": [str(run_dir / "uvicorn.log")],
+        "finalDbState": result.get("final_database_audit"),
+    }
+    specs = (
+        ("L3-VALIDATION-PASS", "VAL-PASS-001", "validation", "validation_ux"),
+        ("L3-VALIDATION-CONTENT", "VAL-CONTENT-001", "validation", "validation_ux"),
+        ("L3-VALIDATION-ADVISORY", "VAL-ADVISORY-001", "validation", "validation_ux"),
+        ("L3-VALIDATION-SYSTEM", "VAL-SYSTEM-001", "validation", "validation_ux"),
+        ("L3-VALIDATION-ERROR", "VAL-HARD-001", "validation", "validation_ux"),
+        ("L3-CARD-WARNING-SAVE", "VAL-CONTENT-001", "card-create-edit", "card_ui_flow"),
+        ("L3-AI-CONTENT-BLOCK", "VAL-CONTENT-001", "ai-analysis", "validation_ux"),
+        ("L3-AI-CANCEL-REGENERATE", "VAL-PASS-001", "ai-analysis", "qwen"),
+        ("L3-PRONUNCIATION-KNOWN", "VAL-PASS-001", "pronunciation", "tts_client_flow"),
+        ("L3-PRONUNCIATION-CONTENT-BLOCK", "VAL-CONTENT-001", "pronunciation", "validation_ux"),
+        ("L3-REVIEW-FIXTURE", "VAL-PASS-001", "review", "review_ui_flow"),
+        ("L3-AUTH-RECOVERY-LOGOUT", "VAL-PASS-001", "auth", "401_relogin"),
+        ("L3-SYNC-REPLAY", "VAL-PASS-001", "sync", "sync"),
+        ("L3-FULL-SMOKE", "VAL-PASS-001", "full-smoke", "wechat_devtools_automation"),
+    )
+    journeys = []
+    for journey_id, scenario_id, module, acceptance_key in specs:
+        journeys.append(
+            {
+                "journeyId": journey_id,
+                "scenarioId": scenario_id,
+                "module": module,
+                "status": "PASS"
+                if acceptance.get(acceptance_key) in {"PASS", "REAL PASS"}
+                else "FAIL",
+                **common,
+            }
+        )
+    return {
+        "schemaVersion": "1.0",
+        "runId": result.get("run_id"),
+        "timestamp": result.get("finished_at"),
+        "sourceRevision": result.get("source_revision"),
+        "environment": result.get("environment"),
+        "journeys": journeys,
+    }
+
+
 async def execute() -> tuple[int, Path]:
-    preflight = _preflight()
     runner = Level7Runner()
+    harper_process, harper_runtime = _ensure_harper(runner.run_dir)
+    try:
+        preflight = _preflight()
+    except BaseException:
+        if harper_process is not None:
+            harper_process.stop()
+        raise
+    preflight["harper_runtime"] = harper_runtime
     runtime_project = runner.run_dir / "runtime-miniapp"
     runner.result.update(
         {
@@ -730,13 +925,19 @@ async def execute() -> tuple[int, Path]:
                 "auth": "REAL",
                 "qwen": "REAL",
                 "piper": "REAL",
+                "harper": "REAL",
                 "wechat_client": "REAL",
             },
             "client": {},
             "acceptance": {},
+            "source_revision": {
+                "backend": _source_revision(ROOT),
+                "miniapp": _source_revision(MINIAPP),
+            },
         }
     )
     core: dict[str, Any] | None = None
+    system_validation: dict[str, Any] | None = None
     recovery: dict[str, Any] | None = None
     auth_state: dict[str, Any] | None = None
     database: dict[str, Any] | None = None
@@ -746,6 +947,9 @@ async def execute() -> tuple[int, Path]:
 
     try:
         print(f"[{iso_now()}] START isolated Level 7 backend setup", flush=True)
+        os.environ["HARPER_ENABLED"] = "true"
+        os.environ["HARPER_BASE_URL"] = HARPER_BASE_URL
+        os.environ["HARPER_TIMEOUT_SECONDS"] = "0.5"
         await runner.setup()
         runner.result["environment"]["wechat_automation"] = {
             "developer_cli_present": True,
@@ -766,6 +970,29 @@ async def execute() -> tuple[int, Path]:
             raise E2EFailure(f"Real code2session/openid evidence failed: {auth_state}")
         piper = _validate_piper_wav(runner)
         runner.result["piper_wav_evidence"] = piper
+
+        if harper_process is None:
+            raise E2EFailure(
+                "Layer 3 SYSTEM_WARNING requires a runner-managed Harper sidecar; "
+                "port 8082 was already occupied and will not be stopped"
+            )
+        stopped_harper = harper_process.stop()
+        harper_process = None
+        if port_listener_pid(HARPER_PORT) is not None:
+            raise E2EFailure("Runner-managed Harper sidecar did not stop for SYSTEM_WARNING")
+        try:
+            system_validation = await asyncio.to_thread(
+                _run_client, runner, runtime_project, "system-validation", 120.0
+            )
+            runner.result["client"]["system_validation"] = system_validation
+            runner.result["harper_fault_injection"] = {
+                "kind": "controlled_process_stop",
+                "stopped": stopped_harper,
+                "port_while_stopped": port_listener_pid(HARPER_PORT),
+            }
+        finally:
+            harper_process, restarted_harper = _ensure_harper(runner.run_dir)
+            runner.result.setdefault("harper_fault_injection", {})["recovery"] = restarted_harper
 
         invalidation = _invalidate_only_e2e_user_token(runner)
         runner.result["token_invalidation"] = invalidation
@@ -794,6 +1021,7 @@ async def execute() -> tuple[int, Path]:
         write_json(runner.run_dir / "client-http-evidence.json", runner.result["http_evidence"])
         write_json(runner.run_dir / "final-postgresql-audit.json", database)
         write_json(runner.run_dir / "streaming-evidence.json", core.get("streaming") or {})
+        write_json(runner.run_dir / "validation-ux-evidence.json", core.get("validation") or {})
 
         if database.get("status") != "PASS":
             raise E2EFailure(f"Final PostgreSQL audit failed: {database.get('checks')}")
@@ -874,6 +1102,17 @@ async def execute() -> tuple[int, Path]:
         automation_cleanup["finished_at"] = iso_now()
 
         await runner.cleanup()
+        harper_cleanup: dict[str, Any] = {
+            "managed_by_runner": harper_process is not None,
+            "reused": harper_process is None,
+        }
+        if harper_process is not None:
+            try:
+                harper_cleanup["process"] = harper_process.stop()
+            except Exception as exc:
+                harper_cleanup["error"] = f"{type(exc).__name__}: {exc}"
+        harper_cleanup["port_after_stop"] = port_listener_pid(HARPER_PORT)
+        runner.result["cleanup"]["harper"] = harper_cleanup
         runner.result["cleanup"]["wechat_automation"] = automation_cleanup
         cleanup = runner.result["cleanup"]
         database_cleanup = cleanup.get("database") or {}
@@ -883,9 +1122,15 @@ async def execute() -> tuple[int, Path]:
             and (cleanup.get("ports_after_stop") or {}).get(str(PROXY_PORT)) is None
             and automation_cleanup.get("automation_port_after_close") is None
             and automation_cleanup.get("runtime_project_removed") is True
+            and (
+                harper_process is None
+                or harper_cleanup.get("port_after_stop") is None
+            )
         )
 
-        acceptance = _build_acceptance(core, recovery, auth_state, database, piper, final_gauges)
+        acceptance = _build_acceptance(
+            core, system_validation, recovery, auth_state, database, piper, final_gauges
+        )
         acceptance["cleanup"] = "PASS" if cleanup_ok else "FAIL"
         runner.result["acceptance"] = acceptance
         all_pass = cleanup_ok and not gate_failed and all(
@@ -904,6 +1149,10 @@ async def execute() -> tuple[int, Path]:
             runner.result["chain_conclusion"] = (
                 "NO. The full chain was not proven; failed acceptance items: " + ", ".join(failed)
             )
+        write_json(
+            runner.run_dir / "layer3-journeys.json",
+            sanitize_value(_layer3_artifact(runner.result, runner.run_dir)),
+        )
         write_json(runner.run_dir / "result.json", sanitize_value(runner.result))
         (runner.run_dir / "REPORT.md").write_text(
             _render_report(sanitize_value(runner.result)), encoding="utf-8"

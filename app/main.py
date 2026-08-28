@@ -37,7 +37,12 @@ from app.routers.auth import router as auth_router
 from app.routers.cards import router as cards_router
 from app.routers.language import router as language_router
 from app.routers.reviews import review_sessions_router, router as reviews_router
-from app.schemas import AnalyzeRequest, AnalyzeResponse
+from app.schemas import (
+    AnalyzeRequest,
+    AnalyzeResponse,
+    ValidationRequest,
+    ValidationResponse,
+)
 from app.observability.context import reset_request_id, set_request_id
 from app.observability.errors import classify_exception, is_db_pool_timeout, result_from_status
 from app.observability.logging import configure_logging, log_event
@@ -58,6 +63,7 @@ from app.observability.tracing import configure_tracing, start_span
 from app.services.analyzer import analyze_text, analyze_text_streaming
 from app.services.auth_service import get_current_user
 from app.services.piper_service import warmup_voices
+from app.services.validator import validate_english
 import app.services.request_reliability as request_reliability_module
 from app.services.request_reliability import (
     IdempotencyKeyReuseError,
@@ -503,6 +509,16 @@ def _ai_event(event: str, result: str, **extra: object) -> None:
     )
 
 
+def _configured_ai_provider_name() -> str:
+    return str(getattr(settings, "ai_provider", "ollama") or "ollama").lower()
+
+
+def _configured_ai_model_name() -> str:
+    if _configured_ai_provider_name() == "ollama":
+        return settings.ollama_model
+    return getattr(settings, "ai_model", settings.ollama_model)
+
+
 @contextmanager
 def _ai_inflight_follower_slot() -> Iterator[None]:
     semaphore = _ai_inflight_follower_semaphore
@@ -607,6 +623,20 @@ async def _run_sync(func, *args, **kwargs):
     return await anyio.to_thread.run_sync(partial(func, *args, **kwargs))
 
 
+@app.post("/api/validate-english", response_model=ValidationResponse)
+async def validate_english_content(
+    payload: ValidationRequest,
+    current_user: User = Depends(get_current_user),
+) -> ValidationResponse:
+    """Run the deterministic English preflight without AI, quota, or writes."""
+    result = await _run_sync(
+        validate_english,
+        payload.text,
+        requested_category=payload.cardType,
+    )
+    return ValidationResponse(**result)
+
+
 def _analyze_text_observed_sync(
     payload: AnalyzeRequest,
     *,
@@ -693,7 +723,14 @@ async def analyze_english(
                 limit=settings.ai_daily_quota,
             )
             log_event(logger, logging.INFO, "quota_committed", resource="ai", increment=1)
-            log_event(logger, logging.INFO, "ai_analyze_start", resource="ai", provider="ollama", model=settings.ollama_model)
+            log_event(
+                logger,
+                logging.INFO,
+                "ai_analyze_start",
+                resource="ai",
+                provider=_configured_ai_provider_name(),
+                model=_configured_ai_model_name(),
+            )
             result = await _run_sync(
                 _analyze_text_observed_sync,
                 payload,
@@ -941,7 +978,14 @@ async def analyze_english_stream(
             limit=settings.ai_daily_quota,
         )
         log_event(logger, logging.INFO, "quota_committed", resource="ai", increment=1)
-        log_event(logger, logging.INFO, "ai_analyze_start", resource="ai", provider="ollama", model=settings.ollama_model)
+        log_event(
+            logger,
+            logging.INFO,
+            "ai_analyze_start",
+            resource="ai",
+            provider=_configured_ai_provider_name(),
+            model=_configured_ai_model_name(),
+        )
     except HTTPException as exc:
         if slot_entered:
             await slot.__aexit__(type(exc), exc, exc.__traceback__)

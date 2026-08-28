@@ -34,6 +34,7 @@ $ErrorActionPreference = 'Stop'
 $BackendDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PythonExe = Join-Path $BackendDir '.venv\Scripts\python.exe'
 $FastApiPort = 8000
+$HarperPort = 8082
 $OllamaUrl = 'http://127.0.0.1:11434'
 $OllamaModel = 'qwen3:8b'
 $PgPort = 5432
@@ -50,7 +51,7 @@ function Write-Step {
 
   $script:StepNumber++
   $script:StepLabel = $Label
-  $head = "[{0}/3] {1}" -f $script:StepNumber, $Label
+  $head = "[{0}/4] {1}" -f $script:StepNumber, $Label
   $dots = '.' * [Math]::Max(0, 26 - $head.Length)
   Write-Host ("{0}{1} {2}" -f $head, $dots, $Status)
 }
@@ -82,6 +83,13 @@ function Get-ListenerProcess {
 function Test-PortListening {
   param([int]$Port)
   return ($null -ne (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue))
+}
+
+function Test-HarperProcess {
+  param($Proc)
+  if (-not $Proc -or -not $Proc.CommandLine) { return $false }
+  return ($Proc.Name -match '^node(\.exe)?$' -and
+    $Proc.CommandLine -match '(^|\s|["\\/])server\.mjs(["\s]|$)')
 }
 
 function Test-IsProjectUvicorn {
@@ -178,6 +186,12 @@ function Get-CommandLineHash {
   }
 }
 
+function Get-ProcessCreationDateString {
+  param($Proc)
+
+  try { return ([datetime]$Proc.CreationDate).ToString('o') } catch { return '' }
+}
+
 function Test-ProcessIdentityMatches {
   param(
     $Proc,
@@ -188,9 +202,16 @@ function Test-ProcessIdentityMatches {
   $props = $Identity.PSObject.Properties.Name
   if ($props -contains 'pid' -and $Identity.pid -and [int]$Identity.pid -ne [int]$Proc.ProcessId) { return $false }
   if ($props -contains 'creation_date' -and $Identity.creation_date) {
-    $liveCreated = ''
-    try { $liveCreated = ([datetime]$Proc.CreationDate).ToString('o') } catch { }
-    if ($liveCreated -and $liveCreated -ne [string]$Identity.creation_date) { return $false }
+    $liveCreated = Get-ProcessCreationDateString -Proc $Proc
+    if ($liveCreated) {
+      try {
+        $liveCreatedUtc = ([datetime]$Proc.CreationDate).ToUniversalTime()
+        $trackedCreatedUtc = ([datetime]$Identity.creation_date).ToUniversalTime()
+        if ($liveCreatedUtc.Ticks -ne $trackedCreatedUtc.Ticks) { return $false }
+      } catch {
+        if ($liveCreated -ne [string]$Identity.creation_date) { return $false }
+      }
+    }
   }
   if ($props -contains 'executable_path' -and $Identity.executable_path -and
       [string]$Proc.ExecutablePath -ine [string]$Identity.executable_path) { return $false }
@@ -283,6 +304,8 @@ $stateFastApiLauncherIdentity = $null
 $stateFastApiListenerIdentity = $null
 $stateStartedAt = $null
 $stateNgrokPid = $null
+$stateHarperPid = $null
+$stateHarperIdentity = $null
 if ($state) {
   $stateProps = $state.PSObject.Properties.Name
   if ($stateProps -contains 'fastapi_pid' -and $state.fastapi_pid) { $stateFastApiPid = [int]$state.fastapi_pid }
@@ -292,9 +315,35 @@ if ($state) {
   if ($stateProps -contains 'fastapi_listener_identity') { $stateFastApiListenerIdentity = $state.fastapi_listener_identity }
   if ($stateProps -contains 'started_at' -and $state.started_at) { $stateStartedAt = [string]$state.started_at }
   if ($stateProps -contains 'ngrok_pid' -and $state.ngrok_pid) { $stateNgrokPid = [int]$state.ngrok_pid }
+  if ($stateProps -contains 'harper_pid' -and $state.harper_pid) { $stateHarperPid = [int]$state.harper_pid }
+  if ($stateProps -contains 'harper_identity') { $stateHarperIdentity = $state.harper_identity }
 }
 
-# ================================================================ 1. ngrok
+# ================================================================ 1. Harper
+if ($stateHarperPid) {
+  $harperProc = Get-ProcessById -Id $stateHarperPid
+  if ($harperProc -and (Test-HarperProcess -Proc $harperProc) -and
+      (-not $stateHarperIdentity -or (Test-ProcessIdentityMatches -Proc $harperProc -Identity $stateHarperIdentity))) {
+    $harperResult = Stop-OneProcess -Id $stateHarperPid
+    $harperOk = ($harperResult -ne 'FAILED')
+    Write-Step -Label 'Harper' -Status $(if ($harperOk) { 'STOPPED' } else { 'STOP FAILED' })
+    Write-Sub -Text ("PID: {0}" -f $stateHarperPid)
+    if (-not $harperOk) {
+      Write-Warn 'Harper could not be stopped; continuing with other services.'
+      $script:Incomplete = $true
+    }
+  } elseif ($harperProc) {
+    Write-Step -Label 'Harper' -Status 'SKIPPED / UNKNOWN PROCESS'
+    Write-Warn 'Tracked Harper PID failed identity validation; leaving it running.'
+  } else {
+    Write-Step -Label 'Harper' -Status 'NOT RUNNING'
+  }
+} else {
+  Write-Step -Label 'Harper' -Status 'NOT MANAGED'
+  Write-Sub -Text 'No Harper PID recorded by start-server.ps1; no process was touched.'
+}
+
+# ================================================================ 2. ngrok
 $ngrokIds = @()
 if ($stateNgrokPid) {
   $sp = Get-CimInstance Win32_Process -Filter "ProcessId=$stateNgrokPid" -ErrorAction SilentlyContinue

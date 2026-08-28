@@ -33,7 +33,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Alembic upgrade failed; do not start new code.
 .\start-server.ps1
 ```
 
-`start-server.ps1` 只检查数据库 revision 与代码唯一 head 是否一致，不自动执行 migration；同时执行现有 PostgreSQL、Ollama/Qwen、Piper、FastAPI 和 health 检查。ngrok 默认关闭，只有显式设置 `NGROK_ENABLED=true` 才会启动 tunnel。
+`start-server.ps1` 只检查数据库 revision 与代码唯一 head 是否一致，不自动执行 migration；同时执行现有 PostgreSQL、Ollama/Qwen、Piper、FastAPI 和 health 检查。ngrok 默认开启；设置 `NGROK_ENABLED=false` 才使用本机/LAN 模式。
 
 ## 验证
 

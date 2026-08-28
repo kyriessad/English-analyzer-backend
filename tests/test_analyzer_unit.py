@@ -352,6 +352,89 @@ class AlphanumericClassificationTest(unittest.TestCase):
         self.assertEqual(self._cat("She loves English."), "sentence")
 
 
+class HardRulesV1Test(unittest.TestCase):
+    def _level(self, text: str) -> str:
+        from app.services.validator import validate_english
+
+        return validate_english(text)["level"]
+
+    def test_invalid_inputs_are_hard_rejected(self):
+        invalid_inputs = [
+            "",
+            "   ",
+            "中文",
+            "hello 中文",
+            "123",
+            "12.5",
+            "!!!",
+            "😀",
+            "https://example.com",
+            "test@example.com",
+            "<div>Hello</div>",
+            "console.log('hi');",
+            r"C:\Users\test",
+            "hello\u200b",
+            "hello\x00",
+            "aaaaaaaaaaaa",
+        ]
+
+        for text in invalid_inputs:
+            with self.subTest(text=repr(text)):
+                self.assertEqual(self._level(text), "error")
+
+    def test_valid_english_inputs_are_not_hard_rejected(self):
+        long_text = "This is a normal English sentence with useful context. " * 12
+        valid_inputs = [
+            "gonna",
+            "ain't",
+            "Netflix",
+            "ChatGPT",
+            "LOL",
+            "no way",
+            "what the hell",
+            "Coming?",
+            "So good.",
+            "I dunno.",
+            "soooo good",
+            "nooooo",
+            "yessss",
+            "U.S.",
+            "e.g.",
+            "can't",
+            "mother-in-law",
+            long_text,
+        ]
+
+        self.assertGreater(len(long_text), 500)
+        for text in valid_inputs:
+            with self.subTest(text=repr(text)):
+                self.assertNotEqual(self._level(text), "error")
+
+    def test_normalize_is_idempotent_for_typical_input(self):
+        from app.services.validator import normalize_text
+
+        normalized = normalize_text("I don \u2019 t know \u3002 ")
+        self.assertEqual(normalized, "I don't know.")
+        self.assertEqual(normalize_text(normalized), normalized)
+
+    def test_ai_analysis_rejects_invalid_text_before_downstream_work(self):
+        from app.services.analyzer import analyze_text
+
+        with (
+            patch("app.services.analyzer.translate_to_zh") as mock_translate,
+            patch("app.services.analyzer.generate_understanding") as mock_understanding,
+            patch("app.services.analyzer.generate_analysis_with_ollama") as mock_ai,
+        ):
+            result = analyze_text("hello \u4e2d\u6587")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["level"], "error")
+        self.assertEqual(result["normalizedText"], "hello \u4e2d\u6587")
+        mock_translate.assert_not_called()
+        mock_understanding.assert_not_called()
+        mock_ai.assert_not_called()
+
+
 class AlphanumericExampleChainTest(unittest.TestCase):
     """Phase 8I: alphanumeric / abbreviation words enter Ollama generation."""
 

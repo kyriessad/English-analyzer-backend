@@ -517,6 +517,21 @@ async function closeAutomationBestEffort(label) {
   await new Promise((resolve) => setTimeout(resolve, 1000));
 }
 
+async function reopenRuntimeProject(label) {
+  await closeAutomationBestEffort(`${label}_close`);
+  await waitForAutomationPortReleased(30000);
+  launchWechatCliAuto(label);
+  await waitUntil(`automation TCP listener ${label}`, automationPortListening, 120000, 1000);
+  step(`wechat_processes_after_cli_auto_${label}`, {
+    automation_port_owner: processForAutomationPort(),
+    processes: listWechatProcesses(),
+  });
+  const toolInfo = await waitForAutomationSdkVersion(120000);
+  step(`automation_sdk_ready_after_${label}`, toolInfo);
+  await warmRuntimeCurrentPageBeforeConnect();
+  await connectWithRetry({ retries: 5, timeoutMs: 20000, skipSdkWait: true });
+}
+
 function normalizePagePath(value) {
   return String(value || '').replace(/^\//, '');
 }
@@ -626,7 +641,13 @@ async function connectWithRetry({ retries = 5, timeoutMs = 20000, skipSdkWait = 
         `automator.connect attempt ${attempt}`,
       );
       miniProgram = connected;
-      if (mode === 'auth' || mode === 'core' || mode === 'crud' || mode === 'recovery') attachObservers(miniProgram);
+      if (
+        mode === 'auth' ||
+        mode === 'core' ||
+        mode === 'crud' ||
+        mode === 'recovery' ||
+        mode === 'system-validation'
+      ) attachObservers(miniProgram);
       step('automation_connected', {
         attempt,
         service_port: servicePort,
@@ -662,13 +683,30 @@ async function safeReLaunch(expectedPath, timeoutMs = 90000) {
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
       step('relaunch_attempt', { attempt, target: normalized });
-      // automator.reLaunch() calls currentPage() before wx.reLaunch. That is
-      // unsafe while DevTools has a connection but no current runtime page.
-      await withTimeout(
-        miniProgram.callWxMethod('reLaunch', { url: `/${normalized}` }),
-        45000,
-        `raw reLaunch attempt ${attempt}`,
+      const relaunched = await withTimeout(
+        miniProgram.evaluate(function (targetUrl) {
+          return new Promise(function (resolve) {
+            wx.reLaunch({
+              url: targetUrl,
+              success: function () { resolve({ ok: true }); },
+              fail: function (error) { resolve({ ok: false, error: error && error.errMsg ? error.errMsg : String(error) }); },
+            });
+          });
+        }, `/${normalized}`),
+        30000,
+        `runtime wx.reLaunch attempt ${attempt}`,
       );
+      if (!relaunched || relaunched.ok !== true) {
+        step('runtime_relaunch_failed', { attempt, target: normalized, result: relaunched || null });
+        // automator.reLaunch() calls currentPage() before wx.reLaunch. That is
+        // unsafe while DevTools has a connection but no current runtime page, so
+        // keep it as a secondary path only after runtime wx.reLaunch fails.
+        await withTimeout(
+          miniProgram.callWxMethod('reLaunch', { url: `/${normalized}` }),
+          30000,
+          `raw reLaunch attempt ${attempt}`,
+        );
+      }
       const page = await waitForReadyPage(normalized, timeoutMs);
       step('relaunch_after', {
         attempt,
@@ -684,13 +722,7 @@ async function safeReLaunch(expectedPath, timeoutMs = 90000) {
         error: String(error && error.message ? error.message : error),
       });
       if (attempt < 2) {
-        if (miniProgram) {
-          try {
-            miniProgram.disconnect();
-          } catch (_) {}
-          miniProgram = null;
-        }
-        await connectWithRetry({ retries: 3, timeoutMs: 20000 });
+        await reopenRuntimeProject(`relaunch_reopen_${attempt}`);
       }
     }
   }
@@ -699,6 +731,43 @@ async function safeReLaunch(expectedPath, timeoutMs = 90000) {
 
 async function waitForPage(expectedPath, timeoutMs = 60000) {
   return waitForReadyPage(expectedPath, timeoutMs);
+}
+
+async function navigateBackTo(expectedPath, timeoutMs = 30000) {
+  const normalized = normalizePagePath(expectedPath);
+  try {
+    const returnedPage = await withTimeout(
+      miniProgram.navigateBack(),
+      20000,
+      `automator.navigateBack:${normalized}`,
+    );
+    const returnedPath = returnedPage && returnedPage.path
+      ? normalizePagePath(returnedPage.path)
+      : null;
+    step('automator_navigate_back', { target: normalized, returned_path: returnedPath });
+    if (returnedPath === normalized) return returnedPage;
+    return await waitForReadyPage(normalized, Math.min(timeoutMs, 10000));
+  } catch (error) {
+    step('automator_navigate_back_fallback_native', {
+      target: normalized,
+      error: String(error && error.message ? error.message : error),
+    });
+    try {
+      await withTimeout(miniProgram.native().navigateLeft(), 15000, `native.navigateLeft:${normalized}`);
+      return await waitForReadyPage(normalized, Math.min(timeoutMs, 15000));
+    } catch (nativeError) {
+      step('native_navigate_back_fallback_relaunch', {
+        target: normalized,
+        error: String(nativeError && nativeError.message ? nativeError.message : nativeError),
+      });
+      if (miniProgram) {
+        try { miniProgram.disconnect(); } catch (_) {}
+        miniProgram = null;
+      }
+      await connectWithRetry({ retries: 3, timeoutMs: 20000 });
+      return safeReLaunch(normalized, Math.max(timeoutMs, 60000));
+    }
+  }
 }
 
 async function currentPageOrReLaunch(expectedPath, timeoutMs = 90000) {
@@ -774,6 +843,238 @@ async function screenshot(name) {
   if (stat.size < 1000) throw new Error(`Screenshot is unexpectedly small: ${target}`);
   step('screenshot', { name, path: target, bytes: stat.size });
   return { path: target, bytes: stat.size };
+}
+
+async function validationSnapshot(page) {
+  const form = (await page.data('form')) || {};
+  return {
+    status: String((await page.data('validationStatus')) || ''),
+    input: String(form.englishText || ''),
+    category: String(form.category || ''),
+    issues: (await page.data('validationIssues')) || [],
+    visibleIssues: (await page.data('validationVisibleIssues')) || [],
+    hiddenCount: Number((await page.data('validationHiddenCount')) || 0),
+    formatMessage: String((await page.data('validationFormatMessage')) || ''),
+    canSave: await page.data('validationCanSave'),
+    canAnalyze: await page.data('validationCanAnalyze'),
+    canPronounce: await page.data('validationCanPronounce'),
+  };
+}
+
+async function waitForValidation(page, label, predicate, timeoutMs = 20000) {
+  let latest = null;
+  try {
+    return await waitUntil(label, async () => {
+      const state = await validationSnapshot(page);
+      latest = state;
+      return predicate(state) ? state : false;
+    }, timeoutMs, 100);
+  } catch (error) {
+    step('validation_wait_timeout_snapshot', {
+      label,
+      latest,
+      error: String(error && error.message ? error.message : error),
+    });
+    throw error;
+  }
+}
+
+function hasValidationIssue(state, type) {
+  return Array.isArray(state && state.issues) && state.issues.some((item) => item && item.type === type);
+}
+
+function countAiRequestSince(index) {
+  return countConsoleSince(index, /stream_http_start/) +
+    countConsoleSince(index, /request_start.*\/api\/analyze-english/);
+}
+
+async function runValidationUx(page, screenshots) {
+  const validationLogStart = consoleEvents.length;
+  const evidence = {};
+
+  await input(page, '.textarea-english', 'because', 'validation_enter_pass');
+  const passState = await waitForValidation(page, 'validation PASS', (state) => state.status === 'pass');
+  const passElements = await page.$$('.validation-issue');
+  if (passState.visibleIssues.length !== 0 || passElements.length !== 0) {
+    throw new Error(`PASS was not silent: ${JSON.stringify(passState)}`);
+  }
+  evidence.pass_silent = passState;
+
+  await input(page, '.textarea-english', '  absolutely  ', 'validation_enter_normalize');
+  evidence.normalization = await waitForValidation(
+    page,
+    'validation normalization',
+    (state) => state.status === 'pass' && state.input === 'absolutely' && state.formatMessage === '已自动整理格式',
+  );
+
+  await input(page, '.textarea-english', 'becuase', 'validation_enter_spelling_warning');
+  const spellingState = await waitForValidation(
+    page,
+    'validation spelling warning',
+    (state) => state.status === 'warning' && hasValidationIssue(state, 'spelling'),
+  );
+  const spellingIssue = spellingState.issues.find((item) => item && item.type === 'spelling');
+  if (!String((spellingIssue && spellingIssue.detail) || '').includes('because')) {
+    throw new Error(`Spelling suggestion was not user-visible: ${JSON.stringify(spellingState)}`);
+  }
+  if (spellingState.canSave !== true || spellingState.canAnalyze !== false || spellingState.canPronounce !== false) {
+    throw new Error(`CONTENT_WARNING capabilities were not consumed: ${JSON.stringify(spellingState)}`);
+  }
+  screenshots.push(await screenshot('validation-01-spelling-warning'));
+
+  const contentAiLogStart = consoleEvents.length;
+  await tap(page, ['.ai-analyze-btn'], 'validation_content_warning_tap_ai');
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  const contentAiRequests = countAiRequestSince(contentAiLogStart);
+  if (contentAiRequests !== 0 || Boolean(await page.data('isAnalyzing'))) {
+    throw new Error(`CONTENT_WARNING reached AI: request_events=${contentAiRequests}`);
+  }
+  evidence.content_warning_blocked = {
+    request_events: contentAiRequests,
+    state: await validationSnapshot(page),
+  };
+
+  await input(page, '.textarea-english', 'because', 'validation_fix_spelling');
+  const immediateAfterEdit = await validationSnapshot(page);
+  if (immediateAfterEdit.status !== 'idle' || immediateAfterEdit.visibleIssues.length !== 0) {
+    throw new Error(`Old warning survived input edit: ${JSON.stringify(immediateAfterEdit)}`);
+  }
+  evidence.warning_cleared_to_pass = await waitForValidation(
+    page,
+    'warning changed to PASS',
+    (state) => state.status === 'pass' && state.visibleIssues.length === 0,
+  );
+
+  await input(page, '.textarea-english', 'This is a complete sentence.', 'validation_enter_category_mismatch');
+  const categoryState = await waitForValidation(
+    page,
+    'validation category mismatch',
+    (state) => state.status === 'warning' && hasValidationIssue(state, 'category_mismatch'),
+  );
+  await tap(page, ['.validation-action'], 'validation_switch_to_sentence');
+  const switchedSentence = await waitForValidation(
+    page,
+    'category switched to sentence',
+    (state) => state.category === '句子' && !hasValidationIssue(state, 'category_mismatch') && ['pass', 'warning'].includes(state.status),
+  );
+  evidence.category_action = { before: categoryState, after: switchedSentence };
+
+  await input(page, '.textarea-english', 'I goed there yesterday.', 'validation_enter_grammar_warning');
+  evidence.grammar_warning = await waitForValidation(
+    page,
+    'validation grammar warning',
+    (state) => state.status === 'warning' && hasValidationIssue(state, 'grammar'),
+  );
+
+  await input(page, '.textarea-english', 'Really???', 'validation_enter_punctuation_warning');
+  const punctuationState = await waitForValidation(
+    page,
+    'validation punctuation warning',
+    (state) => state.status === 'warning' && hasValidationIssue(state, 'punctuation') && state.visibleIssues.length > 0,
+  );
+  const punctuationAutoHidden = await waitForValidation(
+    page,
+    'light punctuation warning auto hidden',
+    (state) => state.status === 'warning' && state.visibleIssues.length === 0,
+    10000,
+  );
+  evidence.punctuation_auto_hide = { before: punctuationState, after: punctuationAutoHidden };
+
+  if (punctuationState.canAnalyze !== true || punctuationState.canPronounce !== true) {
+    throw new Error(`ADVISORY_WARNING capabilities were not allowed: ${JSON.stringify(punctuationState)}`);
+  }
+  const advisoryAiLogStart = consoleEvents.length;
+  await tap(page, ['.ai-analyze-btn'], 'validation_advisory_warning_tap_ai');
+  await waitUntil('ADVISORY_WARNING AI request started', async () => {
+    return countAiRequestSince(advisoryAiLogStart) > 0 || Boolean(await page.data('isAnalyzing'));
+  }, 30000, 100);
+  await waitUntil('ADVISORY_WARNING AI completed', async () => {
+    return !Boolean(await page.data('isAnalyzing')) && countAiRequestSince(advisoryAiLogStart) > 0;
+  }, 180000, 150);
+  evidence.advisory_warning_allowed = {
+    request_events: countAiRequestSince(advisoryAiLogStart),
+    state: await validationSnapshot(page),
+  };
+
+  await input(page, '.textarea-english', 'because', 'validation_prepare_word_category');
+  await waitForValidation(
+    page,
+    'word mismatch while sentence selected',
+    (state) => state.status === 'warning' && hasValidationIssue(state, 'category_mismatch'),
+  );
+  await tap(page, ['.validation-action'], 'validation_switch_to_word');
+  await waitForValidation(page, 'category switched to word', (state) => state.category === '单词' && state.status === 'pass');
+
+  const longMultipleWarning = Array(9).fill('This is a useful sentence.').join(' ') + '???';
+  await input(page, '.textarea-english', longMultipleWarning, 'validation_enter_multiple_warnings');
+  const multipleState = await waitForValidation(
+    page,
+    'validation multiple warnings',
+    (state) => state.status === 'warning' && state.issues.length >= 3 && state.visibleIssues.length === 2 && state.hiddenCount === state.issues.length - 2,
+  );
+  screenshots.push(await screenshot('validation-02-multiple-warnings'));
+  evidence.multiple_warnings = multipleState;
+
+  const invalidAiLogStart = consoleEvents.length;
+  await input(page, '.textarea-english', '我的', 'validation_enter_invalid_for_rapid_ai');
+  await tap(page, ['.ai-analyze-btn'], 'validation_rapid_ai_tap');
+  const invalidAiState = await waitForValidation(page, 'rapid AI INVALID', (state) => state.status === 'invalid');
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  const invalidAiRequests = countAiRequestSince(invalidAiLogStart);
+  if (invalidAiRequests !== 0 || Boolean(await page.data('isAnalyzing'))) {
+    throw new Error(`INVALID reached AI: request_events=${invalidAiRequests}`);
+  }
+  evidence.invalid_ai_blocked = invalidAiState;
+
+  await input(page, '.textarea-english', 'because', 'validation_fix_invalid');
+  const immediateAfterInvalidEdit = await validationSnapshot(page);
+  if (immediateAfterInvalidEdit.status !== 'idle') {
+    throw new Error(`INVALID did not clear immediately after edit: ${JSON.stringify(immediateAfterInvalidEdit)}`);
+  }
+  evidence.invalid_cleared_to_pass = await waitForValidation(
+    page,
+    'INVALID changed to PASS',
+    (state) => state.status === 'pass',
+  );
+
+  await input(page, '.input-source', 'Validation UX real DevTools', 'validation_preserve_source');
+  await input(page, '.textarea-understanding', '保留我的理解', 'validation_preserve_understanding');
+  const notesInputs = await page.$$('textarea.textarea');
+  if (notesInputs.length < 3) throw new Error('Validation UX notes textarea was not found');
+  await notesInputs[notesInputs.length - 1].input('保留我的备注');
+  step('validation_preserve_notes', { value_length: 6 });
+
+  const invalidSaveLogStart = consoleEvents.length;
+  await input(page, '.textarea-english', '12345', 'validation_enter_invalid_for_rapid_save');
+  await tap(page, ['.primary-btn.submit-btn'], 'validation_rapid_save_tap');
+  const invalidSaveState = await waitForValidation(page, 'rapid save INVALID', (state) => state.status === 'invalid');
+  await waitUntil('rapid invalid save settled', async () => !Boolean(await page.data('isSaving')), 10000, 100);
+  const preservedForm = await page.data('form');
+  const current = await currentPageSafe('validation:invalid_save_stays_on_add');
+  const invalidSaveRequests = countConsoleSince(invalidSaveLogStart, /request_start.*\/api\/cards/);
+  if (
+    !current || normalizePagePath(current.path) !== 'pages/add/add' || invalidSaveRequests !== 0 ||
+    preservedForm.whereEncountered !== 'Validation UX real DevTools' ||
+    preservedForm.myUnderstanding !== '保留我的理解' ||
+    preservedForm.notes !== '保留我的备注'
+  ) {
+    throw new Error(`INVALID save did not preserve the form: ${JSON.stringify({ invalidSaveRequests, preservedForm })}`);
+  }
+  screenshots.push(await screenshot('validation-03-invalid-save-blocked'));
+  evidence.invalid_save_blocked = { state: invalidSaveState, preservedForm, request_events: invalidSaveRequests };
+
+  await input(page, '.textarea-english', 'becuase', 'validation_restore_warning_for_save');
+  evidence.warning_ready_for_save = await waitForValidation(
+    page,
+    'WARNING ready for save',
+    (state) => state.status === 'warning' && hasValidationIssue(state, 'spelling'),
+  );
+  evidence.validation_request_events = countConsoleSince(validationLogStart, /request_start.*\/api\/validate-english/);
+  if (evidence.validation_request_events < 8) {
+    throw new Error(`Too few real validation requests: ${evidence.validation_request_events}`);
+  }
+  evidence.status = 'PASS';
+  return evidence;
 }
 
 async function storageState() {
@@ -1017,7 +1318,7 @@ async function runCore() {
   await tap(page, ['.first-card-btn', '.add-main-btn'], 'open_add_page');
   page = await waitForPage('pages/add/add');
   await waitUntil('add page non-critical controls', async () => Boolean(await page.data('deferNonCriticalReady')), 15000);
-  await input(page, '.textarea-english', 'ephemeral', 'enter_initial_card_text');
+  const validationEvidence = await runValidationUx(page, screenshots);
   await input(page, '.input-source', 'Level 7 WeChat DevTools E2E', 'enter_initial_source');
   await input(page, '.textarea-understanding', '短暂存在的', 'enter_initial_understanding');
   const notesInputs = await page.$$('textarea.textarea');
@@ -1029,13 +1330,13 @@ async function runCore() {
 
   await waitUntil('created card on home page', async () => {
     const cards = await page.data('cards');
-    return Array.isArray(cards) && cards.some((card) => card && card.englishText === 'ephemeral');
+    return Array.isArray(cards) && cards.some((card) => card && card.englishText === 'becuase');
   }, 45000);
   screenshots.push(await screenshot('02-card-created'));
 
   await waitUntil('initial background analysis settlement', async () => {
     const cards = await miniProgram.evaluate(function () { return wx.getStorageSync('cardsCache'); });
-    const card = Array.isArray(cards) ? cards.find((item) => item && item.englishText === 'ephemeral') : null;
+    const card = Array.isArray(cards) ? cards.find((item) => item && item.englishText === 'becuase') : null;
     if (!card) return false;
     return card.analysisStatus === 'done' || card.analysisStatus === 'failed' ? card : false;
   }, 180000, 500);
@@ -1046,7 +1347,7 @@ async function runCore() {
   const syncReplaySetup = await miniProgram.evaluate(function () {
     const cards = wx.getStorageSync('cardsCache');
     if (!Array.isArray(cards)) return { prepared: false, reason: 'cardsCache missing' };
-    const index = cards.findIndex(function (card) { return card && card.englishText === 'ephemeral'; });
+    const index = cards.findIndex(function (card) { return card && card.englishText === 'becuase'; });
     if (index < 0) return { prepared: false, reason: 'created card missing' };
     cards[index].backend_sync_status = 'pending';
     cards[index].backend_card_id = '';
@@ -1066,11 +1367,10 @@ async function runCore() {
   const syncReplayLogStart = consoleEvents.length;
   await tap(page, ['.header-settings'], 'open_settings_before_sync_replay');
   await waitForPage('pages/settings/index', 20000);
-  await miniProgram.native().navigateLeft();
-  page = await waitForPage('pages/index/index', 30000);
+  page = await navigateBackTo('pages/index/index', 30000);
   await waitUntil('real client sync replay success', async () => {
     const cards = await page.data('cards');
-    const card = Array.isArray(cards) ? cards.find((item) => item && item.englishText === 'ephemeral') : null;
+    const card = Array.isArray(cards) ? cards.find((item) => item && item.englishText === 'becuase') : null;
     const logs = consoleEvents.slice(syncReplayLogStart).map(consoleText).join('\n');
     return card && card.backend_sync_status === 'synced' && /sync complete synced[^0-9]*1[^0-9]+failed[^0-9]*0/.test(logs);
   }, 60000, 250);
@@ -1084,7 +1384,7 @@ async function runCore() {
   page = await waitForPage('pages/add/add');
   await waitUntil('edit card loaded', async () => Boolean(await page.data('isEdit')), 20000);
   const rereadBeforeEdit = await page.data('form');
-  if (!rereadBeforeEdit || rereadBeforeEdit.englishText !== 'ephemeral') {
+  if (!rereadBeforeEdit || rereadBeforeEdit.englishText !== 'becuase') {
     throw new Error('Created card could not be re-read through the Card UI');
   }
 
@@ -1092,9 +1392,30 @@ async function runCore() {
   await input(page, '.input-source', 'Level 7 edited through UI', 'modify_card_source');
   await input(page, '.textarea-understanding', '美好得难以言喻', 'modify_card_understanding');
 
+  const cancelledStreamLogStart = consoleEvents.length;
+  await tap(page, ['.ai-analyze-btn'], 'tap_ai_analyze_generation_a');
+  await waitUntil('generation A produced a real delta', async () => {
+    return Boolean(await page.data('isAnalyzing'))
+      && countConsoleSince(cancelledStreamLogStart, /stream_delta/) > 0;
+  }, 60000, 100);
+  await tap(page, ['.ai-analyze-cancel'], 'cancel_ai_generation_a');
+  await waitUntil('generation A cancelled', async () => !Boolean(await page.data('isAnalyzing')), 30000, 100);
+  const cancellationEvidence = {
+    delta_events: countConsoleSince(cancelledStreamLogStart, /stream_delta/),
+    final_events_before_regenerate: countConsoleSince(cancelledStreamLogStart, /stream_final/),
+    done_events_before_regenerate: countConsoleSince(cancelledStreamLogStart, /stream_done/),
+  };
+  if (
+    cancellationEvidence.delta_events < 1
+    || cancellationEvidence.final_events_before_regenerate !== 0
+    || cancellationEvidence.done_events_before_regenerate !== 0
+  ) {
+    throw new Error(`Generation A cancellation invariant failed: ${JSON.stringify(cancellationEvidence)}`);
+  }
+
   const streamLogStart = consoleEvents.length;
   const streamStartedAt = Date.now();
-  await tap(page, ['.ai-analyze-btn'], 'tap_ai_analyze');
+  await tap(page, ['.ai-analyze-btn'], 'tap_ai_analyze_generation_b');
   let sawAnalyzing = false;
   let progressive = null;
   let finalState = null;
@@ -1131,6 +1452,7 @@ async function runCore() {
     progressive_before_complete: Boolean(progressive),
     progressive_snapshot: progressive,
     final_snapshot: finalState,
+    cancel_regenerate: cancellationEvidence,
   };
   if (streamEvidence.chunk_events < 2) {
     throw new Error(`onChunkReceived delivered fewer than two chunks: ${JSON.stringify(streamEvidence)}`);
@@ -1195,15 +1517,65 @@ async function runCore() {
   }
   screenshots.push(await screenshot('04-tts-client'));
 
-  await miniProgram.native().navigateLeft();
-  page = await waitForPage('pages/index/index', 30000);
+  await input(page, '.textarea-english', '我的', 'validation_enter_invalid_for_tts');
+  const invalidTtsState = await waitForValidation(page, 'TTS INVALID', (state) => state.status === 'invalid');
+  await waitUntil('invalid TTS control settled', async () => !Boolean(await page.data('editPhoneticLoading')), 30000, 100);
+  const invalidTtsLogStart = consoleEvents.length;
+  await tap(page, ['.edit-pronunciation-btn'], 'validation_invalid_tts_tap');
+  const invalidTtsRequests = countConsoleSince(invalidTtsLogStart, /edit_button_clicked|"event":"download_start"/);
+  if (invalidTtsRequests !== 0) {
+    throw new Error(`INVALID reached TTS: request_events=${invalidTtsRequests}`);
+  }
+  await input(page, '.textarea-english', 'ineffable', 'validation_fix_invalid_tts');
+  const ttsValidationRecovered = await waitForValidation(
+    page,
+    'TTS INVALID changed to PASS',
+    (state) => state.status === 'pass',
+  );
+  ttsEvidence.invalid_blocked = {
+    state: invalidTtsState,
+    request_events: invalidTtsRequests,
+    recovered: ttsValidationRecovered,
+  };
+
+  await input(page, '.textarea-english', 'becuase', 'validation_enter_content_warning_for_tts');
+  const contentWarningTtsState = await waitForValidation(
+    page,
+    'TTS CONTENT_WARNING',
+    (state) => state.status === 'warning' && state.canPronounce === false,
+  );
+  const contentWarningTtsLogStart = consoleEvents.length;
+  await tap(page, ['.edit-pronunciation-btn'], 'validation_content_warning_tts_tap');
+  const contentWarningTtsRequests = countConsoleSince(
+    contentWarningTtsLogStart,
+    /edit_button_clicked|"event":"download_start"/,
+  );
+  if (contentWarningTtsRequests !== 0) {
+    throw new Error(`CONTENT_WARNING reached TTS: request_events=${contentWarningTtsRequests}`);
+  }
+  ttsEvidence.content_warning_blocked = {
+    state: contentWarningTtsState,
+    request_events: contentWarningTtsRequests,
+  };
+  await input(page, '.textarea-english', 'ineffable', 'validation_recover_content_warning_tts');
+  await waitForValidation(page, 'TTS CONTENT_WARNING recovered', (state) => state.status === 'pass');
+
+  page = await navigateBackTo('pages/index/index', 30000);
   await tap(page, ['.review-main-btn'], 'open_review');
   page = await waitForPage('pages/review/review', 45000);
   await waitUntil('active review card', async () => (await page.data('pageState')) === 'active', 45000);
   screenshots.push(await screenshot('05-review-active'));
-  await tap(page, ['.reveal-btn'], 'reveal_review_answer');
-  await waitUntil('review answer visible', async () => Boolean(await page.data('answerVisible')), 10000);
-  await tap(page, ['.action-good'], 'submit_review');
+  const reviewCard = await page.data('currentCard');
+  const reviewOptions = await page.$$('.mcq-option');
+  if (!reviewOptions.length) {
+    throw new Error('Active review card did not render any selectable options');
+  }
+  const correctOptionIndex = reviewCard.options.findIndex((option) => option.text === reviewCard.myUnderstanding);
+  if (correctOptionIndex < 0) {
+    throw new Error(`Correct review option was not identifiable from the fixed card fixture: ${JSON.stringify(reviewCard)}`);
+  }
+  await reviewOptions[correctOptionIndex].tap();
+  step('submit_review_option', { option_index: correctOptionIndex });
   await waitUntil('review feedback completion', async () => {
     const current = await currentPageSafe('core:review_feedback_completion');
     if (!current) return false;
@@ -1220,7 +1592,7 @@ async function runCore() {
 
   let current = await currentPageSafe('core:before_return_home');
   if (current && normalizePagePath(current.path) !== 'pages/index/index') {
-    await miniProgram.native().navigateLeft();
+    await safeReLaunch('pages/index/index', 60000);
   }
   await waitForPage('pages/index/index', 30000);
 
@@ -1233,7 +1605,7 @@ async function runCore() {
     runtime,
     auth: initialAuthEvidence,
     card: {
-      created_content: 'ephemeral',
+      created_content: 'becuase',
       reread_before_edit: rereadBeforeEdit.englishText,
       modified_content: 'ineffable',
       reread_after_edit: rereadAfterEdit.englishText,
@@ -1241,6 +1613,7 @@ async function runCore() {
       sync_replay: syncReplayEvidence,
     },
     streaming: streamEvidence,
+    validation: validationEvidence,
     tts: ttsEvidence,
     review: { submitted: true },
     screenshots,
@@ -1512,15 +1885,14 @@ async function runRecovery() {
   await connectRecovery();
   shouldCloseProject = true;
   const screenshots = [];
-  let page = await waitForPage('pages/index/index', 30000);
+  const recoveryLogStart = consoleEvents.length;
+  let page = await currentPageOrReLaunch('pages/index/index', 90000);
   const before = await storageState();
   if (!before.hasAccessToken) throw new Error('Expected the invalidated JWT to remain in client storage');
 
-  const recoveryLogStart = consoleEvents.length;
   await tap(page, ['.header-settings'], 'open_settings_to_trigger_return');
   await waitForPage('pages/settings/index', 20000);
-  await miniProgram.native().navigateLeft();
-  page = await waitForPage('pages/index/index', 30000);
+  page = await navigateBackTo('pages/index/index', 30000);
 
   await waitUntil('401 single-flight relogin recovery', async () => {
     const state = await storageState();
@@ -1589,6 +1961,33 @@ async function runRecovery() {
   };
 }
 
+async function runSystemValidation() {
+  await connectRecovery();
+  const screenshots = [];
+  const page = await safeReLaunch('pages/add/add', 60000);
+  await input(page, '.textarea-english', 'This is a complete sentence.', 'system_warning_validation_input');
+  const state = await waitForValidation(
+    page,
+    'Harper unavailable SYSTEM_WARNING',
+    (value) => value.status === 'warning'
+      && value.canSave === true
+      && value.canAnalyze === true
+      && value.canPronounce === true,
+    30000,
+  );
+  screenshots.push(await screenshot('validation-04-system-warning'));
+  miniProgram.disconnect();
+  miniProgram = null;
+  return {
+    status: 'PASS',
+    validation: state,
+    harper_expected_unavailable: true,
+    screenshots,
+    console_event_count: consoleEvents.length,
+    exception_event_count: exceptionEvents.length,
+  };
+}
+
 async function runCleanup() {
   await connectRecovery();
   shouldCloseProject = true;
@@ -1612,8 +2011,8 @@ async function runCleanup() {
 async function main() {
   requireValue(artifactDir, 'LEVEL7_ARTIFACT_DIR');
   requireValue(cliPath, 'LEVEL7_WECHAT_CLI');
-  if (mode !== 'prepare' && mode !== 'launch' && mode !== 'auth' && mode !== 'crud' && mode !== 'core' && mode !== 'recovery' && mode !== 'cleanup' && mode !== 'page-control') {
-    throw new Error('Mode must be prepare, launch, auth, crud, core, recovery, cleanup, or page-control');
+  if (mode !== 'prepare' && mode !== 'launch' && mode !== 'auth' && mode !== 'crud' && mode !== 'core' && mode !== 'system-validation' && mode !== 'recovery' && mode !== 'cleanup' && mode !== 'page-control') {
+    throw new Error('Mode must be prepare, launch, auth, crud, core, system-validation, recovery, cleanup, or page-control');
   }
   fs.mkdirSync(artifactDir, { recursive: true });
   fs.writeFileSync(consolePath, '', 'utf8');
@@ -1621,7 +2020,7 @@ async function main() {
 
   const result = mode === 'prepare'
     ? await runPrepare()
-    : (mode === 'launch' ? await runLaunch() : (mode === 'auth' ? await runAuth() : (mode === 'crud' ? await runCrud() : (mode === 'core' ? await runCore() : (mode === 'recovery' ? await runRecovery() : (mode === 'page-control' ? await runPageControl() : await runCleanup()))))));
+    : (mode === 'launch' ? await runLaunch() : (mode === 'auth' ? await runAuth() : (mode === 'crud' ? await runCrud() : (mode === 'core' ? await runCore() : (mode === 'system-validation' ? await runSystemValidation() : (mode === 'recovery' ? await runRecovery() : (mode === 'page-control' ? await runPageControl() : await runCleanup())))))));
   result.mode = mode;
   result.started_at = steps.length ? steps[0].at : now();
   result.finished_at = now();

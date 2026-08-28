@@ -47,6 +47,16 @@ def _ai_event(event: str, result: str, **extra: Any) -> None:
     )
 
 
+def _configured_ai_provider_name() -> str:
+    return str(getattr(settings, "ai_provider", "ollama") or "ollama").lower()
+
+
+def _configured_ai_model_name() -> str:
+    if _configured_ai_provider_name() == "ollama":
+        return str(getattr(settings, "ollama_model", "qwen3:8b") or "qwen3:8b")
+    return str(getattr(settings, "ai_model", "qwen3:8b") or "qwen3:8b")
+
+
 def _make_attempt_recorder(record: Any) -> Any:
     """Build the per-Qwen-request attempt recorder bound to a reliability record."""
     if record is None:
@@ -290,8 +300,13 @@ def _finalize_analysis(
             warnings.append(TRANSLATION_UNAVAILABLE_WARNING)
             translation = None
 
-    # Example sentence + translation + synonyms + similar phrases.
-    if ollama:
+    # Paragraphs expose only their translation and a simplified understanding.
+    # Keep the response schema stable by leaving word/phrase fields empty.
+    example_sentence = None
+    example_translation = None
+    example_source = None
+    example_error = None
+    if ollama and category != "paragraph":
         example_sentence = ollama.get("exampleSentence")
         example_translation = ollama.get("exampleTranslation")
         example_source = "ollama"
@@ -302,7 +317,7 @@ def _finalize_analysis(
         alternative_meanings = ollama.get("alternativeMeanings") or []
         usage_scenario = ollama.get("usageScenario") or ""
         dialogue = ollama.get("dialogue") or {"english": [], "chinese": []}
-    else:
+    elif category != "paragraph":
         example_sentence, example_translation, example_source, example_error = _generate_example(
             normalized_text,
             category,
@@ -326,8 +341,15 @@ def _finalize_analysis(
         translation,
     )
 
-    analysis_source = "ollama" if ollama else "fallback"
-    analysis_model = settings.ollama_model if ollama else None
+    ai_provider = _configured_ai_provider_name()
+    analysis_source = ai_provider if ollama else "fallback"
+    analysis_model = (
+        _configured_ai_model_name()
+        if ollama and ai_provider == "ollama"
+        else _configured_ai_model_name()
+        if ollama
+        else None
+    )
 
     response = _build_response(
         ok=True,
@@ -379,15 +401,34 @@ def _finalize_analysis(
     return response
 
 
-def _validation_context(text: str) -> tuple[dict[str, Any], str, Level, str, list[str], list[str]]:
+def _validation_context(
+    text: str,
+    requested_category: str = "auto",
+) -> tuple[dict[str, Any], str, Level, str, list[str], list[str]]:
     """Run validation and return the pieces both analysis paths need."""
-    validation = validate_english(text)
+    validation = validate_english(text, requested_category=requested_category)
     category = validation["category"]
     validation_level = validation["level"]
     normalized_text = validation["normalizedText"]
     warnings = list(validation.get("warnings") or [])
     errors = list(validation.get("errors") or [])
     return validation, category, validation_level, normalized_text, warnings, errors
+
+
+def _apply_current_validation_warnings(
+    cached: dict[str, Any],
+    validation_level: Level,
+    warnings: list[str],
+) -> dict[str, Any]:
+    response = dict(cached)
+    merged_warnings = list(response.get("warnings") or [])
+    for warning in warnings:
+        if warning not in merged_warnings:
+            merged_warnings.append(warning)
+    response["warnings"] = merged_warnings
+    if validation_level == "warning":
+        response["level"] = "warning"
+    return response
 
 
 def analyze_text(
@@ -411,7 +452,10 @@ def analyze_text(
     )
     try:
         with observed_operation("ai", "validate_english"):
-            validation, category, validation_level, normalized_text, warnings, errors = _validation_context(text)
+            validation, category, validation_level, normalized_text, warnings, errors = _validation_context(
+                text,
+                card_type,
+            )
 
         if validation["level"] == "error":
             result_label = "validation_error"
@@ -443,6 +487,7 @@ def analyze_text(
                         category=cached_category,
                     )
                 else:
+                    cached = _apply_current_validation_warnings(cached, validation_level, warnings)
                     cached["cacheHit"] = True
                     AI_CACHE_EVENTS_TOTAL.labels(operation="analyze_text", result="hit").inc()
                     log_event(
@@ -477,10 +522,10 @@ def analyze_text(
 
         # One Ollama call generates the full English-learning reference (meaning, expression
         # type, alternative meanings, usage scenario, example + translation, dialogue,
-        # synonyms, similar phrases). word/phrase/sentence all prefer Qwen.
+        # synonyms, similar phrases). Paragraphs retain only meaning downstream.
         ollama = None
         if (
-            category in ("word", "phrase", "sentence")
+            category in ("word", "phrase", "sentence", "paragraph")
             and settings.example_generator_provider == "ollama"
         ):
             if time.monotonic() >= deadline_at:
@@ -506,7 +551,7 @@ def analyze_text(
                 with observed_operation(
                     "ollama",
                     "qwen_analysis",
-                    attributes={"model": settings.ollama_model, "category": category},
+                    attributes={"model": _configured_ai_model_name(), "category": category},
                 ):
                     ollama = generate_analysis_with_ollama(
                         normalized_text,
@@ -518,10 +563,10 @@ def analyze_text(
                 logger.warning("[analyzer] ollama analysis error: %s", _short_error(exc))
                 ollama = None
 
-        # Qwen is the formal AI result for word/phrase/sentence. A failed Qwen call must
+        # Qwen is the formal AI result for supported categories. A failed Qwen call must
         # surface as a clear failure, not be disguised by an Argos+template fallback.
         if (
-            category in ("word", "phrase", "sentence")
+            category in ("word", "phrase", "sentence", "paragraph")
             and settings.example_generator_provider == "ollama"
             and ollama is None
         ):
@@ -608,7 +653,10 @@ def analyze_text_streaming(
     )
     try:
         with observed_operation("ai", "validate_english"):
-            validation, category, validation_level, normalized_text, warnings, errors = _validation_context(text)
+            validation, category, validation_level, normalized_text, warnings, errors = _validation_context(
+                text,
+                card_type,
+            )
 
         if validation["level"] == "error":
             result_label = "validation_error"
@@ -652,6 +700,7 @@ def analyze_text_streaming(
                         cache_key=cache_key[:12],
                     )
                 else:
+                    cached = _apply_current_validation_warnings(cached, validation_level, warnings)
                     cached["cacheHit"] = True
                     AI_CACHE_EVENTS_TOTAL.labels(operation="analyze_text_streaming", result="hit").inc()
                     log_event(
@@ -700,7 +749,7 @@ def analyze_text_streaming(
         ollama = None
         final_attempt = 1
         if (
-            category in ("word", "phrase", "sentence")
+            category in ("word", "phrase", "sentence", "paragraph")
             and settings.example_generator_provider == "ollama"
         ):
             if time.monotonic() >= deadline_at:
@@ -736,7 +785,7 @@ def analyze_text_streaming(
                 with observed_operation(
                     "ollama",
                     "qwen_analysis_stream",
-                    attributes={"model": settings.ollama_model, "category": category},
+                    attributes={"model": _configured_ai_model_name(), "category": category},
                 ):
                     for event in generate_analysis_with_ollama_stream(
                         normalized_text,
@@ -745,7 +794,11 @@ def analyze_text_streaming(
                         attempt_recorder=_make_attempt_recorder(record),
                         cancel_controller=cancel_controller,
                     ):
-                        if event[0] in {"delta", "field", "reset"}:
+                        if event[0] == "reset":
+                            yield event
+                        elif event[0] in {"delta", "field"} and (
+                            category != "paragraph" or event[1] == "meaning"
+                        ):
                             yield event
                         elif event[0] == "cancelled":
                             # The Ollama stream aborted because the client went
@@ -772,10 +825,10 @@ def analyze_text_streaming(
                 cache_key=cache_key[:12],
             )
 
-        # Qwen is the formal AI result for word/phrase/sentence. A failed Qwen call must
+        # Qwen is the formal AI result for supported categories. A failed Qwen call must
         # surface as a clear failure, not be disguised by an Argos+template fallback.
         if (
-            category in ("word", "phrase", "sentence")
+            category in ("word", "phrase", "sentence", "paragraph")
             and settings.example_generator_provider == "ollama"
             and ollama is None
         ):

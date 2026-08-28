@@ -68,6 +68,31 @@ COUNTER_NAMES = (
     "tts_queue_full_reject_total",
 )
 
+REVIEWED_ITEM_WITHOUT_LOG_SQL = """
+    SELECT count(*)
+    FROM review_session_items i
+    LEFT JOIN review_logs legacy_log ON legacy_log.session_item_id=i.id
+    LEFT JOIN review_answer_logs answer_log ON answer_log.session_item_id=i.id
+    WHERE i.status IN ('reviewed', 'done')
+      AND legacy_log.id IS NULL
+      AND answer_log.id IS NULL
+"""
+
+REVIEW_LOG_WITHOUT_REVIEWED_ITEM_SQL = """
+    SELECT count(*)
+    FROM (
+        SELECT legacy_log.id
+        FROM review_logs legacy_log
+        JOIN review_session_items i ON i.id=legacy_log.session_item_id
+        WHERE i.status NOT IN ('reviewed', 'done') OR i.reviewed_at IS NULL
+        UNION ALL
+        SELECT answer_log.id
+        FROM review_answer_logs answer_log
+        JOIN review_session_items i ON i.id=answer_log.session_item_id
+        WHERE i.status NOT IN ('reviewed', 'done') OR i.reviewed_at IS NULL
+    ) inconsistent_logs
+"""
+
 
 class E2EFailure(RuntimeError):
     pass
@@ -528,6 +553,9 @@ class E2EDatabase:
             "review_session_items",
             "review_records",
             "review_logs",
+            "review_answer_logs",
+            "review_mcq_questions",
+            "card_fsrs_states",
             "client_actions",
             "resource_usage",
         )
@@ -553,6 +581,14 @@ class E2EDatabase:
                 """
                 SELECT count(*) FROM (
                     SELECT session_item_id FROM review_logs
+                    GROUP BY session_item_id HAVING count(*) > 1
+                ) duplicates
+                """
+            ).fetchone()[0]
+            result["violations"]["duplicate_review_answer_logs"] = connection.execute(
+                """
+                SELECT count(*) FROM (
+                    SELECT session_item_id FROM review_answer_logs
                     GROUP BY session_item_id HAVING count(*) > 1
                 ) duplicates
                 """
@@ -584,6 +620,15 @@ class E2EDatabase:
                 WHERE l.user_id <> s.user_id OR l.user_id <> c.user_id
                 """
             ).fetchone()[0]
+            result["violations"]["review_answer_log_cross_user"] = connection.execute(
+                """
+                SELECT count(*)
+                FROM review_answer_logs l
+                JOIN review_sessions s ON s.id=l.session_id
+                JOIN review_mcq_questions q ON q.id=l.question_id
+                WHERE l.user_id <> s.user_id OR l.user_id <> q.user_id
+                """
+            ).fetchone()[0]
             result["violations"]["processing_client_actions"] = connection.execute(
                 "SELECT count(*) FROM client_actions WHERE status='processing'"
             ).fetchone()[0]
@@ -601,20 +646,10 @@ class E2EDatabase:
                 """
             ).fetchone()[0]
             result["violations"]["reviewed_item_without_log"] = connection.execute(
-                """
-                SELECT count(*)
-                FROM review_session_items i
-                LEFT JOIN review_logs l ON l.session_item_id=i.id
-                WHERE i.status IN ('reviewed', 'done') AND l.id IS NULL
-                """
+                REVIEWED_ITEM_WITHOUT_LOG_SQL
             ).fetchone()[0]
             result["violations"]["review_log_without_reviewed_item"] = connection.execute(
-                """
-                SELECT count(*)
-                FROM review_logs l
-                JOIN review_session_items i ON i.id=l.session_item_id
-                WHERE i.status NOT IN ('reviewed', 'done') OR i.reviewed_at IS NULL
-                """
+                REVIEW_LOG_WITHOUT_REVIEWED_ITEM_SQL
             ).fetchone()[0]
             for label, query in (
                 ("cards", "SELECT status, count(*) FROM cards GROUP BY status ORDER BY status"),
@@ -1356,6 +1391,12 @@ class Level7Runner:
                     "session_id": session["session_id"],
                     "session_item_id": item["session_item_id"],
                     "card_id": item["card_id"],
+                    "question_id": item["question_id"],
+                    "selected_option_id": next(
+                        option["option_id"]
+                        for option in item["options"]
+                        if option.get("option_id") == "correct"
+                    ),
                     "result": "got_it",
                 },
             ),
@@ -1516,6 +1557,12 @@ class Level7Runner:
                     "session_id": session["session_id"],
                     "session_item_id": item["session_item_id"],
                     "card_id": item["card_id"],
+                    "question_id": item["question_id"],
+                    "selected_option_id": next(
+                        option["option_id"]
+                        for option in item["options"]
+                        if option.get("option_id") == "correct"
+                    ),
                     "result": "got_it",
                 },
             ),
@@ -1761,6 +1808,12 @@ class Level7Runner:
                                     "session_id": session_data["session_id"],
                                     "session_item_id": item["session_item_id"],
                                     "card_id": item["card_id"],
+                                    "question_id": item["question_id"],
+                                    "selected_option_id": next(
+                                        option["option_id"]
+                                        for option in item["options"]
+                                        if option.get("option_id") == "correct"
+                                    ),
                                     "result": "got_it",
                                 },
                             )

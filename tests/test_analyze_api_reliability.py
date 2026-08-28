@@ -320,6 +320,13 @@ class AnalyzeReliabilityApiTest(unittest.TestCase):
         wait.assert_not_called()
 
     def test_follower_capacity_allows_three_and_rejects_fourth_fast(self):
+        # Concurrent requests must exercise follower capacity, not contend on
+        # the single shared SQLite connection merely to re-read the same user.
+        app.dependency_overrides[app_main.get_current_user] = lambda: User(
+            id=self.user_id,
+            wx_openid=f"openid-{self.user_id}",
+        )
+        self.addCleanup(app.dependency_overrides.pop, app_main.get_current_user, None)
         owner_started = threading.Event()
         release_owner = threading.Event()
         outcomes = {}

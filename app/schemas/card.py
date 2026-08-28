@@ -19,7 +19,6 @@ class CardCreate(BaseModel):
     user_id: UUID | None = None
     content: str = Field(
         min_length=1,
-        max_length=500,
         validation_alias=AliasChoices("content", "english_text"),
     )
     card_type: CardType = "word"
@@ -60,7 +59,6 @@ class CardUpdate(BaseModel):
     content: str | None = Field(
         default=None,
         min_length=1,
-        max_length=500,
         validation_alias=AliasChoices("content", "english_text"),
     )
     understanding: str | None = Field(

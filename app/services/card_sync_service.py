@@ -24,6 +24,7 @@ from app.services.idempotency import (
     get_existing_client_action,
     mark_action_succeeded,
 )
+from app.services.lexical_metadata import upsert_card_lexical_metadata_best_effort
 
 
 def _action_type(payload: CardSyncRequest) -> str:
@@ -93,10 +94,14 @@ def _apply_create(db: Session, user_id: UUID, request: CardSyncRequest) -> Card:
 
 def _apply_update(db: Session, user_id: UUID, request: CardSyncRequest) -> Card:
     card = get_card_or_404(db, request.card_id, user_id, for_update=True)
+    before_content_normalized = card.content_normalized
     raw_payload = dict(request.payload or {})
     raw_payload["base_version"] = request.base_version
     payload = CardUpdate.model_validate(raw_payload)
-    return apply_card_update(card, payload)
+    apply_card_update(card, payload)
+    if card.content_normalized != before_content_normalized:
+        upsert_card_lexical_metadata_best_effort(db, card)
+    return card
 
 
 def _apply_delete(db: Session, user_id: UUID, request: CardSyncRequest) -> Card:

@@ -9,6 +9,8 @@ from sqlalchemy.orm import Session
 from app.models.card import Card
 from app.models.user import User, utc_now
 from app.schemas.card import CardCreate, CardResponse, CardUpdate
+from app.services.lexical_metadata import upsert_card_lexical_metadata_best_effort
+from app.services.validator import normalize_text, validate_english
 
 
 MAIN_REVIEW_STATES = ("new", "reviewing", "strengthening", "mastered")
@@ -26,6 +28,25 @@ def recompute_card_readiness(card: Card) -> Card:
     card.is_review_ready = _has_text(card.content)
     card.needs_manual_fix = False
     return card
+
+
+def _normalize_and_validate_card_content(
+    content: str,
+    requested_category: str | None = None,
+) -> tuple[str, dict]:
+    validation = validate_english(content, requested_category=requested_category)
+    normalized_text = validation.get("normalizedText") or normalize_text(content)
+    if validation["level"] != "error":
+        return normalized_text, validation
+    raise HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail={
+            "code": "invalid_english_content",
+            "message": (validation.get("errors") or ["英文内容不合法。"])[0],
+            "errors": validation.get("errors") or [],
+            "normalizedText": normalized_text,
+        },
+    )
 
 
 def get_card_or_404(
@@ -50,6 +71,11 @@ def get_card_or_404(
 
 
 def create_card_in_transaction(db: Session, payload: CardCreate) -> Card:
+    normalized_content, validation = _normalize_and_validate_card_content(
+        payload.content,
+        payload.card_type,
+    )
+
     if db.get(User, payload.user_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
@@ -68,8 +94,8 @@ def create_card_in_transaction(db: Session, payload: CardCreate) -> Card:
         user_id=payload.user_id,
         legacy_cloud_id=payload.legacy_cloud_id,
         local_temp_id=payload.local_temp_id,
-        content=payload.content,
-        content_normalized=normalize_card_content(payload.content),
+        content=normalized_content,
+        content_normalized=normalize_card_content(normalized_content),
         card_type=payload.card_type,
         exam_scene=payload.exam_scene,
         exam_module=payload.exam_module,
@@ -82,8 +108,8 @@ def create_card_in_transaction(db: Session, payload: CardCreate) -> Card:
         example_translation=payload.example_translation,
         translation=payload.translation,
         analysis_status=payload.analysis_status,
-        analysis_level=payload.analysis_level,
-        analysis_messages=list(payload.analysis_messages),
+        analysis_level="warning" if validation["level"] == "warning" else payload.analysis_level,
+        analysis_messages=list(payload.analysis_messages) + list(validation.get("warnings") or []),
         understanding_source=payload.understanding_source,
         review_count=0,
         again_count=0,
@@ -96,6 +122,7 @@ def create_card_in_transaction(db: Session, payload: CardCreate) -> Card:
     recompute_card_readiness(card)
     db.add(card)
     db.flush()
+    upsert_card_lexical_metadata_best_effort(db, card)
     return card
 
 
@@ -141,10 +168,27 @@ def apply_card_update(card: Card, payload: CardUpdate) -> Card:
     if expected_version is not None and card.version != expected_version:
         raise_card_version_conflict(card)
 
-    if update_data.get("content") is not None and update_data["content"] != card.content:
-        card.content = update_data["content"]
-        card.content_normalized = normalize_card_content(update_data["content"])
-        card.analysis_status = "pending"
+    if update_data.get("content") is not None:
+        requested_category = update_data.get("card_type", card.card_type)
+        normalized_content, validation = _normalize_and_validate_card_content(
+            update_data["content"],
+            requested_category,
+        )
+        if normalized_content != card.content:
+            card.content = normalized_content
+            card.content_normalized = normalize_card_content(normalized_content)
+            card.analysis_status = "pending"
+        if validation["level"] == "warning":
+            update_data["analysis_level"] = "warning"
+            update_data["analysis_messages"] = list(validation.get("warnings") or [])
+    elif update_data.get("card_type") is not None:
+        _, validation = _normalize_and_validate_card_content(
+            card.content,
+            update_data["card_type"],
+        )
+        if validation["level"] == "warning":
+            update_data["analysis_level"] = "warning"
+            update_data["analysis_messages"] = list(validation.get("warnings") or [])
 
     for field in (
         "understanding",
@@ -220,7 +264,10 @@ def list_cards(
 
 def update_card(db: Session, card_id: UUID, user_id: UUID, payload: CardUpdate) -> Card:
     card = get_card_or_404(db, card_id, user_id, for_update=True)
+    before_content_normalized = card.content_normalized
     apply_card_update(card, payload)
+    if card.content_normalized != before_content_normalized:
+        upsert_card_lexical_metadata_best_effort(db, card)
 
     try:
         db.commit()

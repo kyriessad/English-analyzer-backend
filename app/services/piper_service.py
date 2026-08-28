@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import threading
@@ -12,8 +13,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.core.config import settings
+from app.observability.logging import log_event
 from app.observability.metrics import TTS_CACHE_EVENTS_TOTAL
 from app.observability.operations import observed_operation, record_operation_result
+
+
+logger = logging.getLogger(__name__)
 
 
 class PronunciationError(RuntimeError):
@@ -240,10 +245,30 @@ def synthesize_or_get_cached_audio(text: str, voice: str | None = None) -> Path:
         voice_obj = _load_voice(resolved_voice)
         temp_path = cache_dir / f".{key}.{uuid.uuid4().hex}.tmp"
         try:
+            log_event(
+                logger,
+                logging.INFO,
+                "tts_piper_generation_started",
+                resource="tts",
+                voice=resolved_voice,
+                temp_file_path=str(temp_path),
+                final_file_path=str(cache_path),
+            )
             with observed_operation("tts", "piper_synthesize", attributes={"voice": resolved_voice}):
                 with wave.open(str(temp_path), "wb") as wav_file:
                     voice_obj.synthesize_wav(normalized_text, wav_file)
             os.replace(temp_path, cache_path)
+            file_exists = cache_path.is_file()
+            log_event(
+                logger,
+                logging.INFO,
+                "tts_piper_generation_completed",
+                resource="tts",
+                voice=resolved_voice,
+                generated_file_path=str(cache_path),
+                file_exists=file_exists,
+                file_size=cache_path.stat().st_size if file_exists else 0,
+            )
         except Exception as exc:
             try:
                 temp_path.unlink(missing_ok=True)

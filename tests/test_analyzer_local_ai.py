@@ -136,6 +136,121 @@ class AnalyzerLocalAiIntegrationTest(unittest.TestCase):
         translate.assert_called_once()
         set_cache.assert_called_once()
 
+    def test_paragraph_returns_only_translation_and_simplified_understanding(self):
+        text = (
+            "Reading every day helps learners notice patterns. "
+            "Over time, those patterns make difficult texts easier to understand."
+        )
+        result, translate, ollama, hunyuan, tmt, _, _ = self._run(
+            text,
+            analysis_result={
+                "meaning": "\u6bcf\u5929\u9605\u8bfb\u80fd\u5e2e\u52a9\u5b66\u4e60\u8005\u53d1\u73b0\u89c4\u5f8b\uff0c\u957f\u671f\u575a\u6301\u4f1a\u8ba9\u96be\u61c2\u7684\u6587\u7ae0\u66f4\u5bb9\u6613\u7406\u89e3\u3002",
+                "expressionType": "literal",
+                "alternativeMeanings": [{"meaning": "not exposed", "type": "literal"}],
+                "usageScenario": "not exposed",
+                "exampleSentence": "This example must not be exposed.",
+                "exampleTranslation": "Not exposed.",
+                "dialogue": {"english": ["Not exposed."], "chinese": ["Not exposed."]},
+                "synonyms": [{"english": "read", "chinese": "read"}],
+                "similarPhrases": [{"english": "read often", "chinese": "read often"}],
+            },
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["category"], "paragraph")
+        self.assertEqual(
+            result["translation"],
+            "\u6bcf\u5929\u9605\u8bfb\u80fd\u5e2e\u52a9\u5b66\u4e60\u8005\u53d1\u73b0\u89c4\u5f8b\uff0c\u957f\u671f\u575a\u6301\u4f1a\u8ba9\u96be\u61c2\u7684\u6587\u7ae0\u66f4\u5bb9\u6613\u7406\u89e3\u3002",
+        )
+        self.assertEqual(result["understanding"], "mock understanding")
+        self.assertIsNone(result["exampleSentence"])
+        self.assertIsNone(result["exampleTranslation"])
+        self.assertEqual(result["synonyms"], [])
+        self.assertEqual(result["similarPhrases"], [])
+        self.assertEqual(result["alternativeMeanings"], [])
+        self.assertEqual(result["usageScenario"], "")
+        self.assertEqual(result["dialogue"], {"english": [], "chinese": []})
+        ollama.assert_called_once_with(text.rstrip(), "paragraph", deadline=ANY, attempt_recorder=None)
+        translate.assert_not_called()
+        hunyuan.assert_not_called()
+        tmt.assert_not_called()
+
+    def test_long_paragraph_over_500_characters_reaches_ai_analysis(self):
+        text = (
+            "Reading every day helps learners notice patterns in the language. "
+            "Over time, those patterns make difficult texts easier to understand. "
+        ) * 6
+        result, _, ollama, _, _, _, _ = self._run(text)
+
+        self.assertGreater(len(text), 500)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["category"], "paragraph")
+        ollama.assert_called_once_with(text.rstrip(), "paragraph", deadline=ANY, attempt_recorder=None)
+
+    def test_paragraph_stream_forwards_only_meaning_before_final_response(self):
+        from app.services.analyzer import analyze_text_streaming
+
+        text = (
+            "Reading every day helps learners notice patterns. "
+            "Over time, those patterns make difficult texts easier to understand."
+        )
+        stream_events = iter(
+            [
+                ("delta", "meaning", "translation", 1, 1),
+                ("field", "meaning", "translation", 1),
+                ("delta", "exampleSentence", "not exposed", 2, 1),
+                ("field", "exampleSentence", "Not exposed.", 1),
+                ("field", "synonyms", [{"english": "read", "chinese": "read"}], 1),
+                (
+                    "result",
+                    {
+                        "meaning": "translation",
+                        "exampleSentence": "Not exposed.",
+                        "exampleTranslation": "Not exposed.",
+                        "synonyms": [{"english": "read", "chinese": "read"}],
+                        "similarPhrases": [{"english": "read often", "chinese": "read often"}],
+                    },
+                    1,
+                ),
+            ]
+        )
+
+        with (
+            patch("app.services.analyzer.get_cache", return_value=None),
+            patch("app.services.analyzer.set_cache"),
+            patch("app.services.analyzer.translate_to_zh") as translate,
+            patch("app.services.analyzer.get_dictionary_translation", return_value=None),
+            patch("app.services.analyzer.generate_understanding", return_value="simplified"),
+            patch(
+                "app.services.analyzer.generate_analysis_with_ollama_stream",
+                return_value=stream_events,
+            ) as stream,
+        ):
+            events = list(analyze_text_streaming(text))
+
+        preview_events = [event for event in events if event[0] in {"delta", "field"}]
+        self.assertEqual(
+            preview_events,
+            [
+                ("delta", "meaning", "translation", 1, 1),
+                ("field", "meaning", "translation", 1),
+            ],
+        )
+        final_response = events[-1][1]
+        self.assertEqual(final_response["category"], "paragraph")
+        self.assertEqual(final_response["translation"], "translation")
+        self.assertEqual(final_response["understanding"], "simplified")
+        self.assertIsNone(final_response["exampleSentence"])
+        self.assertEqual(final_response["synonyms"], [])
+        translate.assert_not_called()
+        stream.assert_called_once_with(
+            text,
+            "paragraph",
+            deadline=ANY,
+            attempt_recorder=None,
+            cancel_controller=ANY,
+        )
+
     def test_sentence_analysis_source_reports_ollama(self):
         result, _, _, _, _, _, _ = self._run(
             "I'm down.",

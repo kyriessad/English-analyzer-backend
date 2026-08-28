@@ -3,19 +3,52 @@
 """
 import re
 import unicodedata
+from functools import lru_cache
+from importlib import resources
 from typing import Any
 
+from app.services.ecdict_service import (
+    dictionary_available,
+    get_dictionary_entry,
+    normalize_lexical_text,
+)
+from app.services.harper_service import get_harper_evidence
+from app.services.validation_decision import ValidationDecisionInput, decide_validation
+
 try:
-    from spellchecker import SpellChecker
+    from symspellpy import SymSpell, Verbosity
 except ImportError:  # pragma: no cover - handled gracefully at runtime
-    SpellChecker = None
+    SymSpell = None
+    Verbosity = None
 
 
 CHINESE_RE = re.compile(r"[\u4e00-\u9fff]")
 ENGLISH_LETTER_RE = re.compile(r"[A-Za-z]")
 ENGLISH_TOKEN_RE = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+)?(?:-[A-Za-z]+)*")
 SENTENCE_END_RE = re.compile(r"[.!?]\s*$")
+SENTENCE_BOUNDARY_RE = re.compile(r"[.!?](?=\s|$)")
+ABBREVIATION_DOT_RE = re.compile(
+    r"\b(?:[A-Za-z]\.){2,}|\b(?:e\.g|i\.e)\.|\b[A-Za-z]{1,4}\.",
+    re.IGNORECASE,
+)
 REPEATED_OR_MIXED_PUNCTUATION_RE = re.compile(r"\?{3,}|!{3,}|\.{3,}|\?!|!\?")
+URL_ONLY_RE = re.compile(r"^(?:https?://|www\.)\S+$", re.IGNORECASE)
+EMAIL_ONLY_RE = re.compile(r"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$", re.IGNORECASE)
+HTML_ONLY_RE = re.compile(
+    r"^(?:<!doctype\s+html[^>]*>|<([A-Za-z][\w:-]*)(?:\s[^<>]*)?>.*</\1>|<([A-Za-z][\w:-]*)(?:\s[^<>]*)?/>)$",
+    re.IGNORECASE | re.DOTALL,
+)
+CODE_ONLY_RE = re.compile(
+    r"""^(?:
+        [A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\s*\([^)]*\)\s*;?
+        |(?:const|let|var|function|return|if|for|while|class|import|from|def|print|console)\b.*[;{}()]
+        |.*[{}]\s*
+    )$""",
+    re.IGNORECASE | re.DOTALL | re.VERBOSE,
+)
+FILESYSTEM_PATH_ONLY_RE = re.compile(
+    r"^(?:[A-Za-z]:[\\/]\S+|(?:\.{1,2}[\\/]|~[\\/]|/)\S+)$"
+)
 SPLIT_POSSESSIVE_APOSTROPHE_RE = re.compile(r"\b([A-Za-z]+s)\s+'\s+(?=[A-Za-z])")
 SPLIT_APOSTROPHE_SUFFIX_RE = re.compile(r"\b([A-Za-z]+)\s*'\s+(s|t|re|ve|ll|d|m)\b", re.IGNORECASE)
 SPACED_APOSTROPHE_SUFFIX_RE = re.compile(r"\b([A-Za-z]+)\s+'\s*(s|t|re|ve|ll|d|m)\b", re.IGNORECASE)
@@ -60,7 +93,23 @@ PROPER_NOUN_WHITELIST = {
     "microsoft",
 }
 
-_spellchecker: SpellChecker | None = None
+CATEGORY_LABELS = {
+    "word": "单词",
+    "phrase": "短语",
+    "sentence": "句子",
+    "paragraph": "段落",
+}
+
+REQUESTED_CATEGORY_ALIASES = {
+    "word": "word",
+    "单词": "word",
+    "phrase": "phrase",
+    "短语": "phrase",
+    "sentence": "sentence",
+    "句子": "sentence",
+    "paragraph": "paragraph",
+    "段落": "paragraph",
+}
 
 
 def normalize_text(text: str) -> str:
@@ -126,6 +175,14 @@ def _has_english(text: str) -> bool:
     return bool(ENGLISH_LETTER_RE.search(text))
 
 
+def _has_latin_letter(text: str) -> bool:
+    return any(
+        unicodedata.category(char).startswith("L")
+        and "LATIN" in unicodedata.name(char, "")
+        for char in text
+    )
+
+
 def _is_all_digits(text: str) -> bool:
     compacted = _compact(text)
     return bool(compacted) and compacted.isdigit()
@@ -135,7 +192,7 @@ def _is_numeric_value_only(text: str) -> bool:
     compacted = _compact(text)
     return (
         bool(compacted)
-        and not _has_english(compacted)
+        and not _has_latin_letter(compacted)
         and bool(re.search(r"\d", compacted))
         and bool(re.fullmatch(r"[0-9.,\-+%/:$¥￥]+", compacted))
     )
@@ -145,16 +202,27 @@ def _is_all_symbols(text: str) -> bool:
     return bool(text) and not re.search(r"[A-Za-z0-9\u4e00-\u9fff]", text)
 
 
-def _get_spellchecker() -> SpellChecker | None:
-    global _spellchecker
+def _has_invalid_invisible(text: str) -> bool:
+    return any(unicodedata.category(char) in {"Cc", "Cf"} for char in text)
 
-    if SpellChecker is None:
+
+def _is_extreme_single_char_repeat(text: str) -> bool:
+    compacted = _compact(text)
+    return len(compacted) >= 12 and len(set(compacted.lower())) == 1 and compacted[0].isalpha()
+
+
+@lru_cache(maxsize=1)
+def _get_symspell():
+    if SymSpell is None:
         return None
 
-    if _spellchecker is None:
-        _spellchecker = SpellChecker(language="en")
-
-    return _spellchecker
+    symspell = SymSpell(max_dictionary_edit_distance=1, prefix_length=7)
+    dictionary_path = resources.files("symspellpy").joinpath(
+        "frequency_dictionary_en_82_765.txt"
+    )
+    if not symspell.load_dictionary(str(dictionary_path), term_index=0, count_index=1):
+        return None
+    return symspell
 
 
 def _is_single_plain_lowercase_word(token: str) -> bool:
@@ -182,30 +250,90 @@ def _should_check_spelling(
     return _is_single_plain_lowercase_word(token)
 
 
-def _get_spelling_warnings(
+def _get_symspell_evidence(
     normalized_text: str,
     category: str,
     tokens: list[str],
-) -> list[str]:
+) -> dict[str, str | int]:
     if not _should_check_spelling(normalized_text, category, tokens):
-        return []
+        return {
+            "source": "symspell",
+            "type": "spelling",
+            "result": "skipped",
+            "polarity": "neutral",
+        }
 
     token = tokens[0]
-
-    spellchecker = _get_spellchecker()
-    if spellchecker is None:
-        return []
-
     lowered = token.lower()
-    if lowered not in spellchecker.unknown([lowered]):
-        return []
 
-    correction = spellchecker.correction(lowered)
-    if correction and correction != lowered:
-        return [f"拼写疑似有误：{token}。你是不是想写 “{correction}”？"]
+    try:
+        symspell = _get_symspell()
+        if symspell is None or Verbosity is None:
+            return {
+                "source": "symspell",
+                "type": "spelling",
+                "result": "unavailable",
+                "polarity": "neutral",
+            }
 
-    return [f"拼写疑似有误：{token}。如果这是人名、地名、品牌名或专有名词，可以继续保存。"]
+        suggestions = symspell.lookup(
+            lowered,
+            Verbosity.CLOSEST,
+            max_edit_distance=1,
+            include_unknown=False,
+        )
+    except Exception:
+        return {
+            "source": "symspell",
+            "type": "spelling",
+            "result": "unavailable",
+            "polarity": "neutral",
+        }
 
+    if not suggestions:
+        return {
+            "source": "symspell",
+            "type": "spelling",
+            "result": "no_suggestion",
+            "polarity": "neutral",
+        }
+
+    best = suggestions[0]
+    suggestion = str(best.term)
+    distance = int(best.distance)
+    if suggestion == lowered or distance == 0:
+        return {
+            "source": "symspell",
+            "type": "spelling",
+            "result": "exact",
+            "polarity": "neutral",
+        }
+
+    if distance == 1:
+        return {
+            "source": "symspell",
+            "type": "spelling",
+            "result": "suggestion",
+            "polarity": "warning",
+            "suggestion": suggestion,
+            "distance": distance,
+        }
+
+    return {
+        "source": "symspell",
+        "type": "spelling",
+        "result": "no_suggestion",
+        "polarity": "neutral",
+    }
+
+
+def _get_spelling_warning(evidence: dict[str, str | int], token: str) -> str | None:
+    if evidence.get("source") != "symspell" or evidence.get("result") != "suggestion":
+        return None
+    suggestion = evidence.get("suggestion")
+    if not suggestion:
+        return None
+    return f"拼写可能有误：{token}。你是不是想写 {suggestion}？"
 
 def _get_format_warnings(normalized_text: str, has_english: bool) -> list[str]:
     if not has_english:
@@ -228,13 +356,35 @@ def _is_abbreviation_like(text: str) -> bool:
     return bool(segments) and all(re.fullmatch(r"[A-Za-z]{1,4}", s) for s in segments)
 
 
+def _count_sentence_units(text: str) -> int:
+    without_abbreviations = ABBREVIATION_DOT_RE.sub(
+        lambda match: match.group(0).replace(".", ""),
+        text,
+    )
+    return len(SENTENCE_BOUNDARY_RE.findall(without_abbreviations))
+
+
+def _normalize_requested_category(category: str | None) -> str | None:
+    normalized = str(category or "").strip().lower()
+    if not normalized or normalized == "auto":
+        return None
+    return REQUESTED_CATEGORY_ALIASES.get(normalized)
+
+
+def _get_category_mismatch_warnings(
+    requested_category: str | None,
+    detected_category: str,
+) -> list[str]:
+    requested = _normalize_requested_category(requested_category)
+    if not requested or requested == detected_category:
+        return []
+    label = CATEGORY_LABELS.get(detected_category)
+    if not label:
+        return []
+    return [f"这段内容看起来更像{label}。"]
+
+
 def _classify_text(text: str, tokens: list[str]) -> str:
-    if len(text) > 180:
-        return "paragraph"
-
-    if _has_chinese(text) and _has_english(text):
-        return "unknown"
-
     # No-space inputs are single-unit entries (word, abbreviation, alphanumeric term).
     # Accept them when every character is a valid word character AND the text has at
     # least one English letter.  This covers:
@@ -244,18 +394,28 @@ def _classify_text(text: str, tokens: list[str]) -> str:
     #   #N/A, @@@, /, !!!  (non-word symbols present)  → unknown
     #   2024, 100-200, -50 (no English letter)         → unknown
     if not re.search(r"\s", text):
+        if SENTENCE_END_RE.search(text) and _has_latin_letter(text):
+            if text.endswith(".") and _is_abbreviation_like(text):
+                return "word"
+            return "sentence"
         if not re.fullmatch(r"[A-Za-z0-9.\-'']+", text):
             return "unknown"
-        if not _has_english(text):
+        if not _has_latin_letter(text):
             return "unknown"
         # Abbreviations end with '.' and have short alpha segments — return "word"
         # immediately so SENTENCE_END_RE below does not fire on them.
         if text.endswith(".") and _is_abbreviation_like(text):
             return "word"
+        if SENTENCE_END_RE.search(text):
+            return "sentence"
         return "word"
 
     # Multi-word inputs: apply sentence heuristics on token count / trailing punctuation.
     token_count = len(tokens)
+    sentence_units = _count_sentence_units(text)
+
+    if sentence_units >= 2 and token_count >= 10:
+        return "paragraph"
 
     if SENTENCE_END_RE.search(text):
         return "sentence"
@@ -272,30 +432,58 @@ def _classify_text(text: str, tokens: list[str]) -> str:
     return "unknown"
 
 
-def validate_english(text: str) -> dict[str, Any]:
+def _get_ecdict_evidence(normalized_text: str, category: str) -> list[dict[str, str]]:
+    if category not in {"word", "phrase"}:
+        return [{
+            "source": "ecdict",
+            "type": "lexical_match",
+            "result": "skipped",
+            "polarity": "neutral",
+        }]
+
+    try:
+        if not dictionary_available():
+            result = "unavailable"
+        else:
+            lookup_key = normalize_lexical_text(normalized_text)
+            result = "hit" if get_dictionary_entry(lookup_key) is not None else "miss"
+    except Exception:
+        result = "unavailable"
+
+    return [{
+        "source": "ecdict",
+        "type": "lexical_match",
+        "result": result,
+        "polarity": "positive" if result == "hit" else "neutral",
+    }]
+
+
+def validate_english(text: str, requested_category: str | None = None) -> dict[str, Any]:
     normalized_text = _collapse_spaces(normalize_text(text))
     warnings: list[str] = []
+    warning_types: list[str] = []
     errors: list[str] = []
 
     has_chinese = _has_chinese(normalized_text)
-    has_english = _has_english(normalized_text)
-    tokens = _get_english_tokens(normalized_text)
-    category = _classify_text(normalized_text, tokens)
+    has_english = _has_latin_letter(normalized_text)
 
     if not normalized_text:
-        return {
-            "level": "error",
-            "category": "unknown",
-            "normalizedText": "",
-            "warnings": [],
-            "errors": ["英文内容为空。"],
-        }
+        return decide_validation(
+            ValidationDecisionInput(
+                hard_rule_errors=["英文内容为空。"],
+                warnings=[],
+                evidence=[],
+                detected_category="unknown",
+                requested_category=requested_category,
+                normalized_text="",
+            )
+        )
 
-    if len(normalized_text) > 500:
-        errors.append("英文内容超过 500 字符，请拆分后再保存。")
+    if _has_invalid_invisible(normalized_text):
+        errors.append("英文内容包含不可见或控制字符，请清理后再保存。")
 
-    if has_chinese and not has_english:
-        errors.append("内容需要包含英文，不能只有中文。")
+    if has_chinese:
+        errors.append("英文内容请只填写英文，不能包含中文字符。")
 
     if _is_numeric_value_only(normalized_text):
         errors.append("内容需要包含英文，不能只填写数字或数值。")
@@ -303,28 +491,104 @@ def validate_english(text: str) -> dict[str, Any]:
     if _is_all_symbols(normalized_text):
         errors.append("内容不能只有符号。")
 
+    if not has_english:
+        errors.append("内容需要包含英文。")
+
+    if URL_ONLY_RE.fullmatch(normalized_text):
+        errors.append("英文内容不能只填写网址。")
+
+    if EMAIL_ONLY_RE.fullmatch(normalized_text):
+        errors.append("英文内容不能只填写邮箱地址。")
+
+    if HTML_ONLY_RE.fullmatch(normalized_text):
+        errors.append("英文内容不能只填写 HTML 片段。")
+
+    if CODE_ONLY_RE.fullmatch(normalized_text):
+        errors.append("英文内容不能只填写代码片段。")
+
+    if FILESYSTEM_PATH_ONLY_RE.fullmatch(normalized_text):
+        errors.append("英文内容不能只填写文件路径。")
+
+    if _is_extreme_single_char_repeat(normalized_text):
+        errors.append("英文内容不能是明显的单字符重复垃圾。")
+
     if errors:
-        return {
-            "level": "error",
-            "category": category if len(normalized_text) > 180 else "unknown",
-            "normalizedText": normalized_text,
-            "warnings": [],
-            "errors": errors,
-        }
+        return decide_validation(
+            ValidationDecisionInput(
+                hard_rule_errors=errors,
+                warnings=warnings,
+                evidence=[],
+                detected_category="unknown",
+                requested_category=requested_category,
+                normalized_text=normalized_text,
+                warning_types=warning_types,
+            )
+        )
 
-    if has_chinese and has_english:
-        warnings.append("内容包含中文，建议确认卡片英文内容是否需要拆分。")
+    tokens = _get_english_tokens(normalized_text)
+    category = _classify_text(normalized_text, tokens)
 
-    if 180 < len(normalized_text) <= 500:
+    if len(normalized_text) > 180:
         warnings.append("内容较长，已按段落处理，建议复习时拆成更短的卡片。")
 
-    warnings.extend(_get_format_warnings(normalized_text, has_english))
-    warnings.extend(_get_spelling_warnings(normalized_text, category, tokens))
+    if len(normalized_text) > 180:
+        warning_types.append("ADVISORY_WARNING")
 
-    return {
-        "level": "warning" if warnings else "pass",
-        "category": category,
-        "normalizedText": normalized_text,
-        "warnings": warnings,
-        "errors": [],
-    }
+    evidence = _get_ecdict_evidence(normalized_text, category)
+    ecdict_hit = any(
+        item.get("source") == "ecdict" and item.get("result") == "hit"
+        for item in evidence
+    )
+    if ecdict_hit:
+        symspell_evidence: dict[str, str | int] = {
+            "source": "symspell",
+            "type": "spelling",
+            "result": "skipped",
+            "polarity": "neutral",
+        }
+    else:
+        symspell_evidence = _get_symspell_evidence(normalized_text, category, tokens)
+    evidence.append(symspell_evidence)
+    harper_evidence, harper_warnings = get_harper_evidence(
+        normalized_text,
+        category,
+    )
+    evidence.extend(harper_evidence)
+
+    format_warnings = _get_format_warnings(normalized_text, has_english)
+    warnings.extend(format_warnings)
+    if format_warnings:
+        warning_types.append("ADVISORY_WARNING")
+    spelling_warning = _get_spelling_warning(
+        symspell_evidence,
+        tokens[0] if tokens else normalized_text,
+    )
+    if spelling_warning:
+        warnings.append(spelling_warning)
+    warnings.extend(harper_warnings)
+    if spelling_warning:
+        warning_types.append("CONTENT_WARNING")
+    if harper_warnings:
+        warning_types.append("ADVISORY_WARNING")
+    if any(
+        item.get("source") == "harper" and item.get("result") == "unavailable"
+        for item in harper_evidence
+    ):
+        warnings.append("Harper unavailable")
+        warning_types.append("SYSTEM_WARNING")
+    mismatch_warnings = _get_category_mismatch_warnings(requested_category, category)
+    warnings.extend(mismatch_warnings)
+    if mismatch_warnings:
+        warning_types.append("ADVISORY_WARNING")
+
+    return decide_validation(
+        ValidationDecisionInput(
+            hard_rule_errors=[],
+            warnings=warnings,
+            evidence=evidence,
+            detected_category=category,
+            requested_category=requested_category,
+            normalized_text=normalized_text,
+            warning_types=warning_types,
+        )
+    )

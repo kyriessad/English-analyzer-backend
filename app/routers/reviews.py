@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.database import get_db
 from app.models.card import Card
-from app.models.review import ReviewLog, ReviewSession, ReviewSessionItem
+from app.models.review import CardFsrsState, ClientAction, ReviewAnswerLog, ReviewLog, ReviewMcqQuestion, ReviewSession, ReviewSessionItem
 from app.models.user import User, utc_now
 from app.observability.operations import observed_operation
 from app.schemas.reviews import (
@@ -53,6 +53,16 @@ from app.services.review_rules import (
     select_review_cards,
     should_append_reappear_item,
 )
+from app.services.review_v1 import (
+    FSRS_SCHEDULER_VERSION,
+    apply_fsrs_review,
+    can_generate_mcq,
+    ensure_question_for_item,
+    is_v1_review_eligible,
+    question_response_options,
+    question_selected_option,
+    select_review_v1_cards,
+)
 
 
 router = APIRouter(prefix="/api/reviews", tags=["reviews"])
@@ -85,9 +95,9 @@ def _active_card_filters(user_id: UUID) -> list:
 def _review_ready_card_filters(user_id: UUID) -> list:
     return [
         *_active_card_filters(user_id),
-        Card.review_state.in_(MAIN_REVIEW_STATES),
+        func.length(func.trim(Card.content)) <= 80,
         # Phase 6G: content-based readiness — cards with non-empty content are always ready
-        func.length(func.trim(Card.content)) > 0,
+        func.length(func.trim(func.coalesce(Card.understanding, ""))) > 0,
     ]
 
 
@@ -120,11 +130,34 @@ def _history_date_bounds(
     return start_at, end_before
 
 
-def _item_response(item: ReviewSessionItem, now: datetime) -> ReviewItemResponse:
+def _item_response(
+    item: ReviewSessionItem,
+    now: datetime,
+    db: Session | None = None,
+    user: User | None = None,
+    session_id: UUID | None = None,
+) -> ReviewItemResponse:
     card = item.card
+    question = None
+    options = []
+    if db is not None and user is not None:
+        try:
+            question = ensure_question_for_item(
+                db,
+                user=user,
+                session_id=session_id or item.session_id,
+                item_id=item.id,
+                card=card,
+                is_repeat=item.is_repeat,
+            )
+            options = question_response_options(question)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
     return ReviewItemResponse(
         session_item_id=item.id,
         card_id=item.card_id,
+        question_id=question.id if question is not None else None,
         content=card.content,
         translation=card.translation,
         understanding=card.understanding or "",
@@ -138,7 +171,10 @@ def _item_response(item: ReviewSessionItem, now: datetime) -> ReviewItemResponse
         review_state=card.review_state,
         mastery_score=card.mastery_score,
         recovery_stage=card.recovery_stage,
-        due_reason=get_due_reason(card, now) or "pending",
+        due_reason="fsrs_due",
+        attempt_no=2 if item.is_repeat else 1,
+        is_repeat=item.is_repeat,
+        options=options,
     )
 
 
@@ -202,7 +238,14 @@ def _refresh_session_progress(db: Session, session: ReviewSession, now: datetime
         session.completed_at = session.completed_at or now
 
 
-def _today_response(session: ReviewSession | None, limit: int, now: datetime, items: list[ReviewSessionItem]) -> TodayReviewsResponse:
+def _today_response(
+    session: ReviewSession | None,
+    limit: int,
+    now: datetime,
+    items: list[ReviewSessionItem],
+    db: Session | None = None,
+    user: User | None = None,
+) -> TodayReviewsResponse:
     if session is None:
         return TodayReviewsResponse(
             session_id=None,
@@ -215,7 +258,7 @@ def _today_response(session: ReviewSession | None, limit: int, now: datetime, it
         session_id=session.id,
         limit=limit,
         progress=_progress_response(session),
-        items=[_item_response(item, now) for item in items],
+        items=[_item_response(item, now, db, user, session.id) for item in items],
     )
 
 
@@ -324,8 +367,8 @@ def _create_session(
     now: datetime,
     session_type: str = "daily_suggested",
 ) -> ReviewSession:
-    planned_new_count = sum(1 for card in cards if card.review_state == "new")
-    planned_review_count = len(cards) - planned_new_count
+    planned_new_count = 0
+    planned_review_count = len(cards)
     session = ReviewSession(
         user_id=user.id,
         review_date=_local_review_date(now, user.timezone),
@@ -362,6 +405,40 @@ def _create_session(
 
 
 def _build_summary(db: Session, session_id: UUID) -> ReviewSummaryResponse:
+    v1_total = db.scalar(
+        select(func.count()).select_from(ReviewAnswerLog).where(ReviewAnswerLog.session_id == session_id)
+    ) or 0
+    if v1_total > 0:
+        unique_cards = db.scalar(
+            select(func.count(func.distinct(ReviewAnswerLog.source_card_id))).where(
+                ReviewAnswerLog.session_id == session_id
+            )
+        ) or 0
+        correct_count = db.scalar(
+            select(func.count()).select_from(ReviewAnswerLog).where(
+                ReviewAnswerLog.session_id == session_id,
+                ReviewAnswerLog.is_correct.is_(True),
+            )
+        ) or 0
+        wrong_count = db.scalar(
+            select(func.count()).select_from(ReviewAnswerLog).where(
+                ReviewAnswerLog.session_id == session_id,
+                ReviewAnswerLog.is_correct.is_(False),
+            )
+        ) or 0
+        return ReviewSummaryResponse(
+            unique_card_count=unique_cards,
+            total_review_count=v1_total,
+            forgot=0,
+            shaky=0,
+            got_it=0,
+            fluent=0,
+            strengthening_count=0,
+            mastered_count=0,
+            correct=correct_count,
+            wrong=wrong_count,
+        )
+
     reviewed_items = list(
         db.scalars(
             select(ReviewSessionItem)
@@ -469,18 +546,17 @@ def _select_session_cards(
     goal_mode: bool = False,
     fill_target: int | None = None,
 ) -> list[Card]:
-    if session_type == "new_only":
-        return _select_new_only_cards(user_id, limit, db)
-
-    if session_type == "free_review":
-        return _select_free_review_cards(user_id, limit, now, db)
-
-    return select_review_cards(
-        user_id, limit, now, db,
-        today_reviewed_card_ids=today_reviewed_card_ids,
-        goal_mode=goal_mode,
-        fill_target=fill_target,
-    )
+    candidate_cards = select_review_v1_cards(db, user_id=user_id, limit=max(limit * 3, limit), now=now)
+    user = db.get(User, user_id)
+    if user is None:
+        return []
+    selected: list[Card] = []
+    for card in candidate_cards:
+        if can_generate_mcq(db, user=user, target_card=card):
+            selected.append(card)
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 def _create_or_return_session(
@@ -503,7 +579,11 @@ def _create_or_return_session(
 
     active_same = next((session for session in active_sessions if session.session_type == session_type), None)
     if active_same is not None and not restart:
-        return active_same, _pending_items(db, active_same.id)
+        pending = _pending_items(db, active_same.id)
+        if all(is_v1_review_eligible(item.card) for item in pending):
+            return active_same, pending
+        active_same.status = "abandoned"
+        db.flush()
 
     active_other = next((session for session in active_sessions if session.session_type != session_type), None)
     if active_other is not None and not restart:
@@ -577,6 +657,8 @@ def _session_create_response(
     limit: int,
     now: datetime,
     items: list[ReviewSessionItem],
+    db: Session | None = None,
+    user: User | None = None,
 ) -> ReviewSessionCreateResponse:
     if session is None:
         return ReviewSessionCreateResponse(
@@ -596,7 +678,7 @@ def _session_create_response(
         planned_new_count=session.planned_new_count,
         planned_review_count=session.planned_review_count,
         progress=_progress_response(session),
-        items=[_item_response(item, now) for item in items],
+        items=[_item_response(item, now, db, user, session.id) for item in items],
     )
 
 
@@ -618,6 +700,94 @@ def _get_review_overview_observed(
     now = utc_now()
     base_filters = _review_ready_card_filters(current_user.id)
     today = _local_review_date(now, current_user.timezone)
+
+    new_count = db.scalar(
+        select(func.count())
+        .select_from(Card)
+        .outerjoin(CardFsrsState, CardFsrsState.card_id == Card.id)
+        .where(*base_filters, CardFsrsState.card_id.is_(None))
+    ) or 0
+    due_count = db.scalar(
+        select(func.count())
+        .select_from(Card)
+        .join(CardFsrsState, CardFsrsState.card_id == Card.id)
+        .where(*base_filters, CardFsrsState.due_at <= now)
+    ) or 0
+    total_available = new_count + due_count
+    suggested_total_count = min(total_available, normalize_review_limit(5))
+
+    active_session = _get_active_session(db, current_user.id)
+    active_session_response = None
+    if active_session is not None:
+        _refresh_session_progress(db, active_session, now)
+        remaining_count = db.scalar(
+            select(func.count())
+            .select_from(ReviewSessionItem)
+            .where(
+                ReviewSessionItem.session_id == active_session.id,
+                ReviewSessionItem.status == "pending",
+            )
+        ) or 0
+        if active_session.status == "active" and remaining_count > 0 and active_session.total_count > 0:
+            active_session_response = {
+                "id": active_session.id,
+                "session_type": active_session.session_type,
+                "remaining_count": remaining_count,
+                "total_count": active_session.total_count,
+                "reviewed_count": active_session.reviewed_count,
+                "status": active_session.status,
+            }
+
+    day_start_utc, day_end_utc = _history_date_bounds(today, today, current_user.timezone)
+    completed_unique_today = db.scalar(
+        select(func.count(func.distinct(ReviewAnswerLog.source_card_id)))
+        .select_from(ReviewAnswerLog)
+        .join(Card, Card.id == ReviewAnswerLog.source_card_id)
+        .where(
+            ReviewAnswerLog.user_id == current_user.id,
+            ReviewAnswerLog.answered_at >= day_start_utc,
+            ReviewAnswerLog.answered_at < day_end_utc,
+            *_active_card_filters(current_user.id),
+        )
+    ) or 0
+
+    target = normalize_daily_goal(daily_goal)
+    goal_progress = GoalProgressResponse(
+        target=target,
+        completed_unique_today=completed_unique_today,
+        display_numerator=min(completed_unique_today, target),
+        display_denominator=target,
+        is_goal_met=completed_unique_today >= target,
+        is_overachieved=completed_unique_today > target,
+        remaining_to_goal=max(target - completed_unique_today, 0),
+        has_goal_contributing_cards=total_available > 0,
+        has_any_reviewable_cards=(db.scalar(select(select(Card.id).where(*base_filters).exists())) or False),
+        is_goal_blocked=completed_unique_today < target and total_available <= 0,
+    )
+
+    db.commit()
+    return ReviewOverviewResponse(
+        suggested={
+            "review_count": due_count,
+            "new_count": new_count,
+            "strengthening_count": 0,
+            "due_count": due_count,
+            "total_count": suggested_total_count,
+        },
+        completed_suggested={
+            "review_count": completed_unique_today,
+            "new_count": 0,
+            "total_count": completed_unique_today,
+        },
+        extra_today={
+            "new_only_count": 0,
+            "free_review_count": total_available,
+            "total_count": total_available,
+        },
+        is_all_done=(active_session_response is None and total_available <= 0),
+        active_session=active_session_response,
+        goal_progress=goal_progress,
+    )
 
     strengthening_count = db.scalar(
         select(func.count())
@@ -1235,11 +1405,12 @@ def get_today_reviews(
             limit=normalized_limit,
             restart=restart,
         )
-        db.commit()
         if session is None:
+            db.commit()
             return _today_response(None, normalized_limit, now, [])
-        db.refresh(session)
-        return _today_response(session, normalized_limit, now, pending_items)
+        response = _today_response(session, normalized_limit, now, pending_items, db, current_user)
+        db.commit()
+        return response
 
 
 @review_sessions_router.post("", response_model=ReviewSessionCreateResponse)
@@ -1260,16 +1431,17 @@ def create_review_session_endpoint(
             now=now,
             daily_goal=payload.daily_goal,
         )
-        db.commit()
-        if session is not None:
-            db.refresh(session)
-        return _session_create_response(
+        response = _session_create_response(
             session,
             session_type=payload.session_type,
             limit=normalized_limit,
             now=now,
             items=pending_items,
+            db=db,
+            user=current_user,
         )
+        db.commit()
+        return response
 
 
 @router.post("/feedback", response_model=ReviewFeedbackResponse)
@@ -1288,6 +1460,306 @@ def _submit_review_feedback_observed(
     current_user: User,
 ) -> ReviewFeedbackResponse:
     now = utc_now()
+    if not payload.question_id or not payload.selected_option_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="question_id and selected_option_id are required for review V1",
+        )
+
+    action = None
+    existing_action = get_existing_client_action(db, current_user.id, payload.client_action_id)
+    if existing_action is not None:
+        if existing_action.status == "succeeded" and existing_action.response_payload:
+            return ReviewFeedbackResponse.model_validate(existing_action.response_payload)
+        if existing_action.status == "ignored":
+            saved = existing_action.response_payload or {}
+            return ReviewFeedbackResponse(
+                done=False,
+                next_item=None,
+                summary=None,
+                progress=ReviewProgressResponse(
+                    reviewed=saved.get("progress", {}).get("reviewed", 0),
+                    total=saved.get("progress", {}).get("total", 0),
+                ),
+                status="ignored",
+                ignored_reason=existing_action.error_message or "action_ignored",
+            )
+        if existing_action.status == "processing":
+            if is_zombie_processing(existing_action):
+                action = reset_zombie_processing(
+                    db,
+                    existing_action,
+                    new_request_payload=payload.model_dump(mode="json"),
+                )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Action is being processed, please retry later.",
+                )
+
+    try:
+        if action is None:
+            action = create_processing_action(
+                db,
+                current_user.id,
+                payload.client_action_id,
+                "review_mcq_answer",
+                request_payload=payload.model_dump(mode="json"),
+            )
+
+        session = db.scalar(
+            select(ReviewSession)
+            .where(
+                ReviewSession.id == payload.session_id,
+                ReviewSession.user_id == current_user.id,
+            )
+            .with_for_update()
+        )
+        if session is None:
+            mark_action_failed(db, action, "Review session not found")
+            db.commit()
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Review session not found")
+
+        if session.status != "active":
+            mark_action_ignored(
+                db,
+                action,
+                response_payload={"progress": _progress_response(session).model_dump()},
+                reason="session_not_active",
+            )
+            db.commit()
+            return ReviewFeedbackResponse(
+                done=False,
+                next_item=None,
+                summary=None,
+                progress=_progress_response(session),
+                status="ignored",
+                ignored_reason="session_not_active",
+            )
+
+        item = db.scalar(
+            select(ReviewSessionItem)
+            .where(
+                ReviewSessionItem.id == payload.session_item_id,
+                ReviewSessionItem.session_id == session.id,
+            )
+            .with_for_update()
+        )
+        if item is None:
+            mark_action_failed(db, action, "Review session item not found")
+            db.commit()
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Review session item not found")
+        if item.status != "pending":
+            mark_action_ignored(
+                db,
+                action,
+                response_payload={"progress": _progress_response(session).model_dump()},
+                reason="session_item_not_pending",
+            )
+            db.commit()
+            return ReviewFeedbackResponse(
+                done=False,
+                next_item=None,
+                summary=None,
+                progress=_progress_response(session),
+                status="ignored",
+                ignored_reason="session_item_not_pending",
+            )
+
+        card = db.scalar(
+            select(Card)
+            .where(
+                Card.id == payload.card_id,
+                Card.user_id == current_user.id,
+                Card.deleted_at.is_(None),
+                Card.status == "active",
+            )
+            .with_for_update()
+        )
+        if card is None:
+            mark_action_failed(db, action, "Card not found")
+            db.commit()
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Card not found")
+        if item.card_id != card.id:
+            mark_action_failed(db, action, "Session item does not match card")
+            db.commit()
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Session item does not match card")
+
+        question = db.scalar(
+            select(ReviewMcqQuestion)
+            .where(
+                ReviewMcqQuestion.id == payload.question_id,
+                ReviewMcqQuestion.session_item_id == item.id,
+                ReviewMcqQuestion.card_id == card.id,
+                ReviewMcqQuestion.user_id == current_user.id,
+            )
+            .with_for_update()
+        )
+        if question is None:
+            mark_action_failed(db, action, "Review question not found")
+            db.commit()
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Review question not found")
+        if question.answered_at is not None:
+            mark_action_ignored(
+                db,
+                action,
+                response_payload={"progress": _progress_response(session).model_dump()},
+                reason="question_already_answered",
+            )
+            db.commit()
+            return ReviewFeedbackResponse(
+                done=False,
+                next_item=None,
+                summary=None,
+                progress=_progress_response(session),
+                status="ignored",
+                ignored_reason="question_already_answered",
+            )
+        if (
+            question.card_version != card.version
+            or question.prompt_content != card.content
+            or question.correct_answer != str(card.understanding or "").strip()
+        ):
+            mark_action_failed(db, action, "Review question is stale")
+            db.commit()
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="stale_question")
+
+        selected = question_selected_option(question, payload.selected_option_id)
+        if selected is None:
+            mark_action_failed(db, action, "Selected option not found")
+            db.commit()
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Selected option not found")
+
+        answered_at = payload.reviewed_at or now
+        is_correct = payload.selected_option_id == question.correct_option_id
+        fsrs_result = apply_fsrs_review(
+            db,
+            user_id=current_user.id,
+            card_id=card.id,
+            is_correct=is_correct,
+            reviewed_at=answered_at,
+        )
+
+        db.add(
+            ReviewAnswerLog(
+                user_id=current_user.id,
+                card_id=card.id,
+                source_card_id=card.id,
+                session_id=session.id,
+                session_item_id=item.id,
+                question_id=question.id,
+                client_action_id=payload.client_action_id,
+                attempt_no=question.attempt_no,
+                is_repeat=item.is_repeat,
+                prompt_content_snapshot=question.prompt_content,
+                correct_answer_snapshot=question.correct_answer,
+                options_snapshot=question.options_snapshot,
+                option_order=question.option_order,
+                selected_option_id=payload.selected_option_id,
+                selected_answer_text=str(selected.get("text") or ""),
+                is_correct=is_correct,
+                response_time_ms=payload.response_time_ms,
+                answered_at=answered_at,
+                fsrs_rating=fsrs_result.rating,
+                fsrs_review_log_json=fsrs_result.review_log_json,
+                fsrs_state_before_json=fsrs_result.state_before_json,
+                fsrs_state_after_json=fsrs_result.state_after_json,
+                scheduler_name="py-fsrs",
+                scheduler_version=FSRS_SCHEDULER_VERSION,
+                scheduler_parameters=fsrs_result.scheduler_parameters,
+            )
+        )
+        question.answered_at = answered_at
+        item.status = "done"
+        item.reviewed_at = answered_at
+
+        if not is_correct and not item.is_repeat:
+            repeat_exists = db.scalar(
+                select(ReviewSessionItem.id)
+                .where(
+                    ReviewSessionItem.session_id == session.id,
+                    ReviewSessionItem.card_id == card.id,
+                    ReviewSessionItem.is_repeat.is_(True),
+                )
+                .limit(1)
+            )
+            if repeat_exists is None:
+                current_max_position = db.scalar(
+                    select(func.max(ReviewSessionItem.position)).where(ReviewSessionItem.session_id == session.id)
+                )
+                db.add(
+                    ReviewSessionItem(
+                        session_id=session.id,
+                        card_id=card.id,
+                        position=int(current_max_position if current_max_position is not None else item.position) + 1,
+                        status="pending",
+                        result=None,
+                        reappear_count=1,
+                        is_repeat=True,
+                        repeat_count=1,
+                    )
+                )
+
+        db.flush()
+        _refresh_session_progress(db, session, now)
+        next_item = _next_pending_item(db, session.id)
+        progress = _progress_response(session)
+        next_item_response = _item_response(next_item, now, db, current_user, session.id) if next_item is not None else None
+
+        summary = None
+        if next_item is None:
+            total_reviews = db.scalar(
+                select(func.count()).select_from(ReviewAnswerLog).where(ReviewAnswerLog.session_id == session.id)
+            ) or 0
+            unique_cards = db.scalar(
+                select(func.count(func.distinct(ReviewAnswerLog.source_card_id))).where(
+                    ReviewAnswerLog.session_id == session.id
+                )
+            ) or 0
+            correct_count = db.scalar(
+                select(func.count()).select_from(ReviewAnswerLog).where(
+                    ReviewAnswerLog.session_id == session.id,
+                    ReviewAnswerLog.is_correct.is_(True),
+                )
+            ) or 0
+            wrong_count = db.scalar(
+                select(func.count()).select_from(ReviewAnswerLog).where(
+                    ReviewAnswerLog.session_id == session.id,
+                    ReviewAnswerLog.is_correct.is_(False),
+                )
+            ) or 0
+            summary = ReviewSummaryResponse(
+                unique_card_count=unique_cards,
+                total_review_count=total_reviews,
+                forgot=0,
+                shaky=0,
+                got_it=0,
+                fluent=0,
+                strengthening_count=0,
+                mastered_count=0,
+                correct=correct_count,
+                wrong=wrong_count,
+            )
+
+        response = ReviewFeedbackResponse(
+            done=next_item is None,
+            next_item=next_item_response,
+            summary=summary,
+            progress=progress,
+            status="success",
+            is_correct=is_correct,
+            selected_option_id=payload.selected_option_id,
+        )
+        mark_action_succeeded(db, action, response_payload=response.model_dump(mode="json"))
+        db.commit()
+        return response
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise
 
     # Step 1: Check client_action_id idempotency
     action = None

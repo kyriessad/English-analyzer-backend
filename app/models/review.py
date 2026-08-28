@@ -7,10 +7,12 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Float,
     Index,
     Integer,
     JSON,
     String,
+    Text,
     UniqueConstraint,
     Uuid,
     text,
@@ -20,6 +22,9 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
 from app.models.user import utc_now
+
+
+json_messages_type = JSON().with_variant(JSONB, "postgresql")
 
 
 class ReviewSession(Base):
@@ -159,6 +164,139 @@ class ReviewSessionItem(Base):
     review_logs: Mapped[list["ReviewLog"]] = relationship(back_populates="session_item")
 
 
+class CardFsrsState(Base):
+    __tablename__ = "card_fsrs_states"
+    __table_args__ = (
+        UniqueConstraint("card_id", name="uq_card_fsrs_states_card_id"),
+        CheckConstraint("state IN (1, 2, 3)", name="ck_card_fsrs_states_state"),
+        Index("ix_card_fsrs_states_user_due", "user_id", "due_at"),
+        Index("ix_card_fsrs_states_card_due", "card_id", "due_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    card_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("cards.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    state: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    stability: Mapped[float | None] = mapped_column(Float, nullable=True)
+    difficulty: Mapped[float | None] = mapped_column(Float, nullable=True)
+    fsrs_card_json: Mapped[dict] = mapped_column(json_messages_type, nullable=False, default=dict)
+    scheduler_name: Mapped[str] = mapped_column(String(64), nullable=False, default="py-fsrs")
+    scheduler_version: Mapped[str] = mapped_column(String(32), nullable=False, default="6.3.2")
+    scheduler_parameters: Mapped[dict] = mapped_column(json_messages_type, nullable=False, default=dict)
+    last_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+
+class ReviewMcqQuestion(Base):
+    __tablename__ = "review_mcq_questions"
+    __table_args__ = (
+        UniqueConstraint("session_item_id", name="uq_review_mcq_questions_session_item_id"),
+        CheckConstraint("attempt_no IN (1, 2)", name="ck_review_mcq_questions_attempt_no"),
+        Index("ix_review_mcq_questions_session", "session_id", "created_at"),
+        Index("ix_review_mcq_questions_card", "card_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    session_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("review_sessions.id"), nullable=False)
+    session_item_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("review_session_items.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    card_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("cards.id"), nullable=False)
+    parent_question_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("review_mcq_questions.id"),
+        nullable=True,
+    )
+    attempt_no: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    is_repeat: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    card_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    prompt_content: Mapped[str] = mapped_column(Text, nullable=False)
+    prompt_content_normalized: Mapped[str] = mapped_column(Text, nullable=False)
+    correct_answer: Mapped[str] = mapped_column(Text, nullable=False)
+    correct_answer_source: Mapped[str] = mapped_column(String(32), nullable=False, default="understanding")
+    options_snapshot: Mapped[list[dict]] = mapped_column(json_messages_type, nullable=False, default=list)
+    option_order: Mapped[list[str]] = mapped_column(json_messages_type, nullable=False, default=list)
+    correct_option_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    generation_version: Mapped[str] = mapped_column(String(32), nullable=False, default="mcq-v1")
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+
+class ReviewAnswerLog(Base):
+    __tablename__ = "review_answer_logs"
+    __table_args__ = (
+        UniqueConstraint("session_item_id", name="uq_review_answer_logs_session_item_id"),
+        UniqueConstraint("user_id", "client_action_id", name="uq_review_answer_logs_user_client_action"),
+        CheckConstraint("attempt_no IN (1, 2)", name="ck_review_answer_logs_attempt_no"),
+        CheckConstraint("fsrs_rating IN ('Again', 'Good')", name="ck_review_answer_logs_fsrs_rating"),
+        CheckConstraint("response_time_ms IS NULL OR response_time_ms >= 0", name="ck_review_answer_logs_response_time"),
+        Index("ix_review_answer_logs_user_answered_at", "user_id", "answered_at"),
+        Index("ix_review_answer_logs_card_answered_at", "card_id", "answered_at"),
+        Index("ix_review_answer_logs_source_card_answered_at", "source_card_id", "answered_at"),
+        Index("ix_review_answer_logs_session", "session_id", "answered_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    card_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("cards.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    source_card_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    session_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("review_sessions.id"), nullable=False)
+    session_item_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("review_session_items.id"),
+        nullable=False,
+    )
+    question_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("review_mcq_questions.id"),
+        nullable=False,
+    )
+    client_action_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    is_repeat: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    prompt_content_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    correct_answer_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    options_snapshot: Mapped[list[dict]] = mapped_column(json_messages_type, nullable=False, default=list)
+    option_order: Mapped[list[str]] = mapped_column(json_messages_type, nullable=False, default=list)
+    selected_option_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    selected_answer_text: Mapped[str] = mapped_column(Text, nullable=False)
+    is_correct: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    response_time_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    answered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    fsrs_rating: Mapped[str] = mapped_column(String(16), nullable=False)
+    fsrs_review_log_json: Mapped[dict] = mapped_column(json_messages_type, nullable=False, default=dict)
+    fsrs_state_before_json: Mapped[dict] = mapped_column(json_messages_type, nullable=False, default=dict)
+    fsrs_state_after_json: Mapped[dict] = mapped_column(json_messages_type, nullable=False, default=dict)
+    scheduler_name: Mapped[str] = mapped_column(String(64), nullable=False, default="py-fsrs")
+    scheduler_version: Mapped[str] = mapped_column(String(32), nullable=False, default="6.3.2")
+    scheduler_parameters: Mapped[dict] = mapped_column(json_messages_type, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+
+
 class ReviewRecord(Base):
     __tablename__ = "review_records"
     __table_args__ = (
@@ -198,9 +336,6 @@ class ReviewRecord(Base):
     card: Mapped["Card"] = relationship(back_populates="review_records")
     session: Mapped["ReviewSession | None"] = relationship(back_populates="review_records")
     session_item: Mapped["ReviewSessionItem | None"] = relationship(back_populates="review_records")
-
-
-json_messages_type = JSON().with_variant(JSONB, "postgresql")
 
 
 class ReviewLog(Base):

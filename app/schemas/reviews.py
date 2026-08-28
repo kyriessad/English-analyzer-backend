@@ -68,9 +68,15 @@ class ReviewProgressResponse(BaseModel):
     total: int
 
 
+class ReviewMcqOptionResponse(BaseModel):
+    option_id: str
+    text: str
+
+
 class ReviewItemResponse(BaseModel):
     session_item_id: UUID
     card_id: UUID
+    question_id: UUID | None = None
     content: str
     translation: str | None = None
     understanding: str | None = ""
@@ -85,6 +91,9 @@ class ReviewItemResponse(BaseModel):
     mastery_score: int
     recovery_stage: int
     due_reason: str
+    attempt_no: int = 1
+    is_repeat: bool = False
+    options: list[ReviewMcqOptionResponse] = []
 
 
 class TodayReviewsResponse(BaseModel):
@@ -117,7 +126,10 @@ class ReviewFeedbackRequest(BaseModel):
     session_id: UUID
     session_item_id: UUID
     card_id: UUID
-    result: ReviewResult
+    question_id: UUID | None = None
+    selected_option_id: str | None = None
+    response_time_ms: int | None = None
+    result: ReviewResult | None = None
     reviewed_at: datetime | None = None
 
 
@@ -130,6 +142,8 @@ class ReviewSummaryResponse(BaseModel):
     fluent: int
     strengthening_count: int
     mastered_count: int
+    correct: int = 0
+    wrong: int = 0
 
 
 class ReviewFeedbackResponse(BaseModel):
@@ -139,6 +153,8 @@ class ReviewFeedbackResponse(BaseModel):
     progress: ReviewProgressResponse
     status: str = "success"
     ignored_reason: str | None = None
+    is_correct: bool | None = None
+    selected_option_id: str | None = None
 
 
 class SessionSummaryResponse(BaseModel):

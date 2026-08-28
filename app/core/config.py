@@ -86,12 +86,25 @@ class Settings:
     )
     max_request_body_bytes: int = _env_int("MAX_REQUEST_BODY_BYTES", 1_048_576)
     http_limit_concurrency: int = _env_int("HTTP_LIMIT_CONCURRENCY", 30)
+    harper_enabled: bool = _env_bool(
+        "HARPER_ENABLED",
+        _env_str("APP_ENV", "development").lower() == "development",
+    )
+    harper_base_url: str = (
+        _env_str("HARPER_BASE_URL", "http://127.0.0.1:8082").rstrip("/")
+        or "http://127.0.0.1:8082"
+    )
+    harper_timeout_seconds: float = _env_float("HARPER_TIMEOUT_SECONDS", 0.5)
     db_pool_size: int = _env_int("DB_POOL_SIZE", 5)
     db_max_overflow: int = _env_int("DB_MAX_OVERFLOW", 10)
     db_pool_timeout: int = _env_int("DB_POOL_TIMEOUT", 3)
 
     translation_provider: str = _env_str("TRANSLATION_PROVIDER", "argos").lower() or "argos"
     example_generator_provider: str = _env_str("EXAMPLE_GENERATOR_PROVIDER", "ollama").lower() or "ollama"
+    ai_provider: str = _env_str("AI_PROVIDER", "ollama").lower() or "ollama"
+    ai_base_url: str = _env_str("AI_BASE_URL", _env_str("OLLAMA_BASE_URL", "http://127.0.0.1:11434")).rstrip("/")
+    ai_api_key: str = _env_str("AI_API_KEY")
+    ai_model: str = _env_str("AI_MODEL", _env_str("OLLAMA_MODEL", "qwen3:8b")) or "qwen3:8b"
 
     ollama_base_url: str = _env_str("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/") or "http://127.0.0.1:11434"
     ollama_model: str = _env_str("OLLAMA_MODEL", "qwen3:8b") or "qwen3:8b"
@@ -176,6 +189,8 @@ def validate_settings(value: Settings = settings) -> None:
             errors.append(f"{name} must be > 0")
     if value.jwt_expire_days > 3:
         errors.append("JWT_EXPIRE_DAYS must be <= 3")
+    if value.ai_provider not in {"ollama", "cloud"}:
+        errors.append("AI_PROVIDER must be one of: ollama, cloud")
     if value.app_env.lower() != "test":
         for name, current in (
             ("JWT_SECRET_KEY", value.jwt_secret_key),

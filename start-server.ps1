@@ -4,9 +4,9 @@
   Unified startup for the English Analyzer backend.
 
 .DESCRIPTION
-  Checks/start PostgreSQL, Ollama, the FastAPI backend (always via the project
+  Checks/starts PostgreSQL, Ollama, the FastAPI backend (always via the project
   .venv, without --reload), warms qwen3:8b, confirms in-process Piper warmup,
-  and, only when explicitly enabled, checks/starts an ngrok tunnel. Every step polls a real
+  and starts ngrok by default unless NGROK_ENABLED=false. Every step polls a real
   health endpoint instead of relying on a fixed sleep. Re-running the script
   reuses any service that is already running correctly instead of starting a
   second copy.
@@ -29,6 +29,7 @@ $StdoutLog = Join-Path $LogsDir 'server.out.log'
 $StderrLog = Join-Path $LogsDir 'server.err.log'
 $StateDir = Join-Path $BackendDir '.runtime'
 $StateFile = Join-Path $StateDir 'server-state.json'
+$MiniappConfigPath = Join-Path (Split-Path -Parent $BackendDir) 'English-study-miniapp\utils\localBackendConfig.js'
 
 $FastApiPort = 8000
 $FastApiHost = '0.0.0.0'
@@ -53,7 +54,7 @@ function Write-Step {
 
   $script:StepNumber++
   $script:StepLabel = $Label
-  $head = "[{0}/7] {1}" -f $script:StepNumber, $Label
+  $head = "[{0}/9] {1}" -f $script:StepNumber, $Label
   $dots = '.' * [Math]::Max(0, 26 - $head.Length)
   Write-Host ("{0}{1} {2}" -f $head, $dots, $Status)
 }
@@ -74,6 +75,36 @@ function Fail {
     Write-Host ("Elapsed: {0}s" -f $elapsed) -ForegroundColor Red
   }
   exit 1
+}
+
+function Set-MiniappNgrokState {
+  param(
+    [bool]$UseNgrok,
+    [string]$PublicUrl = ''
+  )
+
+  if (-not (Test-Path -LiteralPath $MiniappConfigPath -PathType Leaf)) {
+    throw "Mini Program local backend config not found: $MiniappConfigPath"
+  }
+
+  $content = [System.IO.File]::ReadAllText($MiniappConfigPath)
+  $updated = $content
+  $useNgrokText = if ($UseNgrok) { 'true' } else { 'false' }
+  $useNgrokPattern = '(\bconst\s+USE_NGROK\s*=\s*)(true|false)(\s*;)'
+  $ngrokUrlPattern = "(\bconst\s+NGROK_BACKEND_BASE_URL\s*=\s*['""])([^'""]*)(['""]\s*;)"
+  $useNgrokMatch = [regex]::Match($updated, $useNgrokPattern)
+  $ngrokUrlMatch = [regex]::Match($updated, $ngrokUrlPattern)
+  if (-not $useNgrokMatch.Success -or -not $ngrokUrlMatch.Success) {
+    throw "Could not find USE_NGROK and NGROK_BACKEND_BASE_URL declarations in $MiniappConfigPath."
+  }
+
+  $updated = [regex]::Replace($updated, $useNgrokPattern, ('${1}' + $useNgrokText + '${3}'), 1)
+  $updated = [regex]::Replace($updated, $ngrokUrlPattern, ('${1}' + $PublicUrl + '${3}'), 1)
+
+  if ($updated -ne $content) {
+    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::WriteAllText($MiniappConfigPath, $updated, $utf8NoBom)
+  }
 }
 
 # ---------------------------------------------------------------- helpers
@@ -140,6 +171,41 @@ function Test-OllamaUp {
   } catch {
     return $false
   }
+}
+
+$HarperPort = 8082
+$HarperUrl = 'http://127.0.0.1:8082'
+$HarperDir = Join-Path $BackendDir 'harper-sidecar'
+$script:HarperPid = $null
+$script:HarperIdentity = $null
+$script:HarperStatus = 'DISABLED'
+
+function Test-HarperReady {
+  try {
+    $health = Invoke-WebRequest -Method Get -Uri "$HarperUrl/health" `
+      -TimeoutSec 2 -UseBasicParsing
+    if ($health.StatusCode -ne 200) { return $false }
+    $healthPayload = $health.Content | ConvertFrom-Json
+    if ($healthPayload.status -ne 'ok') { return $false }
+
+    $body = @{ text = 'This is a test.' } | ConvertTo-Json -Compress
+    $response = Invoke-WebRequest -Method Post -Uri "$HarperUrl/lint" `
+      -Body $body -ContentType 'application/json' -TimeoutSec 2 -UseBasicParsing
+    if ($response.StatusCode -ne 200) { return $false }
+    $payload = $response.Content | ConvertFrom-Json
+    return ($null -ne $payload -and
+      $payload.PSObject.Properties.Name -contains 'lints' -and
+      $null -ne $payload.lints)
+  } catch {
+    return $false
+  }
+}
+
+function Test-HarperProcess {
+  param($Proc)
+  if (-not $Proc -or -not $Proc.CommandLine) { return $false }
+  return ($Proc.Name -match '^node(\.exe)?$' -and
+    $Proc.CommandLine -match '(^|\s|["\\/])server\.mjs(["\s]|$)')
 }
 
 function Test-PostgresHealth {
@@ -400,8 +466,17 @@ function Get-ManagedConfig {
       $allowedHosts += $hostName
     }
   }
-  if ($script:NgrokEnabled -and $script:NgrokHost -and ($allowedHosts -notcontains $script:NgrokHost)) {
-    $allowedHosts += $script:NgrokHost
+  if ($script:NgrokEnabled) {
+    # Temporary ngrok URLs are assigned at runtime, after this preflight.
+    # Allow only ngrok host suffixes so the URL can be synchronized later.
+    foreach ($ngrokPattern in @('*.ngrok-free.dev', '*.ngrok-free.app', '*.ngrok.io')) {
+      if ($allowedHosts -notcontains $ngrokPattern) {
+        $allowedHosts += $ngrokPattern
+      }
+    }
+    if ($script:NgrokHost -and ($allowedHosts -notcontains $script:NgrokHost)) {
+      $allowedHosts += $script:NgrokHost
+    }
   }
 
   $requiredAlembicRevisionOverride = [string][System.Environment]::GetEnvironmentVariable(
@@ -553,7 +628,7 @@ if (-not $effectiveDatabaseUrl) {
   Fail "DATABASE_URL is not set in the environment or .env. Set it as a User environment variable (password must not be committed). See .env.example."
 }
 
-$script:NgrokEnabled = Get-EffectiveBoolValue -Name 'NGROK_ENABLED' -Default $false
+$script:NgrokEnabled = Get-EffectiveBoolValue -Name 'NGROK_ENABLED' -Default $true
 $script:NgrokBase = (Get-EffectiveEnvValue -Name 'NGROK_DOMAIN' -Default '').TrimEnd('/')
 $script:NgrokHost = $null
 if ($script:NgrokBase) {
@@ -577,6 +652,8 @@ $OllamaModel = $script:OllamaModel
 # ALLOWED_HOSTS must include the ngrok host or TrustedHostMiddleware rejects
 # public requests. This env var is set before uvicorn launches.
 $env:ALLOWED_HOSTS = ($allowedHosts -join ',')
+$script:HarperEnabled = Get-EffectiveBoolValue -Name 'HARPER_ENABLED' -Default $true
+$env:HARPER_ENABLED = if ($script:HarperEnabled) { 'true' } else { 'false' }
 Normalize-ProcessEnvironment
 
 # ================================================================ 1. PostgreSQL
@@ -671,7 +748,55 @@ if ($processor -notmatch 'GPU') {
 Write-Step -Label 'qwen3:8b' -Status 'WARM'
 Write-Sub -Text ("Processor: {0}" -f $processor)
 
-# ================================================================ 4. FastAPI
+# ================================================================ 4. Harper
+$harperEnabled = $script:HarperEnabled
+if (-not $harperEnabled) {
+  Write-Step -Label 'Harper' -Status 'DISABLED'
+  Write-Sub -Text 'HARPER_ENABLED=false; continuing without sidecar.'
+} elseif (Test-HarperReady) {
+  $listener = Get-ListenerProcess -Port $HarperPort
+  if ($listener -and (Test-HarperProcess -Proc $listener)) {
+    $script:HarperPid = [int]$listener.ProcessId
+    $script:HarperIdentity = Get-ProcessIdentity -Proc $listener
+  }
+  $script:HarperStatus = 'READY'
+  Write-Step -Label 'Harper' -Status 'READY (reused)'
+} else {
+  $node = Get-Command node -ErrorAction SilentlyContinue
+  $npm = Get-Command npm -ErrorAction SilentlyContinue
+  $packagePath = Join-Path $HarperDir 'package.json'
+      if (-not $node -or -not $npm -or -not (Test-Path -LiteralPath $packagePath -PathType Leaf)) {
+        $script:HarperStatus = 'UNAVAILABLE'
+        Write-Step -Label 'Harper' -Status 'UNAVAILABLE'
+        Write-Sub -Text 'WARNING: Node/npm or harper-sidecar is unavailable; continuing.'
+      } else {
+        try {
+          $npmCommand = Get-Command npm.cmd -ErrorAction SilentlyContinue
+          $npmPath = if ($npmCommand) { $npmCommand.Source } else { $npm.Source }
+          Start-Process -FilePath $npmPath -ArgumentList @('start') `
+            -WorkingDirectory $HarperDir -WindowStyle Hidden | Out-Null
+      if (Wait-For { Test-HarperReady } 'Harper /health and /lint' 10) {
+        $listener = Get-ListenerProcess -Port $HarperPort
+        if ($listener -and (Test-HarperProcess -Proc $listener)) {
+          $script:HarperPid = [int]$listener.ProcessId
+          $script:HarperIdentity = Get-ProcessIdentity -Proc $listener
+        }
+        $script:HarperStatus = 'READY'
+        Write-Step -Label 'Harper' -Status 'READY'
+          } else {
+            $script:HarperStatus = 'UNAVAILABLE'
+            Write-Step -Label 'Harper' -Status 'UNAVAILABLE'
+            Write-Sub -Text 'WARNING: Harper readiness failed; continuing with fail-open behavior.'
+          }
+        } catch {
+          $script:HarperStatus = 'UNAVAILABLE'
+          Write-Step -Label 'Harper' -Status 'UNAVAILABLE'
+      Write-Sub -Text ("WARNING: Harper startup failed: {0}; continuing." -f $_.Exception.Message)
+    }
+  }
+}
+
+# ================================================================ 5. FastAPI
 $script:StepLabel = 'FastAPI'
 $state = $null
 if (Test-Path -LiteralPath $StateFile) {
@@ -790,6 +915,18 @@ if ($listener) {
   $matchesTrackedListener = ($trackedListenerPid -and $listener.ProcessId -eq $trackedListenerPid)
   $belongsToTrackedLauncher = ($trackedLauncherPid -and
     (Test-IsAncestorProcess -AncestorId $trackedLauncherPid -ProcessId $listener.ProcessId))
+
+  # Recover safely when a previous startup restarted this project's uvicorn
+  # tree but failed before persisting the new runtime state. Only accept a
+  # listener whose direct parent is also this project's managed uvicorn.
+  if (-not ($matchesTrackedListener -or $belongsToTrackedLauncher) -and $listenerIsManaged) {
+    $parentProc = Get-ProcessById -Id ([int]$listener.ParentProcessId)
+    if ($parentProc -and (Test-ManagedUvicorn -Proc $parentProc)) {
+      $trackedLauncherPid = [int]$parentProc.ProcessId
+      $matchesTrackedListener = $true
+      $stateFastApiListenerIdentity = $null
+    }
+  }
 
   if (-not ($matchesTrackedListener -or $belongsToTrackedLauncher)) {
     Fail "Port $FastApiPort is occupied by a uvicorn process that is not tracked by the current state file (PID $($listener.ProcessId))."
@@ -965,12 +1102,20 @@ $piperDegraded = ($piperFemale.Status -ne 'WARM') -or ($piperMale.Status -ne 'WA
 
 # ================================================================ 7. ngrok (optional)
 if (-not $script:NgrokEnabled) {
+  try {
+    Set-MiniappNgrokState -UseNgrok $false
+  } catch {
+    Fail "ngrok is disabled, but Mini Program backend mode could not be synchronized: $($_.Exception.Message)"
+  }
   Write-Step -Label 'ngrok' -Status 'DISABLED'
   Write-Sub -Text 'FastAPI is ready for local development without ngrok.'
 } else {
   $script:StepLabel = 'ngrok / public health'
   $ngrokExe = Get-NgrokExe
-  if (-not $ngrokExe) { Fail 'ngrok is enabled but NGROK_EXE is not set and ngrok is not on PATH.' }
+  if (-not $ngrokExe) {
+    try { Set-MiniappNgrokState -UseNgrok $false } catch { }
+    Fail 'ngrok is enabled but NGROK_EXE is not set and ngrok is not on PATH.'
+  }
   $arguments = @('http', [string]$FastApiPort)
   if ($script:NgrokBase) { $arguments += @('--url', $script:NgrokBase) }
   $ngrokProc = Start-Process -FilePath $ngrokExe -ArgumentList $arguments -WindowStyle Hidden -PassThru
@@ -980,13 +1125,25 @@ if (-not $script:NgrokEnabled) {
     Start-Sleep -Seconds 1
     $publicUrl = Get-NgrokPublicUrl
   } while (-not $publicUrl -and (Get-Date) -lt $deadline)
-  if (-not $publicUrl) { Fail 'ngrok started but did not publish an HTTPS URL within 45 seconds.' }
+  if (-not $publicUrl) {
+    try { Set-MiniappNgrokState -UseNgrok $false } catch { }
+    Fail 'ngrok started but did not publish an HTTPS URL within 45 seconds.'
+  }
   $script:NgrokBase = $publicUrl.TrimEnd('/')
   $script:NgrokHost = ([System.Uri]$script:NgrokBase).Host
   try {
     $response = Invoke-WebRequest -Uri "$($script:NgrokBase)/health" -Headers @{ 'ngrok-skip-browser-warning' = '1' } -TimeoutSec 10 -UseBasicParsing
     if ($response.StatusCode -ne 200 -or (($response.Content | ConvertFrom-Json).status -ne 'ok')) { throw 'unexpected health response' }
-  } catch { Fail "ngrok public health check failed: $($_.Exception.Message)" }
+  } catch {
+    try { Set-MiniappNgrokState -UseNgrok $false } catch { }
+    Fail "ngrok public health check failed: $($_.Exception.Message)"
+  }
+  try {
+    Set-MiniappNgrokState -UseNgrok $true -PublicUrl $script:NgrokBase
+  } catch {
+    try { Set-MiniappNgrokState -UseNgrok $false } catch { }
+    Fail "ngrok is online, but Mini Program backend config could not be synchronized: $($_.Exception.Message)"
+  }
   Write-Step -Label 'ngrok' -Status 'READY'
   Write-Sub -Text ("Public URL: {0}" -f $script:NgrokBase)
 }
@@ -996,6 +1153,9 @@ if (-not $script:NgrokEnabled) {
 New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
 $stateObject = [ordered]@{
   managed_version        = 3
+  harper_pid             = $script:HarperPid
+  harper_identity        = $script:HarperIdentity
+  harper_status          = $script:HarperStatus
   fastapi_launcher_pid   = $fastapiLauncherPid
   fastapi_listener_pid   = $fastapiPid
   fastapi_pid            = $fastapiPid

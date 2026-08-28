@@ -102,3 +102,37 @@ class Card(Base):
     review_session_items: Mapped[list["ReviewSessionItem"]] = relationship(back_populates="card")
     review_records: Mapped[list["ReviewRecord"]] = relationship(back_populates="card")
     review_logs: Mapped[list["ReviewLog"]] = relationship(back_populates="card")
+    lexical_metadata: Mapped["CardLexicalMetadata | None"] = relationship(
+        back_populates="card",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+
+
+class CardLexicalMetadata(Base):
+    __tablename__ = "card_lexical_metadata"
+    __table_args__ = (
+        Index("ix_card_lexical_metadata_content_normalized", "content_normalized"),
+        Index("ix_card_lexical_metadata_pos_frq", "pos", "frq"),
+        Index("ix_card_lexical_metadata_pos_bnc", "pos", "bnc"),
+    )
+
+    card_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("cards.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    content_normalized: Mapped[str] = mapped_column(Text, nullable=False)
+    edict_hit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    pos: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    frq: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    bnc: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    metadata_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+    card: Mapped["Card"] = relationship(back_populates="lexical_metadata")

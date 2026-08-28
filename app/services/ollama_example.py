@@ -15,6 +15,8 @@ import requests
 from app.core.config import settings
 from app.observability.logging import log_event
 from app.observability.operations import observed_operation
+from app.providers.cloud_ai_provider import CloudAIProvider
+from app.providers.ollama_provider import OllamaProvider
 from app.providers.argos_translator import ArgosTranslator
 from app.services.hunyuan_example import _text_in_sentence
 from app.services.request_reliability import StreamCancelController
@@ -54,8 +56,31 @@ class _AttemptResult:
     dialogue: dict | None = None
 
 
-def _ollama_url() -> str:
-    return f"{settings.ollama_base_url.rstrip('/')}/api/generate"
+def _provider_name() -> str:
+    return str(getattr(settings, "ai_provider", "ollama") or "ollama").strip().lower()
+
+
+def _model_name() -> str:
+    if _provider_name() == "ollama":
+        return str(getattr(settings, "ollama_model", "qwen3:8b") or "qwen3:8b")
+    return str(getattr(settings, "ai_model", "qwen3:8b") or "qwen3:8b")
+
+
+def _ollama_base_url() -> str:
+    return str(getattr(settings, "ollama_base_url", "http://127.0.0.1:11434") or "http://127.0.0.1:11434").rstrip("/")
+
+
+def _ai_provider():
+    provider = _provider_name()
+    if provider == "ollama":
+        return OllamaProvider(base_url=_ollama_base_url(), http_post=requests.post)
+    if provider == "cloud":
+        return CloudAIProvider(
+            base_url=str(getattr(settings, "ai_base_url", "") or ""),
+            api_key=str(getattr(settings, "ai_api_key", "") or ""),
+            model=_model_name(),
+        )
+    return OllamaProvider(base_url=_ollama_base_url(), http_post=requests.post)
 
 
 def _json_schema_format() -> dict[str, Any]:
@@ -400,7 +425,7 @@ def _build_payload(
 ) -> dict[str, Any]:
     system_prompt, user_prompt = _build_prompts(text, chinese_meaning, strict_retry=strict_retry)
     return {
-        "model": settings.ollama_model,
+        "model": _model_name(),
         "system": system_prompt,
         "prompt": user_prompt,
         "stream": stream,
@@ -427,11 +452,7 @@ def _post_generate(payload: dict[str, Any], deadline: float) -> requests.Respons
         "http_generate",
         attributes={"model": payload.get("model"), "stream": bool(payload.get("stream"))},
     ):
-        return requests.post(
-            _ollama_url(),
-            json=payload,
-            timeout=_remaining_timeout(deadline),
-        )
+        return _ai_provider().generate(payload, timeout_seconds=_remaining_timeout(deadline))
 
 
 def _call_once(
@@ -849,12 +870,7 @@ def _post_generate_stream(payload: dict[str, Any], deadline: float) -> requests.
         "http_generate_stream_open",
         attributes={"model": payload.get("model"), "stream": True},
     ):
-        return requests.post(
-            _ollama_url(),
-            json=payload,
-            stream=True,
-            timeout=_remaining_timeout(deadline),
-        )
+        return _ai_provider().stream(payload, timeout_seconds=_remaining_timeout(deadline))
 
 
 _STREAM_FIELD_ORDER = [
