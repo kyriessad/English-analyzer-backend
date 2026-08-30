@@ -447,6 +447,7 @@ def analyze_text(
     *,
     deadline_at: float | None = None,
     record: Any | None = None,
+    regenerate_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     result_label = "success"
@@ -569,6 +570,7 @@ def analyze_text(
                         category,
                         deadline=effective_deadline,
                         attempt_recorder=_make_attempt_recorder(record),
+                        regenerate_context=regenerate_context,
                     )
             except Exception as exc:
                 logger.warning("[analyzer] ollama analysis error: %s", _short_error(exc))
@@ -640,6 +642,7 @@ def analyze_text_streaming(
     deadline_at: float | None = None,
     record: Any | None = None,
     cancel_controller: StreamCancelController | None = None,
+    regenerate_context: dict[str, Any] | None = None,
 ):
     """Like ``analyze_text``, but streams provisional Ollama events.
 
@@ -807,6 +810,7 @@ def analyze_text_streaming(
                         deadline=effective_deadline,
                         attempt_recorder=_make_attempt_recorder(record),
                         cancel_controller=cancel_controller,
+                        regenerate_context=regenerate_context,
                     ):
                         if event[0] == "reset":
                             yield event

@@ -384,6 +384,7 @@ def _build_prompts(
     *,
     category: str | None = None,
     strict_retry: bool,
+    regenerate_context: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     target = str(text or "").strip()
     meaning_hint = f"\nChinese meaning hint: {chinese_meaning}" if chinese_meaning else ""
@@ -483,6 +484,13 @@ def _build_prompts(
         '"similarPhrases": [{"english": "...", "chinese": "..."}]}'
         f"{stricter}"
     )
+    if regenerate_context and not _is_translation_only_category(normalized_category, target):
+        user_prompt += (
+            "\nRegenerate the analysis. Keep the core meaning accurate. Generate a different example sentence "
+            "and a different dialogue. Do not reuse the previous example sentence or dialogue.\n"
+            f"Previous exampleSentence: {str(regenerate_context.get('exampleSentence') or '')!r}\n"
+            f"Previous dialogue: {json.dumps(regenerate_context.get('dialogue') or {}, ensure_ascii=False)}\n"
+        )
     return system_prompt, user_prompt
 
 
@@ -494,12 +502,14 @@ def _build_payload(
     strict_retry: bool,
     format_spec: dict[str, Any] | str,
     stream: bool = False,
+    regenerate_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     system_prompt, user_prompt = _build_prompts(
         text,
         chinese_meaning,
         category=category,
         strict_retry=strict_retry,
+        regenerate_context=regenerate_context,
     )
     return {
         "model": _model_name(),
@@ -509,7 +519,7 @@ def _build_payload(
         "think": settings.ollama_think,
         "format": format_spec,
         "options": {
-            "temperature": settings.ollama_temperature,
+            "temperature": 0.6 if regenerate_context else settings.ollama_temperature,
             "num_predict": OLLAMA_NUM_PREDICT,
         },
         "keep_alive": "30m",
@@ -540,6 +550,7 @@ def _call_once(
     deadline: float,
     strict_retry: bool = False,
     attempt_recorder: Callable[[], None] | None = None,
+    regenerate_context: dict[str, Any] | None = None,
 ) -> _AttemptResult:
     format_spec: dict[str, Any] | str = (
         _translation_only_json_schema_format()
@@ -552,6 +563,7 @@ def _call_once(
         category=category,
         strict_retry=strict_retry,
         format_spec=format_spec,
+        regenerate_context=regenerate_context,
     )
 
     try:
@@ -598,6 +610,17 @@ def _call_once(
         return _AttemptResult(None, None, "json_parse_failed", True)
 
     return _normalize_analysis_data(text, data, category)
+
+def _regenerate_content_differs(result: _AttemptResult, previous: dict[str, Any] | None) -> bool:
+    if not previous:
+        return True
+    def norm(value: Any) -> str:
+        if isinstance(value, (dict, list)):
+            value = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+    dialogue = result.dialogue or {}
+    old_dialogue = previous.get("dialogue") or {}
+    return norm(result.sentence) != norm(previous.get("exampleSentence")) and norm(dialogue) != norm(old_dialogue)
 
 
 def generate_example_with_ollama(
@@ -654,6 +677,7 @@ def generate_analysis_with_ollama(
     *,
     deadline: float | None = None,
     attempt_recorder: Callable[[], None] | None = None,
+    regenerate_context: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Generate meaning + expression type + alternative meanings + example + translation
     + synonyms + similarPhrases in one Ollama call.
@@ -682,6 +706,7 @@ def generate_analysis_with_ollama(
         deadline=deadline,
         strict_retry=False,
         attempt_recorder=attempt_recorder,
+        regenerate_context=regenerate_context,
     )
     result = first
     if first.sentence is None and first.retryable and time.monotonic() < deadline:
@@ -693,8 +718,17 @@ def generate_analysis_with_ollama(
             deadline=deadline,
             strict_retry=True,
             attempt_recorder=attempt_recorder,
+            regenerate_context=regenerate_context,
         )
 
+    if regenerate_context and result.sentence is not None and not _regenerate_content_differs(result, regenerate_context):
+        logger.info("[ollama][diag] regenerate_duplicate_retry")
+        retry = _call_once(target, None, category=category, deadline=deadline, strict_retry=True,
+                           attempt_recorder=attempt_recorder, regenerate_context=regenerate_context)
+        if retry.sentence is not None and _regenerate_content_differs(retry, regenerate_context):
+            result = retry
+        else:
+            return None
     if result.sentence is None:
         return None
     return _assemble_analysis_result(text, result)
@@ -989,6 +1023,7 @@ def _generate_analysis_stream_attempt(
     seq_start: int,
     attempt_recorder: Callable[[], None] | None,
     cancel_controller: StreamCancelController | None,
+    regenerate_context: dict[str, Any] | None = None,
 ):
     """Run one Ollama stream and return its normalized validation outcome."""
     payload = _build_payload(
@@ -1002,6 +1037,7 @@ def _generate_analysis_stream_attempt(
             else _json_schema_format()
         ),
         stream=True,
+        regenerate_context=regenerate_context,
     )
     if cancel_controller is not None and cancel_controller.cancelled():
         logger.info("[ollama][diag] fail_reason=client_cancelled (pre-open)")
@@ -1190,6 +1226,7 @@ def generate_analysis_with_ollama_stream(
     deadline: float | None = None,
     attempt_recorder: Callable[[], None] | None = None,
     cancel_controller: StreamCancelController | None = None,
+    regenerate_context: dict[str, Any] | None = None,
 ):
     """Stream provisional body deltas, complete fields, then one final result.
 
@@ -1238,12 +1275,19 @@ def generate_analysis_with_ollama_stream(
             seq_start=seq,
             attempt_recorder=attempt_recorder,
             cancel_controller=cancel_controller,
+            regenerate_context=regenerate_context,
         )
         seq = outcome.seq
         if outcome.cancelled:
             yield ("cancelled", None)
             return
         if outcome.result is not None and outcome.result.sentence is not None:
+            if regenerate_context and not _regenerate_content_differs(outcome.result, regenerate_context):
+                if attempt == 1 and time.monotonic() < deadline:
+                    yield ("reset", 2)
+                    continue
+                yield ("result", None, attempt)
+                return
             yield ("result", _assemble_analysis_result(target, outcome.result), attempt)
             return
         if attempt == 1 and outcome.retryable and time.monotonic() < deadline:

@@ -16,6 +16,7 @@ class AnalyzeRequest(BaseModel):
     cardType: str = "auto"
     targetLang: str = "zh"
     forceRefresh: bool = False
+    regenerateContext: dict[str, Any] | None = None
 
 
 class ValidationRequest(BaseModel):

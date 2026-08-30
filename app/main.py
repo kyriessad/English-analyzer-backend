@@ -642,6 +642,7 @@ def _analyze_text_observed_sync(
     *,
     deadline_at: float,
     record: object | None,
+    regenerate_context: dict | None = None,
 ) -> dict:
     with observed_operation(
         "ai",
@@ -659,6 +660,7 @@ def _analyze_text_observed_sync(
             force_refresh=payload.forceRefresh,
             deadline_at=deadline_at,
             record=record,
+            regenerate_context=regenerate_context,
         )
 
 
@@ -736,6 +738,7 @@ async def analyze_english(
                 payload,
                 deadline_at=deadline_at,
                 record=record,
+                regenerate_context=payload.regenerateContext,
             )
     except HTTPException as exc:
         if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
@@ -1032,6 +1035,7 @@ async def analyze_english_stream(
         card_type=payload.cardType,
         target_lang=payload.targetLang,
         force_refresh=payload.forceRefresh,
+        regenerate_context=payload.regenerateContext,
         deadline_at=deadline_at,
         record=record,
         cancel_controller=cancel_controller,
