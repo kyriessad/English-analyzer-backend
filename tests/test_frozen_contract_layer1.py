@@ -121,6 +121,71 @@ def test_VAL_HARD_001_hard_error_short_circuits_all_lexical_and_harper_calls():
     harper.assert_not_called()
 
 
+@pytest.mark.parametrize("text", ["and/or", "he/she"])
+def test_slash_english_expressions_are_valid_phrases(text):
+    with (
+        patch("app.services.validator.dictionary_available", return_value=True),
+        patch("app.services.validator.get_dictionary_entry", return_value=None),
+        patch("app.services.validator.get_harper_evidence", return_value=([], [])),
+    ):
+        result = validate_english(text)
+
+    assert result["level"] != "error"
+    assert result["errors"] == []
+    assert result["category"] == "phrase"
+    assert result["canSave"] is True
+
+
+@pytest.mark.parametrize("text", ["/usr/local/bin", r"C:\Users\Admin\Desktop"])
+def test_path_only_inputs_are_invalid(text):
+    with (
+        patch("app.services.validator.dictionary_available") as dictionary,
+        patch("app.services.validator.get_dictionary_entry") as ecdict,
+        patch("app.services.validator._get_symspell") as symspell,
+        patch("app.services.validator.get_harper_evidence") as harper,
+    ):
+        result = validate_english(text)
+
+    assert result["level"] == "error"
+    assert result["canSave"] is False
+    assert result["canAnalyze"] is False
+    assert result["canPronounce"] is False
+    dictionary.assert_not_called()
+    ecdict.assert_not_called()
+    symspell.assert_not_called()
+    harper.assert_not_called()
+
+
+def test_unknown_but_legitimate_word_can_save_without_pronunciation():
+    with (
+        patch("app.services.validator.dictionary_available", return_value=True),
+        patch("app.services.validator.get_dictionary_entry", return_value=None),
+        patch("app.services.validator._get_symspell", return_value=None),
+        patch("app.services.validator.get_harper_evidence", return_value=([], [])),
+    ):
+        result = validate_english("doomscroll")
+
+    assert result["level"] == "pass"
+    assert result["errors"] == []
+    assert result["canSave"] is True
+    assert result["canAnalyze"] is True
+    assert result["canPronounce"] is False
+
+
+def test_product_name_with_number_is_not_invalid():
+    with (
+        patch("app.services.validator.dictionary_available", return_value=True),
+        patch("app.services.validator.get_dictionary_entry", return_value=None),
+        patch("app.services.validator._get_symspell", return_value=None),
+        patch("app.services.validator.get_harper_evidence", return_value=([], [])),
+    ):
+        result = validate_english("iPhone 15")
+
+    assert result["level"] != "error"
+    assert result["errors"] == []
+    assert result["canSave"] is True
+
+
 def test_API_001_validation_response_has_contract_capabilities_and_warning_types():
     result = validate_english("because")
     assert set(result) >= {

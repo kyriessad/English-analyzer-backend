@@ -32,7 +32,7 @@ ABBREVIATION_DOT_RE = re.compile(
     re.IGNORECASE,
 )
 REPEATED_OR_MIXED_PUNCTUATION_RE = re.compile(r"\?{3,}|!{3,}|\.{3,}|\?!|!\?")
-RAW_HARD_RULE_CHARACTER_RE = re.compile(r"[/\\\x00-\x1F\x7F\u200B\u200C\u200D\uFEFF\u202A-\u202E]")
+RAW_HARD_RULE_CHARACTER_RE = re.compile(r"[\x00-\x1F\x7F\u200B\u200C\u200D\uFEFF\u202A-\u202E]")
 URL_ONLY_RE = re.compile(r"^(?:https?://|www\.)\S+$", re.IGNORECASE)
 EMAIL_ONLY_RE = re.compile(r"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$", re.IGNORECASE)
 HTML_ONLY_RE = re.compile(
@@ -391,6 +391,8 @@ def _classify_text(text: str, tokens: list[str]) -> str:
     #   #N/A, @@@, /, !!!  (non-word symbols present)  → unknown
     #   2024, 100-200, -50 (no English letter)         → unknown
     if not re.search(r"\s", text):
+        if re.fullmatch(r"[A-Za-z]+(?:/[A-Za-z]+)+", text):
+            return "phrase"
         if SENTENCE_END_RE.search(text) and _has_latin_letter(text):
             if text.endswith(".") and _is_abbreviation_like(text):
                 return "word"
@@ -460,7 +462,7 @@ def validate_english(text: str, requested_category: str | None = None) -> dict[s
     if _has_raw_hard_rule_character(raw_text):
         return decide_validation(
             ValidationDecisionInput(
-                hard_rule_errors=["English content contains forbidden control or path characters."],
+                hard_rule_errors=["内容中有无法识别的字符，请删除后再试"],
                 warnings=[],
                 evidence=[],
                 detected_category="unknown",
@@ -519,6 +521,9 @@ def validate_english(text: str, requested_category: str | None = None) -> dict[s
 
     if FILESYSTEM_PATH_ONLY_RE.fullmatch(normalized_text):
         errors.append("英文内容不能只填写文件路径。")
+
+    if "\\" in normalized_text and not any(error == "这里像文件路径，请输入想记录的英文" for error in errors):
+        errors.append("这里像文件路径，请输入想记录的英文")
 
     if _is_extreme_single_char_repeat(normalized_text):
         errors.append("英文内容不能是明显的单字符重复垃圾。")
