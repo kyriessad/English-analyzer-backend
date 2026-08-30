@@ -352,6 +352,54 @@ def test_hard_rule_invalid_skips_ecdict_lookup():
     symspell.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "hello/world",
+        "hello\\world",
+        "hello\u0000world",
+        "hello\u001fworld",
+        "hello\u007fworld",
+        "hello\u200bworld",
+        "hello\u200cworld",
+        "hello\u200dworld",
+        "\ufeffhello",
+        "hello\u202aworld",
+        "hello\u202eworld",
+        "hello\nworld",
+        "hello\tworld",
+    ],
+)
+def test_raw_forbidden_characters_are_hard_rule_and_skip_downstream(text):
+    with (
+        patch("app.services.validator.dictionary_available") as available,
+        patch("app.services.validator.get_dictionary_entry") as lookup,
+        patch("app.services.validator._get_symspell") as symspell,
+        patch("app.services.validator.get_harper_evidence") as harper,
+    ):
+        result = validate_english(text, requested_category="sentence")
+
+    assert result["level"] == "error"
+    assert result["category"] == "unknown"
+    assert result["warnings"] == []
+    assert result["warningTypes"] == []
+    assert result["canSave"] is False
+    assert result["canAnalyze"] is False
+    assert result["canPronounce"] is False
+    available.assert_not_called()
+    lookup.assert_not_called()
+    symspell.assert_not_called()
+    harper.assert_not_called()
+
+
+@pytest.mark.parametrize("text", ["hello world", "Really?!", "can't stop"])
+def test_normal_text_without_forbidden_characters_is_not_hard_rule(text):
+    result = validate_english(text)
+
+    assert result["level"] != "error"
+    assert result["errors"] == []
+
+
 def test_hard_rule_error_is_invalid_for_mixed_chinese_and_english():
     result = validate_english("hello 中文")
 

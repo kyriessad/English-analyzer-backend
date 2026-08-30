@@ -32,6 +32,7 @@ ABBREVIATION_DOT_RE = re.compile(
     re.IGNORECASE,
 )
 REPEATED_OR_MIXED_PUNCTUATION_RE = re.compile(r"\?{3,}|!{3,}|\.{3,}|\?!|!\?")
+RAW_HARD_RULE_CHARACTER_RE = re.compile(r"[/\\\x00-\x1F\x7F\u200B\u200C\u200D\uFEFF\u202A-\u202E]")
 URL_ONLY_RE = re.compile(r"^(?:https?://|www\.)\S+$", re.IGNORECASE)
 EMAIL_ONLY_RE = re.compile(r"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$", re.IGNORECASE)
 HTML_ONLY_RE = re.compile(
@@ -204,6 +205,10 @@ def _is_all_symbols(text: str) -> bool:
 
 def _has_invalid_invisible(text: str) -> bool:
     return any(unicodedata.category(char) in {"Cc", "Cf"} for char in text)
+
+
+def _has_raw_hard_rule_character(text: str) -> bool:
+    return bool(RAW_HARD_RULE_CHARACTER_RE.search(text))
 
 
 def _is_extreme_single_char_repeat(text: str) -> bool:
@@ -459,6 +464,20 @@ def _get_ecdict_evidence(normalized_text: str, category: str) -> list[dict[str, 
 
 
 def validate_english(text: str, requested_category: str | None = None) -> dict[str, Any]:
+    raw_text = str(text or "")
+    if _has_raw_hard_rule_character(raw_text):
+        return decide_validation(
+            ValidationDecisionInput(
+                hard_rule_errors=["English content contains forbidden control or path characters."],
+                warnings=[],
+                evidence=[],
+                detected_category="unknown",
+                requested_category=requested_category,
+                normalized_text=raw_text,
+                warning_types=[],
+            )
+        )
+
     normalized_text = _collapse_spaces(normalize_text(text))
     warnings: list[str] = []
     warning_types: list[str] = []
