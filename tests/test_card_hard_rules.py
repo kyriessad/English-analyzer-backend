@@ -640,18 +640,7 @@ def test_harper_grammar_match_is_warning_evidence():
     post.assert_called_once()
 
 
-@pytest.mark.parametrize(
-    ("issue_type", "rule_id", "expected_type"),
-    [
-        ("typographical", "PUNCTUATION_COMMA", "punctuation"),
-        ("style", "STYLE_USAGE", "usage"),
-    ],
-)
-def test_harper_punctuation_and_usage_are_warnings(
-    issue_type,
-    rule_id,
-    expected_type,
-):
+def test_harper_usage_is_content_warning():
     response = FakeHarperResponse(
         {
             "lints": [
@@ -660,7 +649,7 @@ def test_harper_punctuation_and_usage_are_warnings(
                     "offset": 0,
                     "length": 2,
                     "replacements": [],
-                    "kind": issue_type,
+                    "kind": "style",
                 }
             ]
         }
@@ -674,7 +663,11 @@ def test_harper_punctuation_and_usage_are_warnings(
     harper = evidence_by_source(result, "harper")
     assert result["level"] == "warning"
     assert result["errors"] == []
-    assert harper["type"] == expected_type
+    assert result["warningTypes"] == ["CONTENT_WARNING"]
+    assert result["canSave"] is True
+    assert result["canAnalyze"] is False
+    assert result["canPronounce"] is False
+    assert harper["type"] == "usage"
     assert harper["polarity"] == "warning"
 
 
@@ -799,3 +792,230 @@ def test_multiple_warnings_keep_category_mismatch_and_harper_warning():
     assert result["errors"] == []
     assert any("Harper grammar" in warning for warning in result["warnings"])
     assert any("句子" in warning for warning in result["warnings"])
+
+
+def test_control_character_is_hard_rule_and_blocks_all_capabilities():
+    result = validate_english("hello\u0000world", requested_category="sentence")
+
+    assert result["level"] == "error"
+    assert result["category"] == "unknown"
+    assert result["warnings"] == []
+    assert result["errors"]
+    assert result["canSave"] is False
+    assert result["canAnalyze"] is False
+    assert result["canPronounce"] is False
+
+
+def test_category_mismatch_is_advisory_and_does_not_block_ai_or_tts():
+    result = validate_english("gonna", requested_category="phrase")
+
+    assert result["level"] == "warning"
+    assert result["warningTypes"] == ["ADVISORY_WARNING"]
+    assert result["canSave"] is True
+    assert result["canAnalyze"] is True
+    assert result["canPronounce"] is True
+
+
+def test_local_punctuation_anomaly_is_not_warning():
+    result = validate_english("Really?!")
+
+    assert result["level"] == "pass"
+    assert result["warnings"] == []
+    assert result["warningTypes"] == []
+    assert result["canAnalyze"] is True
+    assert result["canPronounce"] is True
+
+
+def test_harper_usage_warning_blocks_ai_and_tts_but_allows_save():
+    response = FakeHarperResponse(
+        {
+            "lints": [
+                {
+                    "message": "Review this wording.",
+                    "offset": 0,
+                    "length": 2,
+                    "replacements": [],
+                    "kind": "style",
+                }
+            ]
+        }
+    )
+    with (
+        patch("app.services.harper_service.settings", harper_settings()),
+        patch("app.services.harper_service.httpx.post", return_value=response),
+    ):
+        result = validate_english("So good.")
+
+    harper = evidence_by_source(result, "harper")
+    assert result["level"] == "warning"
+    assert result["errors"] == []
+    assert result["warningTypes"] == ["CONTENT_WARNING"]
+    assert result["canSave"] is True
+    assert result["canAnalyze"] is False
+    assert result["canPronounce"] is False
+    assert harper["type"] == "usage"
+    assert harper["polarity"] == "warning"
+
+
+def test_local_and_harper_punctuation_do_not_create_warning():
+    response = FakeHarperResponse(
+        {
+            "lints": [
+                {
+                    "message": "Review this punctuation.",
+                    "offset": 0,
+                    "length": 2,
+                    "replacements": [],
+                    "kind": "typographical",
+                }
+            ]
+        }
+    )
+    with (
+        patch("app.services.harper_service.settings", harper_settings()),
+        patch("app.services.harper_service.httpx.post", return_value=response),
+    ):
+        result = validate_english("Really?!")
+
+    harper = evidence_by_source(result, "harper")
+    assert result["level"] == "pass"
+    assert result["warnings"] == []
+    assert result["warningTypes"] == []
+    assert result["canAnalyze"] is True
+    assert result["canPronounce"] is True
+    assert harper["type"] == "punctuation"
+    assert harper["polarity"] == "warning"
+
+
+def test_analyze_text_force_refresh_bypasses_cache_and_calls_model():
+    from app.services.analyzer import analyze_text
+
+    cached = {
+        "ok": True,
+        "level": "pass",
+        "category": "word",
+        "normalizedText": "gonna",
+        "translation": "cached",
+        "exampleSentence": "I'm gonna go now.",
+        "warnings": [],
+    }
+    fresh = {
+        "meaning": "将要",
+        "exampleSentence": "I'm gonna leave soon.",
+        "exampleTranslation": "我马上要离开。",
+        "synonyms": [],
+        "similarPhrases": [],
+    }
+
+    with (
+        patch("app.services.analyzer.get_cache", return_value=cached) as get_cache_mock,
+        patch("app.services.analyzer.set_cache"),
+        patch("app.services.analyzer.generate_analysis_with_ollama", return_value=fresh) as model,
+        patch("app.services.analyzer.generate_understanding", return_value="将要；非正式表达"),
+    ):
+        result = analyze_text("gonna", card_type="word", force_refresh=True)
+
+    get_cache_mock.assert_not_called()
+    model.assert_called_once()
+    assert result["ok"] is True
+    assert result["cacheHit"] is False
+    assert result["translation"] == "将要"
+    assert result["exampleSentence"] == "I'm gonna leave soon."
+
+
+def test_analyze_text_without_force_refresh_can_use_cache():
+    from app.services.analyzer import analyze_text
+
+    cached = {
+        "ok": True,
+        "level": "pass",
+        "category": "word",
+        "normalizedText": "gonna",
+        "translation": "cached",
+        "exampleSentence": "I'm gonna go now.",
+        "warnings": [],
+    }
+
+    with (
+        patch("app.services.analyzer.get_cache", return_value=cached) as get_cache_mock,
+        patch("app.services.analyzer.generate_analysis_with_ollama") as model,
+    ):
+        result = analyze_text("gonna", card_type="word")
+
+    get_cache_mock.assert_called_once()
+    model.assert_not_called()
+    assert result["cacheHit"] is True
+    assert result["translation"] == "cached"
+
+
+def test_ollama_prompt_uses_sentence_not_phrase_for_short_sentence():
+    from app.services.ollama_example import _build_payload
+
+    payload = _build_payload(
+        "I really like this movie.",
+        None,
+        category="sentence",
+        strict_retry=False,
+        format_spec={"type": "object"},
+    )
+
+    assert "Analyze this English sentence" in payload["prompt"]
+    assert "Do not treat the whole sentence as a phrase" in payload["prompt"]
+    assert "Analyze this English phrase" not in payload["prompt"]
+
+
+def test_ollama_prompt_uses_translation_only_for_long_sentence_and_paragraph():
+    from app.services.ollama_example import _build_payload, _translation_only_json_schema_format
+
+    long_sentence = (
+        "This is a longer sentence that should only be translated because it has enough "
+        "characters to exceed the short sentence analysis boundary for learners."
+    )
+    sentence_payload = _build_payload(
+        long_sentence,
+        None,
+        category="sentence",
+        strict_retry=False,
+        format_spec=_translation_only_json_schema_format(),
+    )
+    paragraph_payload = _build_payload(
+        "This is the first sentence. This is the second sentence.",
+        None,
+        category="paragraph",
+        strict_retry=False,
+        format_spec=_translation_only_json_schema_format(),
+    )
+
+    assert "Translate this English sentence" in sentence_payload["prompt"]
+    assert "exampleSentence" not in sentence_payload["prompt"]
+    assert sentence_payload["format"]["required"] == ["meaning"]
+    assert "Translate this English paragraph" in paragraph_payload["prompt"]
+    assert "exampleSentence" not in paragraph_payload["prompt"]
+    assert paragraph_payload["format"]["required"] == ["meaning"]
+
+
+def test_analyze_text_long_sentence_only_returns_translation_fields():
+    from app.services.analyzer import analyze_text
+
+    long_sentence = (
+        "This is a longer sentence that should only be translated because it has enough "
+        "characters to exceed the short sentence analysis boundary for learners."
+    )
+
+    with (
+        patch("app.services.analyzer.get_cache", return_value=None),
+        patch("app.services.analyzer.set_cache"),
+        patch(
+            "app.services.analyzer.generate_analysis_with_ollama",
+            return_value={"meaning": "这是一个较长的句子，只需要翻译。"},
+        ) as model,
+        patch("app.services.analyzer.generate_understanding", return_value="这是一个较长的句子，只需要翻译。"),
+    ):
+        result = analyze_text(long_sentence, card_type="sentence")
+
+    model.assert_called_once()
+    assert result["ok"] is True
+    assert result["category"] == "sentence"
+    assert result["translation"] == "这是一个较长的句子，只需要翻译。"
+    assert result["exampleSentence"] is None
+    assert result["dialogue"] == {"english": [], "chinese": []}

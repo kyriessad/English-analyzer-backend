@@ -77,6 +77,13 @@ def _has_example(response: dict[str, Any]) -> bool:
     return bool(str(response.get("exampleSentence") or "").strip())
 
 
+def _is_translation_only_analysis(category: str | None, text: str) -> bool:
+    normalized_category = str(category or "").strip().lower()
+    if normalized_category == "paragraph":
+        return True
+    return normalized_category == "sentence" and len(str(text or "").strip()) > 100
+
+
 def _generate_example_with_tmt(
     word: str,
     translation: str,
@@ -306,7 +313,8 @@ def _finalize_analysis(
     example_translation = None
     example_source = None
     example_error = None
-    if ollama and category != "paragraph":
+    translation_only = _is_translation_only_analysis(category, normalized_text)
+    if ollama and not translation_only:
         example_sentence = ollama.get("exampleSentence")
         example_translation = ollama.get("exampleTranslation")
         example_source = "ollama"
@@ -317,7 +325,7 @@ def _finalize_analysis(
         alternative_meanings = ollama.get("alternativeMeanings") or []
         usage_scenario = ollama.get("usageScenario") or ""
         dialogue = ollama.get("dialogue") or {"english": [], "chinese": []}
-    elif category != "paragraph":
+    elif not translation_only:
         example_sentence, example_translation, example_source, example_error = _generate_example(
             normalized_text,
             category,
@@ -473,7 +481,10 @@ def analyze_text(
             cached = get_cache(cache_key)
             if cached:
                 cached_category = cached.get("category")
-                needs_example = cached_category in ("word", "phrase", "sentence")
+                needs_example = cached_category in ("word", "phrase", "sentence") and not (
+                    cached_category == "sentence"
+                    and _is_translation_only_analysis(cached_category, normalized_text)
+                )
                 if needs_example and not _has_example(cached):
                     # Pre-Qwen cache entries (or fallback-only results) lack an example; re-analyze.
                     delete_cache(cache_key)
@@ -686,7 +697,10 @@ def analyze_text_streaming(
             cached = get_cache(cache_key)
             if cached:
                 cached_category = cached.get("category")
-                needs_example = cached_category in ("word", "phrase", "sentence")
+                needs_example = cached_category in ("word", "phrase", "sentence") and not (
+                    cached_category == "sentence"
+                    and _is_translation_only_analysis(cached_category, normalized_text)
+                )
                 if needs_example and not _has_example(cached):
                     delete_cache(cache_key)
                     AI_CACHE_EVENTS_TOTAL.labels(operation="analyze_text_streaming", result="stale").inc()
@@ -797,7 +811,8 @@ def analyze_text_streaming(
                         if event[0] == "reset":
                             yield event
                         elif event[0] in {"delta", "field"} and (
-                            category != "paragraph" or event[1] == "meaning"
+                            not _is_translation_only_analysis(category, normalized_text)
+                            or event[1] == "meaning"
                         ):
                             yield event
                         elif event[0] == "cancelled":

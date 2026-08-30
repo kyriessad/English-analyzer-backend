@@ -126,6 +126,23 @@ def _json_schema_format() -> dict[str, Any]:
     }
 
 
+def _is_translation_only_category(category: str | None, text: str) -> bool:
+    normalized_category = str(category or "").strip().lower()
+    if normalized_category == "paragraph":
+        return True
+    return normalized_category == "sentence" and len(str(text or "").strip()) > 100
+
+
+def _translation_only_json_schema_format() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "meaning": {"type": "string"},
+        },
+        "required": ["meaning"],
+    }
+
+
 def _strip_outer_code_fence(content: str) -> str:
     text = content.strip()
     if not text.startswith("```") or not text.endswith("```"):
@@ -257,7 +274,7 @@ def _normalize_dialogue(value: Any) -> dict:
     return {"english": english, "chinese": chinese}
 
 
-def _validate_example(text: str, sentence: str) -> str | None:
+def _validate_example(text: str, sentence: str, category: str | None = None) -> str | None:
     clean_text = str(text or "").strip()
     clean_sentence = str(sentence or "").strip()
 
@@ -269,20 +286,32 @@ def _validate_example(text: str, sentence: str) -> str | None:
         return "example_validation_failed"
     if _word_count(clean_sentence) < 3:
         return "example_validation_failed"
+    if str(category or "").strip().lower() == "sentence":
+        return None
     if not _text_in_sentence(_match_target(clean_text), clean_sentence, allow_inflection=True):
         return "example_validation_failed"
     return None
 
 
-def _normalize_analysis_data(text: str, data: dict[str, Any]) -> _AttemptResult:
+def _normalize_analysis_data(
+    text: str,
+    data: dict[str, Any],
+    category: str | None = None,
+) -> _AttemptResult:
     """Parse + normalize a full JSON analysis object into an ``_AttemptResult``.
 
     Shared by the non-streaming and streaming paths so the final result is
     normalized and validated exactly the same way in both.
     """
+    meaning = str(data.get("meaning") or "").strip()
+    if _is_translation_only_category(category, text):
+        if not _is_valid_chinese_translation(meaning):
+            logger.warning("[ollama][diag] fail_reason=qwen_translation_missing")
+            return _AttemptResult(None, None, "qwen_translation_missing", True)
+        return _AttemptResult("", None, None, False, meaning=meaning)
+
     sentence = str(data.get("exampleSentence") or "").strip()
     translation = str(data.get("exampleTranslation") or "").strip()
-    meaning = str(data.get("meaning") or "").strip()
     synonyms = _normalize_pair_list(data.get("synonyms"))
     similar_phrases = _normalize_pair_list(data.get("similarPhrases"))
     expression_type = _normalize_expression_type(data.get("expressionType"))
@@ -293,7 +322,7 @@ def _normalize_analysis_data(text: str, data: dict[str, Any]) -> _AttemptResult:
         logger.warning("[ollama][diag] fail_reason=missing_example_sentence")
         return _AttemptResult(None, None, "missing_example_sentence", True)
 
-    validation_error = _validate_example(text, sentence)
+    validation_error = _validate_example(text, sentence, category)
     if validation_error:
         logger.warning(
             "[ollama][diag] fail_reason=%s | sentence=%r",
@@ -349,10 +378,14 @@ def _assemble_analysis_result(text: str, result: _AttemptResult) -> dict[str, An
     }
 
 
-def _build_prompts(text: str, chinese_meaning: str | None, *, strict_retry: bool) -> tuple[str, str]:
+def _build_prompts(
+    text: str,
+    chinese_meaning: str | None,
+    *,
+    category: str | None = None,
+    strict_retry: bool,
+) -> tuple[str, str]:
     target = str(text or "").strip()
-    is_phrase = len(target.split()) > 1
-    label = "phrase" if is_phrase else "word"
     meaning_hint = f"\nChinese meaning hint: {chinese_meaning}" if chinese_meaning else ""
     stricter = (
         "\nThis is a retry. Be stricter: return only the JSON object, and make sure "
@@ -360,14 +393,52 @@ def _build_prompts(text: str, chinese_meaning: str | None, *, strict_retry: bool
         if strict_retry
         else ""
     )
+    normalized_category = str(category or "").strip().lower()
+    if _is_translation_only_category(normalized_category, target):
+        label = "paragraph" if normalized_category == "paragraph" else "sentence"
+        system_prompt = (
+            "You are an English-to-Simplified-Chinese translator for Chinese-speaking learners. "
+            "Do not think step by step. Return only valid JSON, no markdown, no notes."
+        )
+        user_prompt = (
+            f'Translate this English {label} into natural Simplified Chinese: "{target}".'
+            f"{meaning_hint}\n"
+            "Requirements:\n"
+            "1. meaning: a natural Simplified-Chinese translation of the full input. "
+            "Keep the original meaning and tone; do not add explanations, examples, synonyms, or dialogue.\n"
+            '2. Return only this JSON shape: {"meaning": "..."}'
+        )
+        return system_prompt, user_prompt
+
+    if normalized_category in {"word", "phrase"}:
+        label = normalized_category
+        is_phrase = normalized_category == "phrase"
+    elif normalized_category == "sentence":
+        label = "sentence"
+        is_phrase = False
+    else:
+        is_phrase = len(target.split()) > 1
+        label = "phrase" if is_phrase else "word"
+    if normalized_category == "sentence":
+        stricter = (
+            "\nThis is a retry. Be stricter: return only the JSON object, and make sure "
+            "exampleSentence is a different sentence that naturally uses or paraphrases the target."
+            if strict_retry
+            else ""
+        )
 
     system_prompt = (
         "You are an English expression analyzer for Chinese-speaking learners. "
-        "You explain what an English word or phrase usually means, not translate a sentence word by word. "
+        "You explain what an English word, phrase, or short sentence usually means for learners. "
         "Do not think step by step. Return only valid JSON, no markdown, no notes."
     )
     match_target = _match_target(target)
-    if is_phrase:
+    if normalized_category == "sentence":
+        target_rule = (
+            "The exampleSentence should be a new, natural daily-life English sentence that demonstrates "
+            f'the meaning or usage of "{match_target}". Do not treat the whole sentence as a phrase.'
+        )
+    elif is_phrase:
         target_rule = (
             f'The exampleSentence should contain the complete phrase "{match_target}" as contiguous words. '
             "Do not split the phrase across different parts of the sentence."
@@ -419,11 +490,17 @@ def _build_payload(
     text: str,
     chinese_meaning: str | None,
     *,
+    category: str | None = None,
     strict_retry: bool,
     format_spec: dict[str, Any] | str,
     stream: bool = False,
 ) -> dict[str, Any]:
-    system_prompt, user_prompt = _build_prompts(text, chinese_meaning, strict_retry=strict_retry)
+    system_prompt, user_prompt = _build_prompts(
+        text,
+        chinese_meaning,
+        category=category,
+        strict_retry=strict_retry,
+    )
     return {
         "model": _model_name(),
         "system": system_prompt,
@@ -459,14 +536,20 @@ def _call_once(
     text: str,
     chinese_meaning: str | None,
     *,
+    category: str | None = None,
     deadline: float,
     strict_retry: bool = False,
     attempt_recorder: Callable[[], None] | None = None,
 ) -> _AttemptResult:
-    format_spec: dict[str, Any] | str = _json_schema_format()
+    format_spec: dict[str, Any] | str = (
+        _translation_only_json_schema_format()
+        if _is_translation_only_category(category, text)
+        else _json_schema_format()
+    )
     payload = _build_payload(
         text,
         chinese_meaning,
+        category=category,
         strict_retry=strict_retry,
         format_spec=format_spec,
     )
@@ -514,7 +597,7 @@ def _call_once(
         logger.warning("[ollama][diag] fail_reason=json_parse_failed | %s | content=%r", exc, content[:200])
         return _AttemptResult(None, None, "json_parse_failed", True)
 
-    return _normalize_analysis_data(text, data)
+    return _normalize_analysis_data(text, data, category)
 
 
 def generate_example_with_ollama(
@@ -595,6 +678,7 @@ def generate_analysis_with_ollama(
     first = _call_once(
         target,
         None,
+        category=category,
         deadline=deadline,
         strict_retry=False,
         attempt_recorder=attempt_recorder,
@@ -605,6 +689,7 @@ def generate_analysis_with_ollama(
         result = _call_once(
             target,
             None,
+            category=category,
             deadline=deadline,
             strict_retry=True,
             attempt_recorder=attempt_recorder,
@@ -898,6 +983,7 @@ class _StreamAttemptOutcome:
 def _generate_analysis_stream_attempt(
     target: str,
     *,
+    category: str | None,
     deadline: float,
     attempt: int,
     seq_start: int,
@@ -908,8 +994,13 @@ def _generate_analysis_stream_attempt(
     payload = _build_payload(
         target,
         None,
+        category=category,
         strict_retry=attempt > 1,
-        format_spec=_json_schema_format(),
+        format_spec=(
+            _translation_only_json_schema_format()
+            if _is_translation_only_category(category, target)
+            else _json_schema_format()
+        ),
         stream=True,
     )
     if cancel_controller is not None and cancel_controller.cancelled():
@@ -1083,7 +1174,7 @@ def _generate_analysis_stream_attempt(
         )
         return _StreamAttemptOutcome(None, seq, "json_parse_failed", retryable=True)
 
-    result = _normalize_analysis_data(target, data)
+    result = _normalize_analysis_data(target, data, category)
     return _StreamAttemptOutcome(
         result,
         seq,
@@ -1141,6 +1232,7 @@ def generate_analysis_with_ollama_stream(
     for attempt in (1, 2):
         outcome = yield from _generate_analysis_stream_attempt(
             target,
+            category=category,
             deadline=deadline,
             attempt=attempt,
             seq_start=seq,

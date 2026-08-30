@@ -341,15 +341,7 @@ def _get_spelling_warning(evidence: dict[str, str | int], token: str) -> str | N
     return f"拼写可能有误：{token}。你是不是想写 {suggestion}？"
 
 def _get_format_warnings(normalized_text: str, has_english: bool) -> list[str]:
-    if not has_english:
-        return []
-
-    warnings: list[str] = []
-
-    if REPEATED_OR_MIXED_PUNCTUATION_RE.search(normalized_text):
-        warnings.append("内容中有连续或混合标点，建议确认是否为有意输入。")
-
-    return warnings
+    return []
 
 
 def _is_abbreviation_like(text: str) -> bool:
@@ -584,11 +576,28 @@ def validate_english(text: str, requested_category: str | None = None) -> dict[s
     )
     if spelling_warning:
         warnings.append(spelling_warning)
-    warnings.extend(harper_warnings)
+    harper_blocks_ai = any(
+        item.get("source") == "harper"
+        and item.get("type") in {"grammar", "usage"}
+        and item.get("polarity") == "warning"
+        for item in harper_evidence
+    )
+    harper_punctuation_only = (
+        bool(harper_warnings)
+        and not harper_blocks_ai
+        and all(
+            item.get("source") != "harper"
+            or item.get("type") == "punctuation"
+            or item.get("polarity") != "warning"
+            for item in harper_evidence
+        )
+    )
+    if not harper_punctuation_only:
+        warnings.extend(harper_warnings)
     if spelling_warning:
         warning_types.append("CONTENT_WARNING")
-    if harper_warnings:
-        warning_types.append("ADVISORY_WARNING")
+    if harper_blocks_ai:
+        warning_types.append("CONTENT_WARNING")
     if any(
         item.get("source") == "harper" and item.get("result") == "unavailable"
         for item in harper_evidence
