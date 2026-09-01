@@ -13,6 +13,7 @@ from app.models.user import User, utc_now
 from app.schemas.card import CardCreate
 from app.services.card_service import create_card_in_transaction
 from app.services.discovery_service import get_today_quote, list_material_items, set_material_known
+from app.services.public_material_importer import PublicMaterialItemImport, PublicMaterialPackImport, import_public_materials
 from app.services.review_v1 import apply_fsrs_review, get_or_create_fsrs_state, is_v1_review_eligible
 
 
@@ -104,4 +105,94 @@ def test_postgresql_discovery_isolation_concurrency_card_and_fsrs_reuse():
             db.query(Card).filter(Card.user_id.in_([user_id, other_user_id])).delete(synchronize_session=False)
             db.query(PublicMaterialPack).filter(PublicMaterialPack.id == pack_id).delete(synchronize_session=False)
             db.query(User).filter(User.id.in_([user_id, other_user_id])).delete(synchronize_session=False)
+            db.commit()
+
+
+def test_postgresql_public_material_importer_is_idempotent_and_persists_trace_fields():
+    suffix = uuid4().hex[:10]
+    pack_code = f"discovery-import-{suffix}"
+    pack = PublicMaterialPackImport(
+        code=pack_code,
+        title="测试导入词书",
+        description="真实 PostgreSQL 导入验收",
+        kind="word_book",
+        sort_order=123,
+        content_version="test-v1",
+    )
+    initial_items = [
+        PublicMaterialItemImport(
+            content="analyze",
+            chinese="分析",
+            card_type="word",
+            source_label="测试导入词书",
+            source="exam-corpus-test",
+            source_id="exam-corpus-test:analyze",
+            license="test-fixture-license",
+            corpus_rank=1,
+            corpus_frequency=42.5,
+            production_batch="test-batch-1",
+            review_note="postgres importer test",
+        ),
+        PublicMaterialItemImport(
+            content="context",
+            chinese="语境",
+            card_type="word",
+            source_label="测试导入词书",
+            source="exam-corpus-test",
+            source_id="exam-corpus-test:context",
+            license="test-fixture-license",
+            corpus_rank=2,
+            corpus_frequency=21.0,
+            production_batch="test-batch-1",
+        ),
+    ]
+    updated_items = [
+        PublicMaterialItemImport(
+            content="analyze",
+            chinese="分析；解析",
+            card_type="word",
+            source_label="测试导入词书",
+            source="exam-corpus-test",
+            source_id="exam-corpus-test:analyze-v2",
+            license="test-fixture-license",
+            corpus_rank=1,
+            corpus_frequency=50.0,
+            production_batch="test-batch-2",
+            review_note="postgres importer test updated",
+        ),
+    ]
+
+    try:
+        with SessionLocal() as db:
+            assert import_public_materials(db, packs=[pack], items_by_pack={pack_code: initial_items}) == {pack_code: 2}
+            db.commit()
+            assert import_public_materials(db, packs=[pack], items_by_pack={pack_code: updated_items}) == {pack_code: 1}
+            assert import_public_materials(db, packs=[pack], items_by_pack={pack_code: updated_items}) == {pack_code: 1}
+            db.commit()
+
+            pack_id = db.scalar(select(PublicMaterialPack.id).where(PublicMaterialPack.code == pack_code))
+            assert pack_id is not None
+            approved = list(db.scalars(select(PublicMaterialItem).where(
+                PublicMaterialItem.pack_id == pack_id,
+                PublicMaterialItem.status == "approved",
+            )))
+            hidden = list(db.scalars(select(PublicMaterialItem).where(
+                PublicMaterialItem.pack_id == pack_id,
+                PublicMaterialItem.status == "hidden",
+            )))
+            assert len(approved) == 1
+            assert len(hidden) == 1
+            item = approved[0]
+            assert item.content == "analyze"
+            assert item.chinese == "分析；解析"
+            assert item.source == "exam-corpus-test"
+            assert item.source_id == "exam-corpus-test:analyze-v2"
+            assert item.license == "test-fixture-license"
+            assert item.corpus_rank == 1
+            assert item.corpus_frequency == 50.0
+            assert item.production_batch == "test-batch-2"
+            assert item.position == 1
+    finally:
+        with SessionLocal() as db:
+            db.query(PublicMaterialPack).filter(PublicMaterialPack.code == pack_code).delete(synchronize_session=False)
             db.commit()

@@ -5,21 +5,23 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from uuid import UUID, uuid5
-
-from sqlalchemy import select, update
+from uuid import UUID
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.data.discovery_content import CONTENT_VERSION, PACKS, STATIC_ENTRIES, WORD_BOOK_TAGS, daily_quotes
 from app.database import SessionLocal
-from app.models.discovery import PublicMaterialItem, PublicMaterialPack
 from app.services.card_service import normalize_card_content
 from app.services.ecdict_service import get_tagged_dictionary_entries
+from app.services.public_material_importer import (
+    PublicMaterialItemImport,
+    PublicMaterialPackImport,
+    import_public_materials,
+    stable_public_material_id,
+)
 from app.services.validator import validate_english
 
 
-CONTENT_NAMESPACE = UUID("c9ba9de8-3b40-4b36-a67d-6b3fa128988e")
 BANNED_QUOTE_PHRASES = (
     "never give up",
     "everything happens for a reason",
@@ -31,7 +33,7 @@ BANNED_QUOTE_PHRASES = (
 
 
 def stable_id(kind: str, value: str) -> UUID:
-    return uuid5(CONTENT_NAMESPACE, f"{kind}:{value}")
+    return stable_public_material_id(kind, value)
 
 
 def validate_editorial_content(*, audit_runtime: bool) -> dict[str, tuple[tuple[str, str, str], ...]]:
@@ -77,52 +79,50 @@ def build_import_content(*, word_limit: int, audit_runtime: bool) -> dict[str, t
 def seed_discovery_content(*, word_limit: int = 500, audit_runtime: bool = False) -> dict[str, int]:
     content_by_pack = build_import_content(word_limit=word_limit, audit_runtime=audit_runtime)
     pack_definitions = {item[0]: item for item in PACKS}
-    counts: dict[str, int] = {}
+    pack_imports = [
+        PublicMaterialPackImport(
+            code=code,
+            title=title,
+            description=description,
+            kind=kind,
+            sort_order=sort_order,
+            content_version=CONTENT_VERSION,
+        )
+        for code, title, description, kind, sort_order in PACKS
+    ]
+    items_by_pack: dict[str, list[PublicMaterialItemImport]] = {}
+
+    for pack_code, entries in content_by_pack.items():
+        _, pack_title, _, _, _ = pack_definitions[pack_code]
+        source_label = "今日一句" if pack_code == "daily-quote" else pack_title
+        item_imports: list[PublicMaterialItemImport] = []
+        for position, (english, chinese, card_type) in enumerate(entries, start=1):
+            if pack_code in WORD_BOOK_TAGS:
+                source = "ecdict"
+                source_id = normalize_card_content(english)
+                review_note = f"ECDICT {WORD_BOOK_TAGS[pack_code]} {CONTENT_VERSION}"
+                corpus_rank = position
+            else:
+                source = "internal-editorial"
+                source_id = f"{pack_code}:{position}"
+                review_note = f"editorial review {CONTENT_VERSION}"
+                corpus_rank = None
+            item_imports.append(PublicMaterialItemImport(
+                content=english,
+                chinese=chinese,
+                card_type=card_type,
+                source_label=source_label,
+                source=source,
+                source_id=source_id,
+                license=None,
+                corpus_rank=corpus_rank,
+                production_batch=CONTENT_VERSION,
+                review_note=review_note,
+            ))
+        items_by_pack[pack_code] = item_imports
 
     with SessionLocal() as db:
-        for code, title, description, kind, sort_order in PACKS:
-            pack = db.scalar(select(PublicMaterialPack).where(PublicMaterialPack.code == code))
-            if pack is None:
-                pack = PublicMaterialPack(id=stable_id("pack", code), code=code)
-                db.add(pack)
-            pack.title = title
-            pack.description = description
-            pack.kind = kind
-            pack.sort_order = sort_order
-            pack.status = "active"
-            pack.content_version = CONTENT_VERSION
-        db.flush()
-
-        for pack_code, entries in content_by_pack.items():
-            pack = db.scalar(select(PublicMaterialPack).where(PublicMaterialPack.code == pack_code))
-            if pack is None:
-                raise RuntimeError(f"pack definition missing: {pack_code}")
-            db.execute(update(PublicMaterialItem).where(PublicMaterialItem.pack_id == pack.id).values(
-                position=PublicMaterialItem.position + 1_000_000,
-                status="hidden",
-            ))
-            active_ids: set[UUID] = set()
-            for position, (english, chinese, card_type) in enumerate(entries, start=1):
-                normalized = normalize_card_content(english)
-                item_id = stable_id("item", f"{pack_code}:{normalized}")
-                item = db.get(PublicMaterialItem, item_id)
-                if item is None:
-                    item = PublicMaterialItem(id=item_id, pack_id=pack.id)
-                    db.add(item)
-                item.content = english.strip()
-                item.content_normalized = normalized
-                item.chinese = chinese.strip()
-                item.card_type = card_type
-                item.source_label = "今日一句" if pack_code == "daily-quote" else pack_definitions[pack_code][1]
-                item.position = position
-                item.status = "approved"
-                item.review_note = (
-                    f"ECDICT {WORD_BOOK_TAGS[pack_code]} {CONTENT_VERSION}"
-                    if pack_code in WORD_BOOK_TAGS
-                    else f"editorial review {CONTENT_VERSION}"
-                )
-                active_ids.add(item_id)
-            counts[pack_code] = len(active_ids)
+        counts = import_public_materials(db, packs=pack_imports, items_by_pack=items_by_pack)
         db.commit()
     return counts
 

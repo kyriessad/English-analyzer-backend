@@ -19,6 +19,11 @@ from app.models.discovery import PublicMaterialItem, PublicMaterialPack, UserMat
 from app.models.user import User
 from app.services import auth_service
 from app.services.card_service import normalize_card_content
+from app.services.public_material_importer import (
+    PublicMaterialItemImport,
+    PublicMaterialPackImport,
+    import_public_materials,
+)
 from scripts.seed_discovery_content import BANNED_QUOTE_PHRASES, stable_id, validate_editorial_content
 
 
@@ -163,6 +168,71 @@ class DiscoveryEditorialContentTest(unittest.TestCase):
         self.assertTrue(all(item[1].strip() and item[2] == "sentence" for item in quotes))
         normalized = "\n".join(item[0].lower() for item in quotes)
         self.assertTrue(all(phrase not in normalized for phrase in BANNED_QUOTE_PHRASES))
+
+
+class PublicMaterialImporterTest(unittest.TestCase):
+    def setUp(self):
+        Base.metadata.drop_all(bind=engine)
+        Base.metadata.create_all(bind=engine)
+
+    def test_importer_is_idempotent_and_preserves_trace_fields(self):
+        pack = PublicMaterialPackImport(
+            code="test-exam",
+            title="测试词书",
+            description="按语料排序",
+            kind="word_book",
+            sort_order=1,
+            content_version="test-v1",
+        )
+        items = [
+            PublicMaterialItemImport(
+                content="analyze",
+                chinese="分析",
+                card_type="word",
+                source_label="测试词书",
+                source="exam-corpus-2026",
+                source_id="exam:analyze",
+                license=None,
+                corpus_rank=1,
+                corpus_frequency=42.5,
+                production_batch="batch-1",
+                review_note="verified fixture",
+            ),
+            PublicMaterialItemImport(
+                content="context",
+                chinese="语境",
+                card_type="word",
+                source_label="测试词书",
+                source="exam-corpus-2026",
+                source_id="exam:context",
+                license=None,
+                corpus_rank=2,
+                corpus_frequency=21,
+                production_batch="batch-1",
+            ),
+        ]
+
+        with TestingSessionLocal() as db:
+            first = import_public_materials(db, packs=[pack], items_by_pack={"test-exam": items})
+            second = import_public_materials(db, packs=[pack], items_by_pack={"test-exam": items[:1]})
+            db.commit()
+
+            self.assertEqual({"test-exam": 2}, first)
+            self.assertEqual({"test-exam": 1}, second)
+            approved = list(db.scalars(select(PublicMaterialItem).where(
+                PublicMaterialItem.status == "approved",
+            )))
+            hidden = list(db.scalars(select(PublicMaterialItem).where(
+                PublicMaterialItem.status == "hidden",
+            )))
+            self.assertEqual(1, len(approved))
+            self.assertEqual(1, len(hidden))
+            self.assertEqual("exam-corpus-2026", approved[0].source)
+            self.assertEqual("exam:analyze", approved[0].source_id)
+            self.assertIsNone(approved[0].license)
+            self.assertEqual(1, approved[0].corpus_rank)
+            self.assertEqual(42.5, approved[0].corpus_frequency)
+            self.assertEqual("batch-1", approved[0].production_batch)
 
 
 if __name__ == "__main__":

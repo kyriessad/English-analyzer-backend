@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, Uuid
+from sqlalchemy import CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -38,6 +38,7 @@ class PublicMaterialItem(Base):
         CheckConstraint("position > 0", name="ck_public_material_items_position_positive"),
         Index("ix_public_material_items_pack_status_position", "pack_id", "status", "position"),
         Index("ix_public_material_items_content_normalized", "content_normalized"),
+        Index("ix_public_material_items_source", "source", "source_id"),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
@@ -47,6 +48,12 @@ class PublicMaterialItem(Base):
     chinese: Mapped[str] = mapped_column(Text, nullable=False)
     card_type: Mapped[str] = mapped_column(String(16), nullable=False)
     source_label: Mapped[str] = mapped_column(String(120), nullable=False)
+    source: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    source_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    license: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    corpus_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    corpus_frequency: Mapped[float | None] = mapped_column(Float, nullable=True)
+    production_batch: Mapped[str | None] = mapped_column(String(80), nullable=True)
     position: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="approved")
     review_note: Mapped[str | None] = mapped_column(String(240), nullable=True)
