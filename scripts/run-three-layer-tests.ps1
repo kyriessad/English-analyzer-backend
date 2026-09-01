@@ -18,7 +18,8 @@ function Assert-LastExitCode([string]$Label) {
 function Invoke-Layer1 {
   Set-Location $BackendRoot
   & $Python -m pytest -q tests\test_frozen_contract_layer1.py `
-    tests\test_frozen_api_card_layer1.py tests\test_frozen_lexical_tts_layer1.py
+    tests\test_frozen_api_card_layer1.py tests\test_frozen_lexical_tts_layer1.py `
+    tests\test_discovery_api.py
   Assert-LastExitCode 'Frozen Layer 1'
   & $Python -m pytest -q tests\test_contract_traceability.py
   Assert-LastExitCode 'Contract traceability'
@@ -26,12 +27,18 @@ function Invoke-Layer1 {
   & node --test tests\frozen-corpus.test.js tests\english-validation.test.js `
     tests\validation-state-machine.test.js tests\stream-provisional.test.js
   Assert-LastExitCode 'Mini Program deterministic tests'
+  & node --test tests\discovery-flow.test.js
+  Assert-LastExitCode 'Mini Program discovery tests'
 }
 
 function Invoke-PrePush {
   Invoke-Layer1
   Set-Location $BackendRoot
-  & $Python -m pytest -q --ignore=tests\test_layer2_real_dependencies.py
+  # Review V1 replaced the legacy result-based feedback contract. Its current
+  # frozen/API coverage lives in test_review_v1_api.py; the phase2 module is
+  # retained only as historical coverage for the retired endpoint shape.
+  & $Python -m pytest -q --ignore=tests\test_layer2_real_dependencies.py `
+    --ignore=tests\test_reviews_phase2_api.py
   Assert-LastExitCode 'Backend pre-push regression'
 }
 

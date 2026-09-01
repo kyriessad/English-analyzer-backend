@@ -28,6 +28,7 @@ $script:StopScript = Join-Path $script:BackendRoot 'stop-server.ps1'
 $script:StartScript = Join-Path $script:BackendRoot 'start-server.ps1'
 $script:DatabaseCheckScript = Join-Path $script:BackendRoot 'scripts\check_database_target.py'
 $script:ReleasePreflightPython = Join-Path $script:BackendRoot 'scripts\release_preflight.py'
+$script:DiscoverySeedScript = Join-Path $script:BackendRoot 'scripts\seed_discovery_content.py'
 $script:PgDumpExe = 'C:\Program Files\PostgreSQL\16\bin\pg_dump.exe'
 $script:PgRestoreExe = 'C:\Program Files\PostgreSQL\16\bin\pg_restore.exe'
 $script:HealthUrl = 'http://127.0.0.1:8000/health'
@@ -124,6 +125,7 @@ function Assert-ReleaseDependencies {
     $script:StartScript,
     $script:DatabaseCheckScript,
     $script:ReleasePreflightPython,
+    $script:DiscoverySeedScript,
     $script:PgDumpExe,
     $script:PgRestoreExe,
     (Join-Path $script:BackendRoot 'alembic.ini')
@@ -229,6 +231,11 @@ function Invoke-ReleaseRevisionVerify {
     Actual = $actual
     Expected = $expected
   }
+}
+
+function Invoke-ReleaseDiscoveryImport {
+  $result = Invoke-NativeCaptured -FilePath $script:PythonExe -Arguments @($script:DiscoverySeedScript, '--word-limit', '500')
+  if ($result.ExitCode -ne 0) { throw 'Discovery content import failed.' }
 }
 
 function Get-CurrentRevisionBestEffort {
@@ -416,6 +423,8 @@ function Invoke-ReleaseUpgrade {
       throw "Verified revision '$afterRevision' does not match preflight target '$targetRevision'."
     }
     Write-Host "$afterRevision == $targetRevision"
+    Invoke-ReleaseDiscoveryImport
+    Write-Host 'Discovery content: PASS' -ForegroundColor Green
   }
   catch {
     $currentAfterFailure = Get-CurrentRevisionBestEffort -Fallback $beforeRevision

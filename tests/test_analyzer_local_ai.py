@@ -52,7 +52,9 @@ class AnalyzerLocalAiIntegrationTest(unittest.TestCase):
         self.assertEqual(result["synonyms"], [])
         self.assertEqual(result["similarPhrases"], [])
         translate.assert_called_once_with("crave")
-        ollama.assert_called_once_with("crave", "word", deadline=ANY, attempt_recorder=None)
+        ollama.assert_called_once_with(
+            "crave", "word", deadline=ANY, attempt_recorder=None, regenerate_context=None
+        )
         hunyuan.assert_not_called()
         tmt.assert_not_called()
         set_cache.assert_called_once()
@@ -70,7 +72,9 @@ class AnalyzerLocalAiIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(result["category"], "phrase")
         self.assertEqual(result["exampleSentence"], "Break a leg at your audition tonight.")
-        ollama.assert_called_once_with("break a leg", "phrase", deadline=ANY, attempt_recorder=None)
+        ollama.assert_called_once_with(
+            "break a leg", "phrase", deadline=ANY, attempt_recorder=None, regenerate_context=None
+        )
 
     def test_word_ollama_meaning_synonyms_and_phrases_propagate(self):
         result, translate, ollama, _, _, _, _ = self._run(
@@ -116,7 +120,9 @@ class AnalyzerLocalAiIntegrationTest(unittest.TestCase):
             result["alternativeMeanings"],
             [{"meaning": "摔断腿", "type": "literal", "note": "字面意思"}],
         )
-        ollama.assert_called_once_with("break a leg", "phrase", deadline=ANY, attempt_recorder=None)
+        ollama.assert_called_once_with(
+            "break a leg", "phrase", deadline=ANY, attempt_recorder=None, regenerate_context=None
+        )
 
     def test_fallback_expression_fields_default_to_literal_empty(self):
         result, _, ollama, _, tmt, set_cache, _ = self._run("crave", analysis_result=None)
@@ -130,7 +136,13 @@ class AnalyzerLocalAiIntegrationTest(unittest.TestCase):
         self.assertEqual(result["category"], "sentence")
         self.assertEqual(result["translation"], "基础翻译")
         self.assertEqual(result["exampleSentence"], "She craves quiet mornings.")
-        ollama.assert_called_once_with("I study English every day.", "sentence", deadline=ANY, attempt_recorder=None)
+        ollama.assert_called_once_with(
+            "I study English every day.",
+            "sentence",
+            deadline=ANY,
+            attempt_recorder=None,
+            regenerate_context=None,
+        )
         hunyuan.assert_not_called()
         tmt.assert_not_called()
         translate.assert_called_once()
@@ -170,7 +182,9 @@ class AnalyzerLocalAiIntegrationTest(unittest.TestCase):
         self.assertEqual(result["alternativeMeanings"], [])
         self.assertEqual(result["usageScenario"], "")
         self.assertEqual(result["dialogue"], {"english": [], "chinese": []})
-        ollama.assert_called_once_with(text.rstrip(), "paragraph", deadline=ANY, attempt_recorder=None)
+        ollama.assert_called_once_with(
+            text.rstrip(), "paragraph", deadline=ANY, attempt_recorder=None, regenerate_context=None
+        )
         translate.assert_not_called()
         hunyuan.assert_not_called()
         tmt.assert_not_called()
@@ -185,7 +199,9 @@ class AnalyzerLocalAiIntegrationTest(unittest.TestCase):
         self.assertGreater(len(text), 500)
         self.assertTrue(result["ok"])
         self.assertEqual(result["category"], "paragraph")
-        ollama.assert_called_once_with(text.rstrip(), "paragraph", deadline=ANY, attempt_recorder=None)
+        ollama.assert_called_once_with(
+            text.rstrip(), "paragraph", deadline=ANY, attempt_recorder=None, regenerate_context=None
+        )
 
     def test_paragraph_stream_forwards_only_meaning_before_final_response(self):
         from app.services.analyzer import analyze_text_streaming
@@ -249,6 +265,7 @@ class AnalyzerLocalAiIntegrationTest(unittest.TestCase):
             deadline=ANY,
             attempt_recorder=None,
             cancel_controller=ANY,
+            regenerate_context=None,
         )
 
     def test_sentence_analysis_source_reports_ollama(self):
@@ -305,7 +322,9 @@ class AnalyzerLocalAiIntegrationTest(unittest.TestCase):
         self.assertEqual(result["synonyms"], [])
         self.assertEqual(result["similarPhrases"], [])
         self.assertEqual(result["errors"], ["分析服务暂时不可用，请稍后重试"])
-        ollama.assert_called_once_with("crave", "word", deadline=ANY, attempt_recorder=None)
+        ollama.assert_called_once_with(
+            "crave", "word", deadline=ANY, attempt_recorder=None, regenerate_context=None
+        )
         tmt.assert_not_called()
         set_cache.assert_not_called()
 
@@ -317,7 +336,9 @@ class AnalyzerLocalAiIntegrationTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertIsNone(result["translation"])
         self.assertEqual(result["exampleSentence"], "She craves quiet mornings.")
-        ollama.assert_called_once_with("crave", "word", deadline=ANY, attempt_recorder=None)
+        ollama.assert_called_once_with(
+            "crave", "word", deadline=ANY, attempt_recorder=None, regenerate_context=None
+        )
         set_cache.assert_not_called()
 
     def test_dictionary_fallback_uses_the_sense_found_in_example_translation(self):
@@ -445,7 +466,9 @@ class AnalyzerLocalAiIntegrationTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["translation"], "渴望")
         get_cache.assert_not_called()
-        ollama.assert_called_once_with("crave", "word", deadline=ANY, attempt_recorder=None)
+        ollama.assert_called_once_with(
+            "crave", "word", deadline=ANY, attempt_recorder=None, regenerate_context=None
+        )
         set_cache.assert_called_once()
 
 

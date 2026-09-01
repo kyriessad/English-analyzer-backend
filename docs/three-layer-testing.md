@@ -70,7 +70,7 @@ Invoke-RestMethod http://127.0.0.1:8082/health
 .\scripts\run-level7-wechat-e2e.ps1
 ```
 
-runner 使用运行时副本，不改源小程序；自动发现开发者工具 service port，并通过 `miniprogram-automator` 执行真实 `wx.login`、JWT、校验、卡片保存/编辑/同步重放、AI streaming、取消后重生、TTS、复习、401 恢复和退出登录。Harper SYSTEM_WARNING 使用明确标注的受控进程停止/恢复，不声称是真实断网。
+runner 使用运行时副本，不改源小程序；自动发现开发者工具 service port，并通过 `miniprogram-automator` 执行真实 `wx.login`、JWT、今日一句保存、发现素材认识/保存、添加页预填、Card/FSRS 复习、校验、卡片编辑/同步重放、AI streaming、取消后重生、TTS、401 恢复和退出登录。Harper SYSTEM_WARNING 使用明确标注的受控进程停止/恢复，不声称是真实断网。
 
 成功 artifact 还包含 `layer3-journeys.json`。可独立校验其证据契约：
 

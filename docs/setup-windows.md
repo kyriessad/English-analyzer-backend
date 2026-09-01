@@ -179,6 +179,16 @@ required `stardict.word`, `phonetic`, and `translation` fields exist, and that a
 known `hello` lookup has phonetic and translation data. Success prints
 `ECDICT READY`; failure prints `ECDICT SETUP FAILED` and exits non-zero.
 
+After ECDICT is ready, install the versioned public discovery corpus. This
+command is transactional and idempotent, so it is safe to repeat after a
+content-version update:
+
+    .\.venv\Scripts\python.exe scripts\seed_discovery_content.py --word-limit 500
+
+Success prints `DISCOVERY CONTENT READY` with five 500-word packs, six
+18-entry expression packs, and 365 daily quotes. Normal backend startup does
+not rerun this import.
+
 ## 8. Start and Verify the Backend
 
 For the first local start, use Uvicorn directly. It works without ngrok and is

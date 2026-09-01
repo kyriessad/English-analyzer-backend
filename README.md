@@ -12,6 +12,8 @@ with wx.login, analyzes English with local AI, and creates Piper WAV audio.
 - Local Argos English-to-Chinese translation and Ollama qwen3:8b examples
 - Lexical information and Piper pronunciation audio
 - Daily, new-card, and free review sessions with feedback and history
+- Public discovery packs and a fixed-timezone daily quote that become Cards
+  only after the user saves them through the existing add-card flow
 
 ## Architecture
 
@@ -58,6 +60,7 @@ english_analyzer.
     .\.venv\Scripts\python.exe scripts\check_config.py
     .\.venv\Scripts\python.exe scripts\check_database_target.py
     .\scripts\setup-ecdict.ps1
+    .\.venv\Scripts\python.exe scripts\seed_discovery_content.py --word-limit 500
     .\scripts\setup-local-ai.ps1
     .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 
@@ -108,6 +111,8 @@ scripts\release-upgrade.ps1.
 - [Troubleshooting](docs/troubleshooting.md): first-run failures and checks
 - [Release Runbook](docs/release-runbook.md): explicit release preflight and
   migration procedure
+- [Discovery Phase 1](docs/discovery-phase1.md): data boundary, import, APIs,
+  daily quote policy, and client flow
 - [E2E README](e2e/README.md): isolated real-dependency smoke test boundary
 
 ## Repository Structure

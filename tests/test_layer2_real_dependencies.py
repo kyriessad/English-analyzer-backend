@@ -20,7 +20,9 @@ from app.services.ecdict_service import (
     get_dictionary_entry,
     get_dictionary_translations,
     get_phonetic,
+    get_tagged_dictionary_entries,
 )
+from app.data.discovery_content import STATIC_ENTRIES, daily_quotes
 
 
 RUN_LAYER2 = os.environ.get("RUN_LAYER2") == "1"
@@ -56,6 +58,21 @@ def test_layer2_real_ecdict_exact_case_miss_phonetic_pos_translation_and_distrac
     assert len(distractors) >= 3
     assert all(item.word.lower() != "because" for item in distractors)
     assert all(item.meanings and item.meanings[0] not in lower.meanings for item in distractors)
+
+
+def test_layer2_real_ecdict_word_books_and_editorial_material_samples():
+    for tag in ("cet4", "cet6", "ky", "ielts", "toefl"):
+        entries = get_tagged_dictionary_entries(tag, limit=500)
+        assert len(entries) == 500
+        assert all(item.word and item.meanings for item in entries)
+
+    samples = [entries[0] for entries in STATIC_ENTRIES.values()]
+    quotes = daily_quotes()
+    samples.extend([quotes[0], quotes[182], quotes[-1]])
+    for english, _, card_type in samples:
+        result = validator.validate_english(english, requested_category=card_type)
+        assert result["level"] != "error", (english, result)
+        assert result["canSave"] is True
 
 
 @pytest.mark.parametrize(

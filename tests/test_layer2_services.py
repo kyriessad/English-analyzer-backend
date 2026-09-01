@@ -43,7 +43,7 @@ def test_LAYER2_001_real_dependency_profile_is_explicit():
     [
         "VAL-PASS-001",
         "VAL-CONTENT-001",
-        "VAL-ADVISORY-001",
+        "VAL-MISMATCH-001",
         "VAL-SYSTEM-001",
         "VAL-HARD-001",
     ],

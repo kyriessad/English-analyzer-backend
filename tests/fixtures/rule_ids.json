@@ -42,6 +42,10 @@
     {"rule_id": "REVIEW-001", "name": "review session/state/log snapshot determinism", "layers": [1, 2, 3]},
     {"rule_id": "REVIEW-002", "name": "stale question and answer-log snapshot", "layers": [1, 2, 3]},
     {"rule_id": "REVIEW-003", "name": "FSRS transition and transaction isolation", "layers": [1, 2, 3]},
-    {"rule_id": "E2E-001", "name": "Layer 3 evidence artifact capture", "layers": [3]}
+    {"rule_id": "E2E-001", "name": "Layer 3 evidence artifact capture", "layers": [3]},
+    {"rule_id": "DISC-001", "name": "public materials never become Cards before explicit save", "layers": [1, 2, 3]},
+    {"rule_id": "DISC-002", "name": "known state is idempotent and isolated per user", "layers": [1, 2, 3]},
+    {"rule_id": "DISC-003", "name": "want-to-remember prefills the existing Card flow", "layers": [1, 2, 3]},
+    {"rule_id": "QUOTE-001", "name": "fixed-timezone daily quote is pre-generated deterministic content", "layers": [1, 2, 3]}
   ]
 }

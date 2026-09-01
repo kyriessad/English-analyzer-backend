@@ -490,6 +490,27 @@ class E2EDatabase:
         if completed.returncode != 0:
             raise E2EFailure("Fresh E2E database creation/migration failed")
         self.created = True
+        seed_environment = os.environ.copy()
+        seed_environment.update({
+            "DATABASE_URL": self.target_dsn,
+            "EXPECTED_DATABASE_DIALECT": "postgresql",
+            "EXPECTED_DATABASE_NAME": DB_NAME,
+            "ALLOW_SQLITE_FOR_TESTS": "false",
+            "APP_ENV": "test",
+        })
+        seeded = subprocess.run(
+            [str(PYTHON), str(ROOT / "scripts" / "seed_discovery_content.py"), "--word-limit", "500"],
+            cwd=ROOT,
+            env=seed_environment,
+            capture_output=True,
+            text=True,
+            timeout=240,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        (self.run_dir / "discovery-seed.log").write_text(seeded.stdout + seeded.stderr, encoding="utf-8")
+        if seeded.returncode != 0:
+            raise E2EFailure("Fresh E2E discovery content import failed")
         with psycopg.connect(self.psycopg_dsn) as connection:
             identity = connection.execute(
                 "SELECT current_database(), current_schema(), version_num FROM alembic_version"

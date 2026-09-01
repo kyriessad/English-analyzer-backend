@@ -30,10 +30,13 @@ cd C:\Users\Administrator\WeChatProjects\English-analyzer-backend
 .\stop-server.ps1
 & .\.venv\Scripts\alembic.exe upgrade head
 if ($LASTEXITCODE -ne 0) { throw 'Alembic upgrade failed; do not start new code.' }
+& .\.venv\Scripts\python.exe scripts\seed_discovery_content.py --word-limit 500
+if ($LASTEXITCODE -ne 0) { throw 'Discovery content import failed; do not start new code.' }
 .\start-server.ps1
 ```
 
 `start-server.ps1` 只检查数据库 revision 与代码唯一 head 是否一致，不自动执行 migration；同时执行现有 PostgreSQL、Ollama/Qwen、Piper、FastAPI 和 health 检查。ngrok 默认开启；设置 `NGROK_ENABLED=false` 才使用本机/LAN 模式。
+正式自动发布优先使用 `scripts\release-upgrade.ps1`；它会在 revision 校验后执行同一个幂等素材导入。导入失败会终止发布，普通服务启动不会无条件重导 2973 条数据。
 
 ## 验证
 

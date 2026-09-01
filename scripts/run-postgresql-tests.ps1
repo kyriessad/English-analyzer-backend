@@ -38,6 +38,10 @@ try {
   $env:MAIL_PROVIDER = "development"
   $env:DEVELOPMENT_MAIL_LOG_PATH = $MailLog
   $env:PUBLIC_BASE_URL = "http://testserver"
+  & $Python scripts\seed_discovery_content.py --word-limit 500
+  if ($LASTEXITCODE -ne 0) {
+    throw "Discovery content import failed in isolated PostgreSQL."
+  }
   # Review V1 intentionally replaced the legacy four-grade Phase 2 contract.
   # Keep the obsolete suite out of the release gate instead of weakening V1 or
   # turning its expected failures into skips. V1 coverage lives in the two

@@ -48,6 +48,7 @@ class EcdictSchema:
     pos_column: str | None
     frq_column: str | None
     bnc_column: str | None
+    tag_column: str | None
 
 
 @dataclass(frozen=True)
@@ -97,6 +98,7 @@ def _resolve_schema() -> EcdictSchema | None:
                         pos_column=_optional_column(columns, "pos"),
                         frq_column=_optional_column(columns, "frq"),
                         bnc_column=_optional_column(columns, "bnc"),
+                        tag_column=_optional_column(columns, "tag"),
                     )
 
     return None
@@ -296,11 +298,12 @@ def get_dictionary_entry(text: str) -> EcdictEntry | None:
         word=str(values.get(schema.word_column) or normalized),
         translation=str(translation) if translation is not None else None,
         meanings=tuple(_translation_candidates(translation)),
-        pos=normalize_pos(
-            str(values.get(schema.pos_column) or "")
+        pos=(
+            normalize_pos(str(values.get(schema.pos_column) or ""))
             if schema.pos_column
-            else str(translation or "")
-        ),
+            else None
+        )
+        or normalize_pos(str(translation or "")),
         frq=_to_int(values.get(schema.frq_column)) if schema.frq_column else None,
         bnc=_to_int(values.get(schema.bnc_column)) if schema.bnc_column else None,
     )
@@ -403,6 +406,65 @@ def get_dictionary_distractor_entries(
         time.perf_counter() - started,
     )
     return tuple(entries)
+
+
+def get_tagged_dictionary_entries(tag: str, *, limit: int = 500) -> tuple[EcdictEntry, ...]:
+    """Return frequency-ordered single words for an ECDICT vocabulary tag.
+
+    The current ECDICT source uses whitespace-separated tags such as cet4,
+    cet6, ky, ielts, and toefl. Legacy three-column databases deliberately
+    return an empty result so the import command can ask for a safe rebuild.
+    """
+    schema = _resolve_schema()
+    normalized_tag = str(tag or "").strip().lower()
+    if schema is None or not schema.translation_column or not schema.tag_column or not normalized_tag:
+        return ()
+
+    columns = [schema.word_column, schema.translation_column]
+    for column in (schema.pos_column, schema.frq_column, schema.bnc_column):
+        if column and column not in columns:
+            columns.append(column)
+    select_sql = ", ".join(_quote_identifier(column) for column in columns)
+    quoted_table = _quote_identifier(schema.table_name)
+    quoted_tag = _quote_identifier(schema.tag_column)
+    order_parts = []
+    if schema.frq_column:
+        order_parts.append(f"coalesce({_quote_identifier(schema.frq_column)}, 999999999)")
+    if schema.bnc_column:
+        order_parts.append(f"coalesce({_quote_identifier(schema.bnc_column)}, 999999999)")
+    order_parts.append(f"lower({_quote_identifier(schema.word_column)})")
+    sql = (
+        f"SELECT {select_sql} FROM {quoted_table} "
+        f"WHERE instr(' ' || lower({quoted_tag}) || ' ', ?) > 0 "
+        f"ORDER BY {', '.join(order_parts)} LIMIT ?"
+    )
+    db_path = Path(settings.ecdict_db_path)
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+        rows = conn.execute(sql, (f" {normalized_tag} ", max(limit * 3, limit))).fetchall()
+
+    results: list[EcdictEntry] = []
+    seen: set[str] = set()
+    for row in rows:
+        values = dict(zip(columns, row, strict=False))
+        word = str(values.get(schema.word_column) or "").strip()
+        normalized_word = normalize_lexical_text(word)
+        if not re.fullmatch(r"[a-z]+(?:['-][a-z]+)*", normalized_word) or normalized_word in seen:
+            continue
+        meanings = tuple(_translation_candidates(values.get(schema.translation_column)))
+        if not meanings:
+            continue
+        seen.add(normalized_word)
+        results.append(EcdictEntry(
+            word=word,
+            translation=str(values.get(schema.translation_column) or ""),
+            meanings=meanings,
+            pos=normalize_pos(str(values.get(schema.pos_column) or "")) if schema.pos_column else None,
+            frq=_to_int(values.get(schema.frq_column)) if schema.frq_column else None,
+            bnc=_to_int(values.get(schema.bnc_column)) if schema.bnc_column else None,
+        ))
+        if len(results) >= limit:
+            break
+    return tuple(results)
 
 
 def _extract_word_tokens(text: str) -> list[str]:

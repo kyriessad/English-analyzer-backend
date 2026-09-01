@@ -948,16 +948,12 @@ async function runValidationUx(page, screenshots) {
   await input(page, '.textarea-english', 'This is a complete sentence.', 'validation_enter_category_mismatch');
   const categoryState = await waitForValidation(
     page,
-    'validation category mismatch',
-    (state) => state.status === 'warning' && hasValidationIssue(state, 'category_mismatch'),
+    'validation category auto switch',
+    (state) => state.category === '句子'
+      && !hasValidationIssue(state, 'category_mismatch')
+      && ['pass', 'warning'].includes(state.status),
   );
-  await tap(page, ['.validation-action'], 'validation_switch_to_sentence');
-  const switchedSentence = await waitForValidation(
-    page,
-    'category switched to sentence',
-    (state) => state.category === '句子' && !hasValidationIssue(state, 'category_mismatch') && ['pass', 'warning'].includes(state.status),
-  );
-  evidence.category_action = { before: categoryState, after: switchedSentence };
+  evidence.category_action = { auto_switched: true, after: categoryState };
 
   await input(page, '.textarea-english', 'I goed there yesterday.', 'validation_enter_grammar_warning');
   evidence.grammar_warning = await waitForValidation(
@@ -966,46 +962,38 @@ async function runValidationUx(page, screenshots) {
     (state) => state.status === 'warning' && hasValidationIssue(state, 'grammar'),
   );
 
-  await input(page, '.textarea-english', 'Really???', 'validation_enter_punctuation_warning');
+  await input(page, '.textarea-english', 'Really?!', 'validation_enter_allowed_punctuation');
   const punctuationState = await waitForValidation(
     page,
-    'validation punctuation warning',
-    (state) => state.status === 'warning' && hasValidationIssue(state, 'punctuation') && state.visibleIssues.length > 0,
+    'validation allowed punctuation',
+    (state) => state.status === 'pass' && state.issues.length === 0 && state.visibleIssues.length === 0,
   );
-  const punctuationAutoHidden = await waitForValidation(
-    page,
-    'light punctuation warning auto hidden',
-    (state) => state.status === 'warning' && state.visibleIssues.length === 0,
-    10000,
-  );
-  evidence.punctuation_auto_hide = { before: punctuationState, after: punctuationAutoHidden };
+  evidence.punctuation_allowed = punctuationState;
 
   if (punctuationState.canAnalyze !== true || punctuationState.canPronounce !== true) {
-    throw new Error(`ADVISORY_WARNING capabilities were not allowed: ${JSON.stringify(punctuationState)}`);
+    throw new Error(`Allowed punctuation capabilities were not available: ${JSON.stringify(punctuationState)}`);
   }
   const advisoryAiLogStart = consoleEvents.length;
-  await tap(page, ['.ai-analyze-btn'], 'validation_advisory_warning_tap_ai');
-  await waitUntil('ADVISORY_WARNING AI request started', async () => {
+  await tap(page, ['.ai-analyze-btn'], 'validation_allowed_punctuation_tap_ai');
+  await waitUntil('allowed punctuation AI request started', async () => {
     return countAiRequestSince(advisoryAiLogStart) > 0 || Boolean(await page.data('isAnalyzing'));
   }, 30000, 100);
-  await waitUntil('ADVISORY_WARNING AI completed', async () => {
+  await waitUntil('allowed punctuation AI completed', async () => {
     return !Boolean(await page.data('isAnalyzing')) && countAiRequestSince(advisoryAiLogStart) > 0;
   }, 180000, 150);
-  evidence.advisory_warning_allowed = {
+  evidence.allowed_punctuation_ai = {
     request_events: countAiRequestSince(advisoryAiLogStart),
     state: await validationSnapshot(page),
   };
 
   await input(page, '.textarea-english', 'because', 'validation_prepare_word_category');
-  await waitForValidation(
+  evidence.word_category_auto_switch = await waitForValidation(
     page,
-    'word mismatch while sentence selected',
-    (state) => state.status === 'warning' && hasValidationIssue(state, 'category_mismatch'),
+    'word category auto switch',
+    (state) => state.category === '单词' && state.status === 'pass' && !hasValidationIssue(state, 'category_mismatch'),
   );
-  await tap(page, ['.validation-action'], 'validation_switch_to_word');
-  await waitForValidation(page, 'category switched to word', (state) => state.category === '单词' && state.status === 'pass');
 
-  const longMultipleWarning = Array(9).fill('This is a useful sentence.').join(' ') + '???';
+  const longMultipleWarning = Array(9).fill('I goed there yesterday.').join(' ');
   await input(page, '.textarea-english', longMultipleWarning, 'validation_enter_multiple_warnings');
   const multipleState = await waitForValidation(
     page,
@@ -1278,6 +1266,118 @@ async function runPrepare() {
   return { status: 'PASS', runtime };
 }
 
+async function answerCurrentReviewCard(page, label) {
+  const card = await page.data('currentCard');
+  if (!card || !Array.isArray(card.options)) throw new Error(`${label}: review card/options missing`);
+  const optionIndex = card.options.findIndex((option) => option.text === card.myUnderstanding);
+  if (optionIndex < 0) throw new Error(`${label}: correct option not identifiable: ${JSON.stringify(card)}`);
+  const options = await page.$$('.mcq-option');
+  if (!options[optionIndex]) throw new Error(`${label}: rendered option missing at ${optionIndex}`);
+  const previousCardId = String(card.cardId || card.id || '');
+  await options[optionIndex].tap();
+  step(label, { content: card.englishText, option_index: optionIndex });
+  await waitUntil(`${label} feedback`, async () => {
+    const current = await currentPageSafe(`${label}:feedback`);
+    if (!current || normalizePagePath(current.path) !== 'pages/review/review') return false;
+    const submitting = Boolean(await current.data('submittingFeedback'));
+    const state = String(await current.data('pageState') || '');
+    const next = await current.data('currentCard');
+    const changed = state === 'completed' || !next || String(next.cardId || next.id || '') !== previousCardId;
+    return !submitting && changed ? { state, next } : false;
+  }, 45000, 100);
+  return card;
+}
+
+async function runDiscoveryAndQuoteJourneys(page, screenshots) {
+  const quote = await waitUntil('today quote loaded', async () => {
+    const item = await page.data('todayQuote');
+    return item && item.content && item.chinese ? item : false;
+  }, 45000, 150);
+  await tap(page, ['#today-quote-remember'], 'today_quote_want_to_remember');
+  page = await waitForPage('pages/add/add', 30000);
+  const quotePrefill = await waitUntil('today quote add prefill', async () => {
+    const form = await page.data('form');
+    return form && form.englishText === quote.content && form.myUnderstanding === quote.chinese
+      && form.whereEncountered === '今日一句' ? form : false;
+  }, 20000);
+  screenshots.push(await screenshot('01a-today-quote-prefill'));
+  await tap(page, ['.primary-btn.submit-btn'], 'today_quote_save_card');
+  page = await waitForPage('pages/index/index', 45000);
+  await waitUntil('today quote card on home', async () => {
+    const cards = await page.data('cards');
+    return Array.isArray(cards) && cards.some((card) => card && card.englishText === quote.content);
+  }, 45000);
+
+  await tap(page, ['#discover-entry'], 'open_discovery');
+  page = await waitForPage('pages/discover/index', 30000);
+  const firstItems = await waitUntil('discovery items loaded', async () => {
+    const items = await page.data('items');
+    return Array.isArray(items) && items.length >= 2 ? items : false;
+  }, 45000, 150);
+  const knownItem = firstItems[0];
+  const wantedItem = firstItems[1];
+  const knownButtons = await page.$$('.known-btn');
+  if (!knownButtons[0]) throw new Error('Discovery known button missing');
+  await knownButtons[0].tap();
+  await waitUntil('known material removed', async () => {
+    const items = await page.data('items');
+    return Array.isArray(items) && !items.some((item) => String(item.id) === String(knownItem.id));
+  }, 30000);
+  step('discovery_mark_known', { item_id: knownItem.id, content: knownItem.content });
+
+  const currentItems = await page.data('items');
+  const wantedIndex = currentItems.findIndex((item) => String(item.id) === String(wantedItem.id));
+  if (wantedIndex < 0) throw new Error('Discovery wanted item disappeared unexpectedly');
+  const rememberButtons = await page.$$('.remember-btn');
+  if (!rememberButtons[wantedIndex]) throw new Error('Discovery remember button missing');
+  await rememberButtons[wantedIndex].tap();
+  page = await waitForPage('pages/add/add', 30000);
+  const materialPrefill = await waitUntil('discovery add prefill', async () => {
+    const form = await page.data('form');
+    return form && form.englishText === wantedItem.content && form.myUnderstanding === wantedItem.chinese
+      && String(form.whereEncountered || '').startsWith('发现素材 · ') ? form : false;
+  }, 20000);
+  screenshots.push(await screenshot('01b-discovery-prefill'));
+  await tap(page, ['.primary-btn.submit-btn'], 'discovery_save_card');
+  // The existing add page correctly returns to its immediate caller. For a
+  // discovery-origin card that caller is the discovery page, so the journey
+  // must explicitly return one more level before checking the home library.
+  page = await waitForPage('pages/discover/index', 45000);
+  page = await navigateBackTo('pages/index/index', 30000);
+  await waitUntil('discovery card on home', async () => {
+    const cards = await page.data('cards');
+    return Array.isArray(cards) && cards.some((card) => card && card.englishText === wantedItem.content);
+  }, 45000);
+  screenshots.push(await screenshot('01c-discovery-cards-saved'));
+
+  await tap(page, ['.review-main-btn'], 'discovery_open_review');
+  page = await waitForPage('pages/review/review', 45000);
+  await waitUntil('discovery review active', async () => (await page.data('pageState')) === 'active', 45000);
+  const reviewed = [];
+  for (let index = 0; index < 6; index += 1) {
+    const state = String(await page.data('pageState') || '');
+    if (state === 'completed') break;
+    reviewed.push(await answerCurrentReviewCard(page, `discovery_review_answer_${index + 1}`));
+  }
+  if (!reviewed.some((card) => card.englishText === quote.content)) {
+    throw new Error('Today quote card did not enter the real review/FSRS journey');
+  }
+  if (!reviewed.some((card) => card.englishText === wantedItem.content)) {
+    throw new Error('Discovery material card did not enter the real review/FSRS journey');
+  }
+  screenshots.push(await screenshot('01d-discovery-review-complete'));
+  page = await safeReLaunch('pages/index/index', 60000);
+  await waitForPage('pages/index/index', 30000);
+  return {
+    page,
+    evidence: {
+      quote: { id: quote.id, content: quote.content, prefill: quotePrefill, reviewed: true },
+      material: { id: wantedItem.id, content: wantedItem.content, prefill: materialPrefill, reviewed: true },
+      known: { id: knownItem.id, content: knownItem.content, removed_from_feed: true },
+    },
+  };
+}
+
 async function runCore() {
   const runtime = await launchCore();
   const screenshots = [];
@@ -1297,6 +1397,9 @@ async function runCore() {
   }, 30000);
   screenshots.push(await screenshot('01-home-authenticated'));
   step('real_auth_ready', authState);
+
+  const discoveryResult = await runDiscoveryAndQuoteJourneys(page, screenshots);
+  page = discoveryResult.page;
 
   const initialAuthEvidence = {
     wx_login_start: countConsoleSince(authLogStart, /wx_login_start/),
@@ -1334,30 +1437,40 @@ async function runCore() {
   }, 45000);
   screenshots.push(await screenshot('02-card-created'));
 
-  await waitUntil('initial background analysis settlement', async () => {
-    const cards = await miniProgram.evaluate(function () { return wx.getStorageSync('cardsCache'); });
-    const card = Array.isArray(cards) ? cards.find((item) => item && item.englishText === 'becuase') : null;
-    if (!card) return false;
-    return card.analysisStatus === 'done' || card.analysisStatus === 'failed' ? card : false;
-  }, 180000, 500);
+  // `becuase` is intentionally a CONTENT_WARNING sample. The current product
+  // saves it but does not start background AI, so waiting for a local AI
+  // settlement would test a retired behavior. The durable Card has already
+  // been proved above; capture the client state and continue to sync replay.
+  const initialCards = await page.data('cards');
+  const initialCard = Array.isArray(initialCards)
+    ? initialCards.find((item) => item && item.englishText === 'becuase')
+    : null;
+  if (!initialCard) throw new Error('Created CONTENT_WARNING card disappeared from home state');
+  step('initial_content_warning_card_ready', {
+    analysis_status: initialCard.analysisStatus || '',
+    sync_status: initialCard.backend_sync_status || initialCard.syncStatus || '',
+  });
 
   // E2E-only setup for a real client sync replay: recreate the durable local
   // state left by an interrupted create after the backend has already committed.
   // The replay itself is triggered by leaving and returning to the real Home UI.
   const syncReplaySetup = await miniProgram.evaluate(function () {
-    const cards = wx.getStorageSync('cardsCache');
-    if (!Array.isArray(cards)) return { prepared: false, reason: 'cardsCache missing' };
+    const userId = String(wx.getStorageSync('backendUserId') || '').trim();
+    const storageKey = userId ? `cardsCache:user:${userId}` : 'cardsCache:anonymous';
+    const cards = wx.getStorageSync(storageKey);
+    if (!Array.isArray(cards)) return { prepared: false, reason: 'scoped cardsCache missing', storageKey };
     const index = cards.findIndex(function (card) { return card && card.englishText === 'becuase'; });
     if (index < 0) return { prepared: false, reason: 'created card missing' };
     cards[index].backend_sync_status = 'pending';
     cards[index].backend_card_id = '';
     cards[index].backend_synced_at = '';
     cards[index].backend_sync_error = 'level7_e2e_interrupted_create';
-    wx.setStorageSync('cardsCache', cards);
+    wx.setStorageSync(storageKey, cards);
     return {
       prepared: true,
       hasLocalTempId: Boolean(cards[index].local_temp_id),
       content: cards[index].englishText,
+      storageKey,
     };
   });
   if (!syncReplaySetup || !syncReplaySetup.prepared || !syncReplaySetup.hasLocalTempId) {
@@ -1482,17 +1595,17 @@ async function runCore() {
   }
 
   await waitUntil('TTS control ready', async () => {
-    const text = String((await page.data('editPronunciationText')) || '');
-    const loading = Boolean(await page.data('editPhoneticLoading'));
+    const text = String((await page.data('pronunciationText')) || '');
+    const loading = Boolean(await page.data('lexicalInfoLoading'));
     return text === 'ineffable' && !loading;
   }, 30000);
   const ttsLogStart = consoleEvents.length;
-  await tap(page, ['.edit-pronunciation-btn'], 'tap_tts');
+  await tap(page, ['.original-pronunciation-btn'], 'tap_tts');
   let sawTtsLoading = false;
   let sawTtsPlaying = false;
   await waitUntil('TTS client completion', async () => {
-    const loading = Boolean(await page.data('editPronunciationLoading'));
-    const playing = Boolean(await page.data('editPronunciationPlaying'));
+    const loading = Boolean(await page.data('pronunciationLoading'));
+    const playing = Boolean(await page.data('pronunciationPlaying'));
     if (loading) sawTtsLoading = true;
     if (playing) sawTtsPlaying = true;
     return sawTtsLoading && !loading ? { loading, playing } : false;
@@ -1500,7 +1613,7 @@ async function runCore() {
   if (!sawTtsPlaying) {
     try {
       await waitUntil('InnerAudioContext onPlay', async () => {
-        sawTtsPlaying = Boolean(await page.data('editPronunciationPlaying'));
+        sawTtsPlaying = Boolean(await page.data('pronunciationPlaying'));
         return sawTtsPlaying;
       }, 5000, 100);
     } catch (_) {
@@ -1519,10 +1632,10 @@ async function runCore() {
 
   await input(page, '.textarea-english', '我的', 'validation_enter_invalid_for_tts');
   const invalidTtsState = await waitForValidation(page, 'TTS INVALID', (state) => state.status === 'invalid');
-  await waitUntil('invalid TTS control settled', async () => !Boolean(await page.data('editPhoneticLoading')), 30000, 100);
+  await waitUntil('invalid TTS control settled', async () => !Boolean(await page.data('lexicalInfoLoading')), 30000, 100);
   const invalidTtsLogStart = consoleEvents.length;
-  await tap(page, ['.edit-pronunciation-btn'], 'validation_invalid_tts_tap');
-  const invalidTtsRequests = countConsoleSince(invalidTtsLogStart, /edit_button_clicked|"event":"download_start"/);
+  await tap(page, ['.original-pronunciation-btn'], 'validation_invalid_tts_tap');
+  const invalidTtsRequests = countConsoleSince(invalidTtsLogStart, /button_clicked|"event":"download_start"/);
   if (invalidTtsRequests !== 0) {
     throw new Error(`INVALID reached TTS: request_events=${invalidTtsRequests}`);
   }
@@ -1545,10 +1658,10 @@ async function runCore() {
     (state) => state.status === 'warning' && state.canPronounce === false,
   );
   const contentWarningTtsLogStart = consoleEvents.length;
-  await tap(page, ['.edit-pronunciation-btn'], 'validation_content_warning_tts_tap');
+  await tap(page, ['.original-pronunciation-btn'], 'validation_content_warning_tts_tap');
   const contentWarningTtsRequests = countConsoleSince(
     contentWarningTtsLogStart,
-    /edit_button_clicked|"event":"download_start"/,
+    /button_clicked|"event":"download_start"/,
   );
   if (contentWarningTtsRequests !== 0) {
     throw new Error(`CONTENT_WARNING reached TTS: request_events=${contentWarningTtsRequests}`);
@@ -1616,6 +1729,7 @@ async function runCore() {
     validation: validationEvidence,
     tts: ttsEvidence,
     review: { submitted: true },
+    discovery: discoveryResult.evidence,
     screenshots,
     console_event_count: consoleEvents.length,
     exception_event_count: exceptionEvents.length,

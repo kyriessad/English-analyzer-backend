@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from contextlib import closing
 import os
 import sqlite3
 import sys
@@ -17,14 +18,14 @@ UPSTREAM_CSV_URL = (
     "https://raw.githubusercontent.com/skywind3000/ECDICT/"
     f"{UPSTREAM_COMMIT}/ecdict.csv"
 )
-REQUIRED_COLUMNS = {"word", "phonetic", "translation"}
+REQUIRED_COLUMNS = {"word", "phonetic", "translation", "tag", "frq", "bnc", "pos"}
 
 
 def validate_database(path: Path) -> tuple[bool, str]:
     if not path.is_file():
         return False, f"database does not exist: {path}"
     try:
-        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as connection:
             columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(stardict)")
             }
@@ -56,7 +57,7 @@ def build_database(csv_path: Path, database_path: Path) -> int:
         reader = csv.DictReader(source)
         if not reader.fieldnames or not REQUIRED_COLUMNS.issubset(reader.fieldnames):
             raise RuntimeError("upstream CSV does not contain word, phonetic, and translation columns")
-        with sqlite3.connect(database_path) as connection:
+        with closing(sqlite3.connect(database_path)) as connection:
             connection.executescript(
                 """
                 CREATE TABLE stardict (
@@ -100,6 +101,7 @@ def build_database(csv_path: Path, database_path: Path) -> int:
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows
                 )
                 total += len(rows)
+            connection.commit()
     return total
 
 

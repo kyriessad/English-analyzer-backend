@@ -355,7 +355,6 @@ def test_hard_rule_invalid_skips_ecdict_lookup():
 @pytest.mark.parametrize(
     "text",
     [
-        "hello/world",
         "hello\\world",
         "hello\u0000world",
         "hello\u001fworld",

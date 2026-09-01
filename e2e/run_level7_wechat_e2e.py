@@ -551,6 +551,9 @@ def _final_database_audit(runner: Level7Runner) -> dict[str, Any]:
         usage = connection.execute(
             "SELECT user_id, resource, count FROM resource_usage ORDER BY resource"
         ).fetchall()
+        material_states = connection.execute(
+            "SELECT user_id, material_item_id, state FROM user_material_states"
+        ).fetchall()
 
     audit = {
         "snapshot": snapshot,
@@ -641,6 +644,10 @@ def _final_database_audit(runner: Level7Runner) -> dict[str, Any]:
             {"user_id": str(row[0]), "resource": row[1], "count": int(row[2])}
             for row in usage
         ],
+        "user_material_states": [
+            {"user_id": str(row[0]), "material_item_id": str(row[1]), "state": row[2]}
+            for row in material_states
+        ],
     }
 
     usage_map = {item["resource"]: item["count"] for item in audit["resource_usage"]}
@@ -657,19 +664,24 @@ def _final_database_audit(runner: Level7Runner) -> dict[str, Any]:
     )
     checks = {
         "exactly_one_real_user": len(users) == 1 and bool(users[0][1]),
-        "exactly_one_card": len(cards) == 1,
-        "card_content_correct": len(cards) == 1 and cards[0][2] == "ineffable",
-        "card_understanding_correct": len(cards) == 1 and cards[0][3] == "美好得难以言喻",
-        "card_source_correct": len(cards) == 1 and cards[0][5] == "Level 7 edited through UI",
-        "card_not_deleted": len(cards) == 1 and cards[0][12] is None,
-        "card_analysis_committed": len(cards) == 1 and cards[0][6] == "done",
+        "exactly_three_cards": len(cards) == 3,
+        "card_content_correct": any(row[2] == "ineffable" for row in cards),
+        "card_understanding_correct": any(row[2] == "ineffable" and row[3] == "美好得难以言喻" for row in cards),
+        "card_source_correct": (
+            any(row[5] == "Level 7 edited through UI" for row in cards)
+            and any(row[5] == "今日一句" for row in cards)
+            and any(str(row[5] or "").startswith("发现素材 · ") for row in cards)
+        ),
+        "card_not_deleted": len(cards) == 3 and all(row[12] is None for row in cards),
+        "card_analysis_committed": any(row[2] == "ineffable" and row[6] == "done" for row in cards),
         "no_duplicate_or_half_transaction": all(int(value or 0) == 0 for value in violations.values()),
-        "sync_replay_no_duplicate": len(cards) == 1 and int(violations.get("duplicate_card_local_ids") or 0) == 0,
-        "review_log_committed_once": review_entries == 1 and len(review_actions) == 1,
-        "review_state_consistent": len(items) == 1 and bool(items[0][4]) and review_entries == 1,
+        "sync_replay_no_duplicate": len(cards) == 3 and int(violations.get("duplicate_card_local_ids") or 0) == 0,
+        "review_log_committed_once": review_entries == 3 and len(review_actions) == 3,
+        "review_state_consistent": len(items) == 3 and all(bool(row[4]) for row in items) and review_entries == 3,
         "review_snapshot_complete": snapshots_ok,
-        "ai_quota_correct": usage_map.get("ai") == 3,
+        "ai_quota_correct": usage_map.get("ai") == 5,
         "tts_quota_correct": usage_map.get("tts") == 1,
+        "known_material_state_committed_once": len(material_states) == 1 and material_states[0][2] == "known",
         "user_ownership_correct": ownership_ok,
     }
     audit["checks"] = checks
@@ -684,6 +696,9 @@ def _http_evidence(log_path: Path) -> dict[str, Any]:
         "/api/auth/me",
         "/api/auth/logout",
         "/api/cards",
+        "/api/discovery/packs",
+        "/api/discovery/items",
+        "/api/discovery/today-quote",
         "/api/analyze-english",
         "/api/analyze-english/stream",
         "/api/pronunciation/audio",
@@ -744,6 +759,7 @@ def _build_acceptance(
     validation = (core or {}).get("validation") or {}
     system_state = (system_validation or {}).get("validation") or {}
     card = (core or {}).get("card") or {}
+    discovery = (core or {}).get("discovery") or {}
     recovery_evidence = (recovery or {}).get("recovery") or {}
     resource_gauge_names = tuple(name for name in GAUGE_NAMES if name != "http_requests_in_progress")
     gauges_ok = bool(final_gauges) and all(
@@ -763,6 +779,8 @@ def _build_acceptance(
         "piper": "REAL PASS" if piper and piper.get("valid_wav_count", 0) >= 1 else "REAL FAIL",
         "tts_client_flow": "PASS" if core_ok and tts.get("playing_observed") and tts.get("console_errors") == 0 and piper else "FAIL",
         "review_ui_flow": "PASS" if core_ok and database and database.get("checks", {}).get("review_log_committed_once") else "FAIL",
+        "discovery_ui_flow": "PASS" if core_ok and (discovery.get("material") or {}).get("reviewed") and (discovery.get("known") or {}).get("removed_from_feed") and database and database.get("checks", {}).get("known_material_state_committed_once") else "FAIL",
+        "today_quote_ui_flow": "PASS" if core_ok and (discovery.get("quote") or {}).get("reviewed") and database and database.get("checks", {}).get("card_source_correct") else "FAIL",
         "logout": "PASS" if recovery_ok and (recovery.get("logout") or {}).get("token_cleared") else "FAIL",
         "401_relogin": "PASS" if recovery_ok and recovery.get("backend_request_401_count", 0) >= 1 and recovery_evidence.get("wx_login_start", 0) >= 1 and recovery_evidence.get("protected_200_after_refresh", 0) >= 1 else "FAIL",
         "postgresql_final_state": "PASS" if database and database.get("status") == "PASS" else "FAIL",
@@ -801,6 +819,8 @@ def _render_report(result: dict[str, Any]) -> str:
         ("piper", "Piper"),
         ("tts_client_flow", "TTS client flow"),
         ("review_ui_flow", "Review UI flow"),
+        ("discovery_ui_flow", "Discovery material flow"),
+        ("today_quote_ui_flow", "Today quote flow"),
         ("logout", "logout"),
         ("401_relogin", "401 relogin"),
         ("postgresql_final_state", "PostgreSQL final state"),
@@ -868,7 +888,7 @@ def _layer3_artifact(result: dict[str, Any], run_dir: Path) -> dict[str, Any]:
     specs = (
         ("L3-VALIDATION-PASS", "VAL-PASS-001", "validation", "validation_ux"),
         ("L3-VALIDATION-CONTENT", "VAL-CONTENT-001", "validation", "validation_ux"),
-        ("L3-VALIDATION-ADVISORY", "VAL-ADVISORY-001", "validation", "validation_ux"),
+        ("L3-PUNCTUATION-ALLOWED", "VAL-PUNCTUATION-001", "validation", "validation_ux"),
         ("L3-VALIDATION-SYSTEM", "VAL-SYSTEM-001", "validation", "validation_ux"),
         ("L3-VALIDATION-ERROR", "VAL-HARD-001", "validation", "validation_ux"),
         ("L3-CARD-WARNING-SAVE", "VAL-CONTENT-001", "card-create-edit", "card_ui_flow"),
@@ -877,6 +897,8 @@ def _layer3_artifact(result: dict[str, Any], run_dir: Path) -> dict[str, Any]:
         ("L3-PRONUNCIATION-KNOWN", "VAL-PASS-001", "pronunciation", "tts_client_flow"),
         ("L3-PRONUNCIATION-CONTENT-BLOCK", "VAL-CONTENT-001", "pronunciation", "validation_ux"),
         ("L3-REVIEW-FIXTURE", "VAL-PASS-001", "review", "review_ui_flow"),
+        ("L3-DISCOVERY-SAVE-REVIEW", "VAL-PASS-001", "discovery", "discovery_ui_flow"),
+        ("L3-TODAY-QUOTE-SAVE-REVIEW", "VAL-PASS-001", "today-quote", "today_quote_ui_flow"),
         ("L3-AUTH-RECOVERY-LOGOUT", "VAL-PASS-001", "auth", "401_relogin"),
         ("L3-SYNC-REPLAY", "VAL-PASS-001", "sync", "sync"),
         ("L3-FULL-SMOKE", "VAL-PASS-001", "full-smoke", "wechat_devtools_automation"),

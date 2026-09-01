@@ -35,6 +35,7 @@ from app.database import (
 from app.models.user import User
 from app.routers.auth import router as auth_router
 from app.routers.cards import router as cards_router
+from app.routers.discovery import router as discovery_router
 from app.routers.language import router as language_router
 from app.routers.reviews import review_sessions_router, router as reviews_router
 from app.schemas import (
@@ -461,6 +462,7 @@ async def db_pool_timeout_handler(
 
 app.include_router(auth_router)
 app.include_router(cards_router)
+app.include_router(discovery_router)
 app.include_router(reviews_router)
 app.include_router(review_sessions_router)
 app.include_router(language_router)
