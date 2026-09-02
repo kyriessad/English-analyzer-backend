@@ -9,9 +9,14 @@ PACKS = (
     ("daily-life", "日常表达", "吃饭、聊天和日常安排中的自然表达", "expression", 60),
     ("workplace", "职场英语", "会议、协作和沟通中的实用表达", "expression", 70),
     ("travel", "旅行英语", "出行、住宿、问路和应急表达", "expression", 80),
-    ("natural-spoken", "自然口语", "让表达更像真实对话", "expression", 90),
-    ("common-phrases", "常见短语", "高频、实用、适合做卡片的短语", "expression", 100),
-    ("useful-sentences", "实用短句", "可以直接放进生活里的完整句子", "expression", 110),
+    ("film-tv", "影视英语", "观看、讨论影视内容时的常用表达", "expression", 90),
+    ("natural-spoken", "自然口语", "让表达更像真实对话", "expression", 100),
+    ("common-phrases", "常见短语", "高频、实用、适合做卡片的短语", "expression", 110),
+    ("useful-sentences", "实用短句", "可以直接放进生活里的完整句子", "expression", 120),
+    ("social-communication", "社交交流", "问候、邀请、致谢和人际沟通表达", "expression", 130),
+    ("campus-study", "校园 / 学习", "课堂、学习和校园生活中的常用表达", "expression", 140),
+    ("dining-shopping", "餐饮购物", "点餐、付款和购物时的实用表达", "expression", 150),
+    ("internet-social-media", "互联网 / 社交媒体", "网络服务和社交媒体中的常用表达", "expression", 160),
     ("daily-quote", "今日一句", "预先生成并审核的每日英文句子", "daily_quote", 999),
 )
 

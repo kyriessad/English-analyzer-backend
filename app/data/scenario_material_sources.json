@@ -1,0 +1,87 @@
+{
+  "production_batch": "scenario-materials-2026.09.v2",
+  "target_per_pack": 1000,
+  "packs": [
+    "daily-life",
+    "workplace",
+    "travel",
+    "film-tv",
+    "natural-spoken",
+    "common-phrases",
+    "useful-sentences",
+    "social-communication",
+    "campus-study",
+    "dining-shopping",
+    "internet-social-media"
+  ],
+  "source": {
+    "id": "tatoeba-cmn-eng-manythings-2026-02-13",
+    "name": "Tatoeba English-Mandarin Chinese sentence pairs selected by ManyThings",
+    "url": "https://www.manythings.org/anki/cmn-eng.zip",
+    "archive_member": "cmn.txt",
+    "revision": "2026-02-13",
+    "sha256": "d606361aa7312dcdfb15ef4fc51cb1e7ed8bc2dc608a7b192626cd36e8403106",
+    "license": "CC BY 2.0 FR",
+    "attribution": "Tatoeba contributors; distribution and selection by www.manythings.org/anki",
+    "nature": "Selected English-Mandarin sentence pairs from identified native speakers and proofread English sentences; not a frequency corpus"
+  },
+  "english_cc0_source": {
+    "id": "tatoeba-eng-cc0-2026-08-29",
+    "name": "Tatoeba English CC0 sentence export",
+    "url": "https://downloads.tatoeba.org/exports/per_language/eng/eng_sentences_CC0.tsv.bz2",
+    "revision": "2026-08-29",
+    "sha256": "489556f5ed662d97f1350ef81aa4b0fc430ea32c0c98853020666b055ee4b40c",
+    "license": "CC0 1.0",
+    "translation_provider": "tencent-tmt",
+    "max_translated_items": 1879
+  },
+  "supplement_sources": [
+    {
+      "id": "dstc8-schema-guided-dialogue-master",
+      "prefix": "sgd",
+      "name": "Google Schema-Guided Dialogue Dataset",
+      "url": "https://codeload.github.com/google-research-datasets/dstc8-schema-guided-dialogue/zip/refs/heads/master",
+      "filename": "schema-guided-dialogue-master.zip",
+      "revision": "master snapshot 2026-09-03",
+      "sha256": "43b186e5af76061846ad24524ffa98a1010b237cefd90c968a90223a52cb06a7",
+      "license": "CC BY-SA 4.0",
+      "source_value": "schema-guided-dialogue-ai-translation",
+      "translation_provider": "tencent-tmt"
+    },
+    {
+      "id": "asapp-abcd-v1.1",
+      "prefix": "abcd",
+      "name": "Action-Based Conversations Dataset v1.1",
+      "url": "https://raw.githubusercontent.com/asappresearch/abcd/master/data/abcd_v1.1.json.gz",
+      "filename": "abcd_v1.1.json.gz",
+      "revision": "v1.1",
+      "sha256": "2bdf53ac359543dcdc38d55bc6513e78df120363f8f44870716e909f4606de15",
+      "license": "MIT",
+      "source_value": "abcd-ai-translation",
+      "translation_provider": "tencent-tmt"
+    },
+    {
+      "id": "uci-clinc150-570",
+      "prefix": "clinc150",
+      "name": "CLINC150",
+      "url": "https://archive.ics.uci.edu/static/public/570/clinc150.zip",
+      "filename": "clinc150.zip",
+      "revision": "UCI dataset 570 snapshot 2026-09-03",
+      "sha256": "0d8ecc3e1edd7b25cabde0177544ce536ddf773844bc80ef1a75f36e7f030ea2",
+      "license": "CC BY 4.0",
+      "source_value": "clinc150-ai-translation",
+      "translation_provider": "tencent-tmt"
+    }
+  ],
+  "ai_review": {
+    "model": "qwen3:8b",
+    "prompt_version": "scenario-review-v1",
+    "items_per_pack": 5,
+    "batch_size": 1
+  },
+  "chinese_review": {
+    "model": "qwen3:8b",
+    "prompt_version": "scenario-chinese-review-v3",
+    "batch_size": 40
+  }
+}

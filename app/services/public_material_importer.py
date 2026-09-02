@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from uuid import UUID, uuid5
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.models.discovery import PublicMaterialItem, PublicMaterialPack
@@ -109,10 +109,24 @@ def import_public_materials(
         if pack is None:
             raise ValueError(f"pack definition missing: {pack_code}")
 
-        db.execute(update(PublicMaterialItem).where(PublicMaterialItem.pack_id == pack.id).values(
-            position=PublicMaterialItem.position + 1_000_000,
-            status="hidden",
+        max_position = db.scalar(select(func.max(PublicMaterialItem.position)).where(
+            PublicMaterialItem.pack_id == pack.id
         ))
+        if max_position is not None:
+            temporary_base = max(int(max_position), len(item_specs))
+            ranked_items = select(
+                PublicMaterialItem.id.label("item_id"),
+                (
+                    temporary_base
+                    + func.row_number().over(order_by=(PublicMaterialItem.position, PublicMaterialItem.id))
+                ).label("temporary_position"),
+            ).where(PublicMaterialItem.pack_id == pack.id).cte("ranked_public_material_items")
+            db.execute(update(PublicMaterialItem).where(
+                PublicMaterialItem.id == ranked_items.c.item_id
+            ).values(
+                position=ranked_items.c.temporary_position,
+                status="hidden",
+            ))
 
         seen_normalized: set[str] = set()
         active_ids: set[UUID] = set()

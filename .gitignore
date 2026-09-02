@@ -50,6 +50,8 @@ fault-experiments/*.toc.list
 data/ecdict/
 data/piper/
 data/audio-cache/
+data/exam-wordbook-cache/
+data/scenario-material-cache/
 
 # Local Node dependencies for E2E client
 node_modules/

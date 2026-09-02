@@ -12,6 +12,7 @@ PyJWT
 sqlalchemy>=2.0
 alembic>=1.13
 psycopg[binary]>=3.1,<4
+pypdf>=5,<7
 tzdata>=2024.1
 piper-tts==1.4.2
 prometheus-client>=0.20,<1

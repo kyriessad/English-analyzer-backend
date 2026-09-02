@@ -167,6 +167,7 @@ def test_postgresql_public_material_importer_is_idempotent_and_persists_trace_fi
             assert import_public_materials(db, packs=[pack], items_by_pack={pack_code: initial_items}) == {pack_code: 2}
             db.commit()
             assert import_public_materials(db, packs=[pack], items_by_pack={pack_code: updated_items}) == {pack_code: 1}
+            db.commit()
             assert import_public_materials(db, packs=[pack], items_by_pack={pack_code: updated_items}) == {pack_code: 1}
             db.commit()
 

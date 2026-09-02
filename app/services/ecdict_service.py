@@ -146,7 +146,8 @@ def get_phonetic(text: str) -> str | None:
 
 def _translation_candidates(value: str | None) -> list[str]:
     candidates: list[str] = []
-    for line in str(value or "").splitlines():
+    normalized_value = str(value or "").replace("\\r\\n", "\n").replace("\\n", "\n")
+    for line in normalized_value.splitlines():
         for part in re.split(r"[,，;；、]", line):
             candidate = re.sub(r"^[A-Za-z]{1,8}\.\s*", "", part.strip())
             candidate = re.sub(r"^\[[^\]]+\]\s*", "", candidate).strip()

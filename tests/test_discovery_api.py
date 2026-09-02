@@ -215,10 +215,12 @@ class PublicMaterialImporterTest(unittest.TestCase):
         with TestingSessionLocal() as db:
             first = import_public_materials(db, packs=[pack], items_by_pack={"test-exam": items})
             second = import_public_materials(db, packs=[pack], items_by_pack={"test-exam": items[:1]})
+            third = import_public_materials(db, packs=[pack], items_by_pack={"test-exam": items[:1]})
             db.commit()
 
             self.assertEqual({"test-exam": 2}, first)
             self.assertEqual({"test-exam": 1}, second)
+            self.assertEqual({"test-exam": 1}, third)
             approved = list(db.scalars(select(PublicMaterialItem).where(
                 PublicMaterialItem.status == "approved",
             )))

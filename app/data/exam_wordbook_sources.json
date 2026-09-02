@@ -1,0 +1,92 @@
+{
+  "production_batch": "exam-wordbooks-2026.09.v2",
+  "candidate_sources": {
+    "ecdict": {
+      "name": "ECDICT",
+      "url": "https://github.com/skywind3000/ECDICT",
+      "revision": "bc015ed2e24a7abef49fc6dbbb7fe32c1dadaf8b",
+      "license": "MIT",
+      "nature": "Community dictionary tags and Chinese definitions"
+    }
+  },
+  "books": {
+    "cet4": {
+      "candidate_source": "ecdict",
+      "candidate_tag": "cet4",
+      "corpus": {
+        "kind": "github_markdown_archive",
+        "name": "english-exem-md CET4 2023 papers",
+        "url": "https://codeload.github.com/wamich/english-exem-md/zip/ff09688a456e174722d85c1fa150485c93f5e68c",
+        "revision": "ff09688a456e174722d85c1fa150485c93f5e68c",
+        "path_segment": "/CET4/",
+        "expected_documents": 6,
+        "license": "GPL-2.0 repository; underlying exam-text rights not stated",
+        "nature": "Community-transcribed June and December 2023 CET4 papers; not a complete historical corpus"
+      }
+    },
+    "cet6": {
+      "candidate_source": "ecdict",
+      "candidate_tag": "cet6",
+      "corpus": {
+        "kind": "github_markdown_archive",
+        "name": "english-exem-md CET6 2023 papers",
+        "url": "https://codeload.github.com/wamich/english-exem-md/zip/ff09688a456e174722d85c1fa150485c93f5e68c",
+        "revision": "ff09688a456e174722d85c1fa150485c93f5e68c",
+        "path_segment": "/CET6/",
+        "expected_documents": 6,
+        "license": "GPL-2.0 repository; underlying exam-text rights not stated",
+        "nature": "Community-transcribed June and December 2023 CET6 papers; not a complete historical corpus"
+      }
+    },
+    "postgraduate": {
+      "candidate_source": "ecdict",
+      "candidate_tag": "ky",
+      "corpus": {
+        "kind": "github_text_archive",
+        "name": "201_204_kaoyan exam passages",
+        "url": "https://codeload.github.com/pfoocc/201_204_kaoyan/zip/f52a3e7e457af13e66ab9c88fb15eba136f9d0ed",
+        "revision": "f52a3e7e457af13e66ab9c88fb15eba136f9d0ed",
+        "file_pattern": "/(?:201|204)/20[0-9]{2}/(?:cloze/articles|read/articles[1-4])\\.tex$",
+        "expected_documents": 165,
+        "license": "No repository license; underlying exam-text rights not stated",
+        "nature": "Community transcription of English I 2005-2023 and English II 2010-2023 cloze and reading passages; source warns that texts are not proofread"
+      }
+    },
+    "ielts": {
+      "candidate_source": "ecdict",
+      "candidate_tag": "ielts",
+      "corpus": {
+        "kind": "pdf_documents",
+        "name": "Official IELTS Academic sample tasks",
+        "license": "Copyrighted official samples; frequency facts only, raw text not redistributed",
+        "nature": "Official Academic Reading and Listening sample tasks; not historical-paper coverage",
+        "documents": [
+          {
+            "id": "ielts-academic-reading-sample-tasks-2023",
+            "url": "https://ielts.org/cdn/Sample-tests/ielts-academic-reading-sample-tasks-2023.pdf"
+          },
+          {
+            "id": "ielts-listening-sample-tasks-2023",
+            "url": "https://ielts.org/cdn/ielts-sample-tests/ielts-listening-sample-tasks-2023.pdf"
+          }
+        ]
+      }
+    },
+    "toefl": {
+      "candidate_source": "ecdict",
+      "candidate_tag": "toefl",
+      "corpus": {
+        "kind": "pdf_documents",
+        "name": "Official TOEFL iBT full-length Practice Test 1",
+        "license": "Copyright by ETS; frequency facts only, raw text not redistributed",
+        "nature": "Official full-length practice test aligned with tests from January 21, 2026; not complete historical-paper coverage",
+        "documents": [
+          {
+            "id": "toefl-ibt-full-length-practice-test-1-2026",
+            "url": "https://www.ets.org/pdfs/toefl/toefl-ibt-full-length-practice-test-1.pdf"
+          }
+        ]
+      }
+    }
+  }
+}

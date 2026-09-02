@@ -7,10 +7,13 @@ import sys
 from pathlib import Path
 from uuid import UUID
 
+from sqlalchemy import select
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.data.discovery_content import CONTENT_VERSION, PACKS, STATIC_ENTRIES, WORD_BOOK_TAGS, daily_quotes
 from app.database import SessionLocal
+from app.models.discovery import PublicMaterialPack
 from app.services.card_service import normalize_card_content
 from app.services.ecdict_service import get_tagged_dictionary_entries
 from app.services.public_material_importer import (
@@ -76,6 +79,28 @@ def build_import_content(*, word_limit: int, audit_runtime: bool) -> dict[str, t
     return content
 
 
+def without_protected_word_books(
+    pack_imports: list[PublicMaterialPackImport],
+    items_by_pack: dict[str, list[PublicMaterialItemImport]],
+    protected_codes: set[str],
+) -> tuple[list[PublicMaterialPackImport], dict[str, list[PublicMaterialItemImport]]]:
+    return (
+        [pack for pack in pack_imports if pack.code not in protected_codes],
+        {
+            code: items for code, items in items_by_pack.items()
+            if code not in protected_codes
+        },
+    )
+
+
+def without_protected_scenario_packs(
+    pack_imports: list[PublicMaterialPackImport],
+    items_by_pack: dict[str, list[PublicMaterialItemImport]],
+    protected_codes: set[str],
+) -> tuple[list[PublicMaterialPackImport], dict[str, list[PublicMaterialItemImport]]]:
+    return without_protected_word_books(pack_imports, items_by_pack, protected_codes)
+
+
 def seed_discovery_content(*, word_limit: int = 500, audit_runtime: bool = False) -> dict[str, int]:
     content_by_pack = build_import_content(word_limit=word_limit, audit_runtime=audit_runtime)
     pack_definitions = {item[0]: item for item in PACKS}
@@ -122,6 +147,20 @@ def seed_discovery_content(*, word_limit: int = 500, audit_runtime: bool = False
         items_by_pack[pack_code] = item_imports
 
     with SessionLocal() as db:
+        protected_word_books = set(db.scalars(select(PublicMaterialPack.code).where(
+            PublicMaterialPack.kind == "word_book",
+            PublicMaterialPack.content_version.like("exam-wordbooks-%"),
+        )))
+        pack_imports, items_by_pack = without_protected_word_books(
+            pack_imports, items_by_pack, protected_word_books
+        )
+        protected_scenario_packs = set(db.scalars(select(PublicMaterialPack.code).where(
+            PublicMaterialPack.kind == "expression",
+            PublicMaterialPack.content_version.like("scenario-materials-%"),
+        )))
+        pack_imports, items_by_pack = without_protected_scenario_packs(
+            pack_imports, items_by_pack, protected_scenario_packs
+        )
         counts = import_public_materials(db, packs=pack_imports, items_by_pack=items_by_pack)
         db.commit()
     return counts
